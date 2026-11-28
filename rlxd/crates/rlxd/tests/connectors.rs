@@ -11,9 +11,14 @@
 //!
 //! The 7.7 checks that need two scenarios in one home (a change, a login after a run)
 //! switch fake-claude's scenario between runs with `FAKE_CLAUDE_SCENARIO_FILE`.
+//!
+//! The refresh probe and a login are Claude Code too: they start the `claude` the app's
+//! environment resolved to, with that environment, as a run does (4.3).
 
 mod common;
 
+use std::path::{Path, PathBuf};
+use std::process::Stdio;
 use std::time::Duration;
 
 use common::runs::{
@@ -1061,4 +1066,128 @@ fn the_cli_prints_rlxds_data_bare() {
     assert_eq!(output.status.code(), Some(0), "{output:?}");
     let printed: Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(printed, data);
+}
+
+// --- 4.3: the app's environment ---------------------------------------------------------
+
+/// A home whose rlxd has no `RLXD_CLAUDE_BIN`, so it starts the `claude` the app's `PATH`
+/// resolves to (4.3), and `<home>/bin/claude`: fake-claude, playing what `<home>/scenario`
+/// names at each start. rlxd's own `CLAUDE_CONFIG_DIR` is the home's, never the app's.
+fn home_with_the_apps_claude(first: &str) -> (TestHome, PathBuf) {
+    let home = TestHome::new().with_own_user();
+    let file = home.root().join("scenario");
+    std::fs::write(&file, first).unwrap();
+    let home = home.with_env("FAKE_CLAUDE_SCENARIO_FILE", file.to_str().unwrap());
+    let mut serve = home.command(&["serve", "--detach", "--gate-dev-mode"]);
+    serve.env_remove("RLXD_CLAUDE_BIN").stdin(Stdio::null());
+    let started = common::run(serve, None);
+    assert_eq!(started.code(), Some(0), "{started:?}");
+    let bin = home.root().join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    let fake = Path::new(env!("CARGO_BIN_EXE_fake-claude"));
+    let claude = bin.join(if cfg!(windows) {
+        "claude.exe"
+    } else {
+        "claude"
+    });
+    if std::fs::hard_link(fake, &claude).is_err() {
+        std::fs::copy(fake, &claude).unwrap();
+    }
+    (home, claude)
+}
+
+/// `env.set change` from the app, which must succeed.
+fn app_sets(home: &TestHome, change: &Value) {
+    let run = home.rlxd(&["call", "--as-app", "env.set", &change.to_string()]);
+    assert_eq!(run.code(), Some(0), "{run:?}");
+}
+
+/// `connectors.list {refresh: true, allow_turn: true}`: the one-turn probe.
+fn refresh(home: &TestHome) -> common::Run {
+    home.rlxd(&[
+        "call",
+        "connectors.list",
+        r#"{"refresh":true,"allow_turn":true}"#,
+    ])
+}
+
+#[test]
+fn the_refresh_probe_and_a_login_start_the_apps_claude_with_its_environment() {
+    let (home, claude) = home_with_the_apps_claude("init-connectors");
+    let config = home.root().join("cc-app");
+    std::fs::create_dir_all(&config).unwrap();
+    let mut dirs = vec![claude.parent().unwrap().to_path_buf()];
+    dirs.extend(home.path_without_real_claude());
+    let path = std::env::join_paths(dirs).unwrap();
+    let (path, config) = (path.to_str().unwrap(), config.to_str().unwrap());
+    app_sets(&home, &json!({"PATH": path, "CLAUDE_CONFIG_DIR": config}));
+    // The last start in fake-claude's log: the app's claude, by the path resolved when
+    // the app set PATH, with the app's PATH, raw, and `config` its CLAUDE_CONFIG_DIR.
+    let last_start = |what: &str, config: Option<&str>| {
+        let log = fixture_log(&home);
+        let start = log["starts"].as_array().unwrap().last().unwrap().clone();
+        assert_eq!(
+            start["argv"][0],
+            claude.display().to_string(),
+            "{what}: {start:#}"
+        );
+        assert_eq!(
+            start["env"]
+                .get("CLAUDE_CONFIG_DIR")
+                .and_then(Value::as_str),
+            config,
+            "{what}: {start:#}"
+        );
+        assert_eq!(start["env"]["PATH"], path, "{what}: {start:#}");
+        start
+    };
+
+    let probed = refresh(&home);
+    assert_eq!(probed.code(), Some(0), "{probed:?}");
+    assert_eq!(probed.data()["model_turns"], 1, "{probed:?}");
+    // The probe is the default account's (#660): the plain account's home, neither of the
+    // two variables, though the app set CLAUDE_CONFIG_DIR.
+    let start = last_start("the refresh probe", None);
+    assert_eq!(start["env"].get("CLAUDE_CODE_TMPDIR"), None, "{start:#}");
+
+    std::fs::write(home.root().join("scenario"), "mcp-login").unwrap();
+    let since = seq(&home);
+    login(&home);
+    let events = login_events(&home, since);
+    assert_eq!(
+        events.last().unwrap()["type"],
+        "connector.login.done",
+        "{events:#?}"
+    );
+    // A login runs where a run does: on the app's CLAUDE_CONFIG_DIR.
+    let start = last_start("the login", Some(config));
+    assert_eq!(start["argv"][1], "mcp", "{start:#}");
+
+    // With no claude on the app's PATH, neither starts, and each says where rlxd looked.
+    let empty = home.root().join("empty");
+    std::fs::create_dir_all(&empty).unwrap();
+    app_sets(&home, &json!({"PATH": empty.to_str().unwrap()}));
+    let starts = fixture_log(&home)["starts"].as_array().unwrap().len();
+    let refused = refresh(&home);
+    assert_eq!(refused.code(), Some(1), "{refused:?}");
+    assert_eq!(refused.error_code(), "claude_not_found", "{refused:?}");
+    let message = refused.json()["error"]["message"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert!(message.contains("on the app's PATH"), "{message}");
+    let since = seq(&home);
+    login(&home);
+    let events = login_events(&home, since);
+    assert_eq!(events.len(), 1, "{events:#?}");
+    assert_eq!(events[0]["type"], "connector.login.error", "{events:#?}");
+    assert_eq!(events[0]["data"]["code"], "claude_not_found", "{events:#?}");
+    let message = events[0]["data"]["message"].as_str().unwrap();
+    assert!(message.contains("on the app's PATH"), "{events:#?}");
+    assert_valid("connector-login-error.json", &events[0]["data"]);
+    assert_eq!(
+        fixture_log(&home)["starts"].as_array().unwrap().len(),
+        starts,
+        "nothing started"
+    );
 }

@@ -11,10 +11,12 @@
 //!   time. A read that fails keeps the account's connectors as read before, with its
 //!   error. Without the route (capability `connectors.no_turn`), `allow_turn: true` runs
 //!   the one-turn probe instead, of one account.
-//! - **At rlxd's start**, when its environment names a `CLAUDE_CONFIG_DIR`, the brain is
-//!   asked once, so rlxd knows which account its own runs use (with none named, it is the
+//! - **At rlxd's start**, when its runs' `CLAUDE_CONFIG_DIR` names one (the app's when it
+//!   set one, as a run's Claude Code gets it, 4.3; else rlxd's own), the brain is asked
+//!   once, so rlxd knows which account its own runs use (with none named, it is the
 //!   default account): a run's `system/init` updates that account's connectors as it
-//!   comes, so a connector a run finds failing needs no refresh.
+//!   comes, so a connector a run finds failing needs no refresh. Each change to the app's
+//!   values settles that account again, asking the brain when it must.
 //! - **Identity** (task #14, step 2, [`crate::identity`]): after an explicit refresh's
 //!   reads, with the capability `connectors.call` on and an app connected, each account is
 //!   asked who it is on each connector the identity table names, with one gated read call
@@ -26,6 +28,7 @@
 //!   read in the background at most daily, unless it is new or signed in again.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
@@ -58,6 +61,9 @@ pub struct ConnectorMap {
     /// The reads under way, by slot: a refresh of an account being read joins that read,
     /// and takes its outcome.
     reading: Mutex<HashMap<u32, Reading>>,
+    /// Whether [`ConnectorMap::follow_env`]'s ask of the brain for the accounts is under
+    /// way: one at a time.
+    asking: AtomicBool,
 }
 
 /// One read under way: its outcome, once it has one.
@@ -86,6 +92,7 @@ impl ConnectorMap {
             connectors,
             brain,
             reading: Mutex::new(HashMap::new()),
+            asking: AtomicBool::new(false),
         })
     }
 
@@ -296,15 +303,14 @@ impl ConnectorMap {
         ))
     }
 
-    /// The background, for as long as rlxd runs. When rlxd's environment names a
-    /// `CLAUDE_CONFIG_DIR`, it asks the brain for the accounts at its start, so rlxd knows
-    /// which account its own runs use; then, on the no-turn route only, it ticks.
+    /// The background, for as long as rlxd runs. When its runs' `CLAUDE_CONFIG_DIR` (the
+    /// app's, else rlxd's own) names one, it asks the brain for the accounts at its start,
+    /// so rlxd knows which account its own runs use, and follows each change to the app's
+    /// values ([`ConnectorMap::follow_env`]); then, on the no-turn route only, it ticks.
     pub async fn run(self: Arc<Self>) {
+        tokio::spawn(Arc::clone(&self).follow_env());
         let ticks = test_times().unwrap_or(Some((TICK, STALE)));
         if !self.connectors.no_turn() || ticks.is_none() {
-            if self.connectors.runs_account_unknown() {
-                self.learn_accounts().await;
-            }
             return;
         }
         let Some((tick, stale)) = ticks else {
@@ -313,6 +319,28 @@ impl ConnectorMap {
         loop {
             self.tick(stale).await;
             tokio::time::sleep(tick).await;
+        }
+    }
+
+    /// Works out again which account rlxd's runs use on each change to the app's values,
+    /// as runs take the app's `CLAUDE_CONFIG_DIR` (4.3), and asks the brain for the
+    /// accounts when rlx has yet to say them and it matters. Once at its start too, for a
+    /// change made before it listened. The ask runs on its own, so a change made while it
+    /// waits on the brain is taken at once.
+    async fn follow_env(self: Arc<Self>) {
+        let mut changes = self.connectors.env_changes();
+        loop {
+            off_worker(|| self.connectors.env_changed());
+            if self.connectors.runs_account_unknown() && !self.asking.swap(true, Ordering::SeqCst) {
+                let map = Arc::clone(&self);
+                tokio::spawn(async move {
+                    map.learn_accounts().await;
+                    map.asking.store(false, Ordering::SeqCst);
+                });
+            }
+            if changes.changed().await.is_err() {
+                return;
+            }
         }
     }
 

@@ -5,9 +5,12 @@
 //! It is rlxd's own Claude Code, not a run, as the one-turn probe is ([`super::probe`]),
 //! and the two never run at once. It is started on a control channel with
 //! [`argv::call_args`] (no tools, no session, project settings only) in an empty folder of
-//! its own, `<home>/rlxd/connectors-read/<slot>/`, on the account's environment: rlxd's
-//! own, with the account's `CLAUDE_CONFIG_DIR` and `CLAUDE_CODE_TMPDIR` for any but the
-//! default account ([`Account::env`]).
+//! its own, `<home>/rlxd/connectors-read/<slot>/`. It is the `claude` the app's
+//! environment resolved to, on the account's environment ([`super::account_env`], 4.3):
+//! a run's (rlxd's own, the app's values on top), then a managed slot's own
+//! `CLAUDE_CONFIG_DIR` and `CLAUDE_CODE_TMPDIR`, or neither for the default account,
+//! even when the app's values carry one; and no `CLAUDE_SECURESTORAGE_CONFIG_DIR` but a
+//! managed slot's own.
 //!
 //! - **`initialize`**, then **`mcp_status`** every [`STATUS_EVERY`], until it lists a
 //!   server and none of them is `pending`: that listing is the account's connectors now.
@@ -36,8 +39,7 @@ use tokio::time::Instant;
 use super::call::{MAX_LINE, Message, listed_of, untrusted};
 use super::probe::Tended;
 use super::process::Launch;
-use super::{Runner, argv, blocking, refusal, run_env, stream};
-use crate::claude;
+use super::{Runner, account_env, argv, blocking, claude_from, refusal, stream};
 use crate::connectors::{Account, Observed, Read};
 use crate::log::{info, warning};
 
@@ -164,16 +166,10 @@ impl Runner {
             ));
         }
         let _one = self.probing.lock().await;
-        let Some(program) = claude::resolve().and_then(|p| std::path::absolute(p).ok()) else {
-            return Err(refusal(
-                codes::CLAUDE_NOT_FOUND,
-                format!(
-                    "Claude Code was not found: there is no `claude` on rlxd's PATH, and {} \
-                     names none",
-                    claude::BIN_ENV
-                ),
-            ));
-        };
+        // The `claude` the app's environment resolved to, read with the values it goes
+        // with, as a run's attempt reads them (4.3).
+        let (values, resolved) = self.env.snapshot();
+        let program = claude_from(resolved)?;
         let failed = |why: String| {
             refusal(
                 codes::PROBE_FAILED,
@@ -204,14 +200,13 @@ impl Runner {
             "connectors: account {}'s connectors are read (model_turns: 0)",
             account.slot
         );
-        let mut env = run_env();
-        env.extend(account.env());
+        let (env, unset) = account_env(&values, account);
         let launch = Launch {
             program: program.clone(),
             args: argv::call_args(),
             cwd: dir,
             env,
-            unset: account.unset(),
+            unset,
         };
         let (mut child, tree) = self.spawner.spawn(launch).await.map_err(|e| {
             failed(format!(

@@ -1,0 +1,16 @@
+#!/bin/sh
+# fake-brain/print-env: says a good hello, then answers each request with what it was
+# started with of the app's environment (4.3): its pid and CLAUDE_CONFIG_DIR. Once it has
+# accepted a request it touches $AISQUARE_HOME/fake-brain-busy, and holds the reply while
+# $AISQUARE_HOME/fake-brain-hold exists, so a check can change the environment while a
+# request runs. print-env.cmd is the same for Windows.
+read -r hello
+printf '%s\n' "{\"type\":\"hello\",\"protocol\":1,\"pid\":$$,\"rlx_version\":\"0.0.0\"}"
+dir=$(printf '%s' "${CLAUDE_CONFIG_DIR-}" | sed 's/\\/\\\\/g; s/"/\\"/g')
+while read -r request; do
+    id=$(printf '%s' "$request" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')
+    printf '%s\n' "{\"type\":\"accepted\",\"id\":$id}"
+    : > "$AISQUARE_HOME/fake-brain-busy"
+    while [ -e "$AISQUARE_HOME/fake-brain-hold" ]; do sleep 0.1; done
+    printf '%s\n' "{\"type\":\"reply\",\"id\":$id,\"ok\":true,\"result\":{\"pid\":$$,\"CLAUDE_CONFIG_DIR\":\"$dir\"}}"
+done

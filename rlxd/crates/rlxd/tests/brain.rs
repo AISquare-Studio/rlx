@@ -359,3 +359,91 @@ fn a_brain_ends_when_rlxd_is_killed() {
         "{roll:?}"
     );
 }
+
+/// `hook.ping`'s answer, which must come: from fake-brain/print-env, its pid and the
+/// `CLAUDE_CONFIG_DIR` it was started with.
+fn ping(home: &TestHome) -> Value {
+    let ping = home.rlxd(&["call", "hook.ping"]);
+    assert_eq!(ping.code(), Some(0), "{ping:?}");
+    ping.data()
+}
+
+/// `env.set` from the app.
+fn set_env(home: &TestHome, change: &str) {
+    let set = home.rlxd(&["call", "--as-app", "env.set", change]);
+    assert_eq!(set.code(), Some(0), "{set:?}");
+}
+
+/// 4.3: the brain runs with the app's environment, as a run's Claude Code does. An
+/// `env.set` that changes it starts the brain again with the new values once it is idle:
+/// a request it runs ends first, answered by the brain it started on. One that changes
+/// nothing leaves it running, and env.json's values reach the brain of the next rlxd.
+#[test]
+fn an_env_set_reaches_the_brain_once_no_request_runs() {
+    let home = TestHome::new();
+    let own = home.root().join("claude-config").display().to_string();
+    let home = std::sync::Arc::new(
+        home.with_env("CLAUDE_CONFIG_DIR", &own)
+            .with_rlx(fake_brain("print-env")),
+    );
+    home.start_dev();
+    let first = ping(&home);
+    assert_eq!(
+        first["CLAUDE_CONFIG_DIR"],
+        own.as_str(),
+        "rlxd's own, as the app set none: {first}"
+    );
+
+    // The app's environment changes while the brain runs a request.
+    let hold = home.root().join("fake-brain-hold");
+    let busy = home.root().join("fake-brain-busy");
+    std::fs::write(&hold, "").unwrap();
+    let _ = std::fs::remove_file(&busy);
+    let running = {
+        let home = std::sync::Arc::clone(&home);
+        thread::spawn(move || ping(&home))
+    };
+    eventually("the brain runs the request", || busy.exists());
+    set_env(&home, r#"{"CLAUDE_CONFIG_DIR":"cc-brain"}"#);
+    thread::sleep(Duration::from_millis(500));
+    let held = brain(&home);
+    assert_eq!(held["restarts"], 0, "not while it runs a request: {held}");
+    std::fs::remove_file(&hold).unwrap();
+    let ran = running.join().unwrap();
+    assert_eq!(ran["pid"], first["pid"], "{ran}");
+    assert_eq!(
+        ran["CLAUDE_CONFIG_DIR"],
+        own.as_str(),
+        "the values it started with: {ran}"
+    );
+
+    // Then it is started again, with no backoff and no error, and runs with the app's.
+    eventually("the brain is started again", || {
+        brain(&home)["restarts"] == 1
+    });
+    let now = brain(&home);
+    assert!(
+        now.get("error").is_none() && now.get("backoff_ms").is_none(),
+        "{now}"
+    );
+    let second = ping(&home);
+    assert_ne!(second["pid"], first["pid"], "{second}");
+    assert_eq!(second["CLAUDE_CONFIG_DIR"], "cc-brain", "{second}");
+    assert!(
+        home.log().contains("the app's environment changed"),
+        "{}",
+        home.log()
+    );
+
+    // The same values again: no change, no restart.
+    set_env(&home, r#"{"CLAUDE_CONFIG_DIR":"cc-brain"}"#);
+    thread::sleep(Duration::from_millis(500));
+    assert_eq!(ping(&home)["pid"], second["pid"]);
+    assert_eq!(brain(&home)["restarts"], 1);
+
+    // A later rlxd's brain starts with env.json's values.
+    home.stop();
+    home.start_dev();
+    let third = ping(&home);
+    assert_eq!(third["CLAUDE_CONFIG_DIR"], "cc-brain", "{third}");
+}

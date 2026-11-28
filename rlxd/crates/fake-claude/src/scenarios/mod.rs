@@ -18,6 +18,7 @@ pub mod mcp_accounts;
 pub mod mcp_direct;
 mod orphan;
 mod persist;
+mod print_env;
 mod rate_limit;
 mod slow;
 mod structured;
@@ -83,6 +84,9 @@ pub const ALL: &[(&str, Scenario)] = &[
     ("mcp-direct-needs-auth", |fake| {
         mcp_direct::play(fake, Variant::NeedsAuth)
     }),
+    ("mcp-direct-needs-auth-slow", |fake| {
+        mcp_direct::play(fake, Variant::NeedsAuthSlow)
+    }),
     ("mcp-direct-old", |fake| {
         mcp_direct::play(fake, Variant::Old)
     }),
@@ -118,6 +122,7 @@ pub const ALL: &[(&str, Scenario)] = &[
     }),
     ("orphan", orphan::run),
     ("persist", persist::run),
+    ("print-env", print_env::run),
     ("rate-limit", rate_limit::run),
     ("slow", slow::run),
     ("stdin-eof-empty", connectors::stdin_eof_empty),

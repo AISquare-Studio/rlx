@@ -23,8 +23,7 @@ use tokio::io::{AsyncWriteExt, BufReader};
 
 use super::process::{Launch, Tree};
 use super::stream::{self, Line};
-use super::{Runner, argv, blocking, refusal, run_env};
-use crate::claude;
+use super::{Runner, account_env, argv, blocking, claude_from, refusal};
 use crate::connectors::{Account, Read};
 use crate::log::{info, warning};
 
@@ -41,7 +40,9 @@ impl Runner {
     /// Runs one probe on `account`'s environment and puts its `system/init` in the
     /// connectors' cache as `account`'s. One probe runs at a time (and no no-turn read
     /// beside it): a second waits for the first, then runs its own. Refused with
-    /// `claude_not_found` when there is no Claude Code, or `probe_failed`, saying why.
+    /// `claude_not_found` or `claude_not_runnable` as `run.start` is, or `probe_failed`,
+    /// saying why. It starts the `claude` the app's environment resolved to, on the
+    /// account's environment ([`account_env`], 4.3).
     pub async fn probe_connectors(&self, account: &Account) -> Result<(), ErrorBody> {
         if !account.homes_known() {
             return Err(refusal(
@@ -55,16 +56,10 @@ impl Runner {
             ));
         }
         let _one = self.probing.lock().await;
-        let Some(program) = claude::resolve().and_then(|p| std::path::absolute(p).ok()) else {
-            return Err(refusal(
-                codes::CLAUDE_NOT_FOUND,
-                format!(
-                    "Claude Code was not found: there is no `claude` on rlxd's PATH, and {} \
-                     names none",
-                    claude::BIN_ENV
-                ),
-            ));
-        };
+        // The `claude` the app's environment resolved to, read with the values it goes
+        // with, as a run's attempt reads them.
+        let (values, resolved) = self.env.snapshot();
+        let program = claude_from(resolved)?;
         let failed = |why: String| {
             refusal(
                 codes::PROBE_FAILED,
@@ -85,14 +80,13 @@ impl Runner {
             "connectors: a one-turn probe of account {} starts (model_turns: 1)",
             account.slot
         );
-        let mut env = run_env();
-        env.extend(account.env());
+        let (env, unset) = account_env(&values, account);
         let launch = Launch {
             program: program.clone(),
             args: argv::probe_args(&settings_file),
             cwd: dir,
             env,
-            unset: account.unset(),
+            unset,
         };
         let (mut child, tree) = self.spawner.spawn(launch).await.map_err(|e| {
             failed(format!(

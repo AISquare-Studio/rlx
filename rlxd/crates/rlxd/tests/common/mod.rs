@@ -2,11 +2,12 @@
 //! time limit, and the checked-in schemas.
 #![allow(dead_code)]
 
+use std::ffi::{OsStr, OsString};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::{Mutex, PoisonError, mpsc};
+use std::sync::{Mutex, OnceLock, PoisonError, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -191,6 +192,26 @@ impl TestHome {
         self.envs.push((name.to_owned(), value.to_owned()));
     }
 
+    /// Stops setting `name` for the `rlxd`s run in this home from now on: they inherit
+    /// the test's own, for a restart with another environment.
+    pub fn remove_env(&mut self, name: &str) {
+        self.envs.retain(|(each, _)| each != name);
+    }
+
+    /// This home, its rlxd given a `HOME`, `USERPROFILE` and `CLAUDE_CONFIG_DIR` of its own
+    /// in the home (`user-home`, `claude-config`), so a `claude` it starts reads none of
+    /// the user's: for a test whose rlxd looks for `claude` on a `PATH` (the stub).
+    pub fn with_own_user(self) -> Self {
+        let user = self.root.join("user-home");
+        let config = self.root.join("claude-config");
+        std::fs::create_dir_all(&user).unwrap();
+        std::fs::create_dir_all(&config).unwrap();
+        let (user, config) = (user.display().to_string(), config.display().to_string());
+        self.with_env("HOME", &user)
+            .with_env("USERPROFILE", &user)
+            .with_env("CLAUDE_CONFIG_DIR", &config)
+    }
+
     /// This home, run by the rlxd at `binary` rather than this test build's.
     pub fn with_binary(mut self, binary: PathBuf) -> Self {
         self.binary = Some(binary);
@@ -277,6 +298,11 @@ impl TestHome {
 
     /// `rlxd args…` in this home, with `stdin` on its stdin.
     pub fn rlxd_with_stdin(&self, args: &[&str], stdin: Option<&str>) -> Run {
+        for line in stdin.unwrap_or_default().lines() {
+            if let Ok(value) = serde_json::from_str::<Value>(line) {
+                self.refuse_a_real_claude_on(&value, "its stdin");
+            }
+        }
         let mut command = self.command(args);
         command.stdin(if stdin.is_some() {
             Stdio::piped()
@@ -299,7 +325,22 @@ impl TestHome {
 
     /// `program args…` in this home, as [`TestHome::command`] runs `rlxd`: for a copy of
     /// rlxd, such as a signed helper, or a wrapper that runs it.
+    ///
+    /// No test may ever start a real Claude Code (it would read the developer's sign-in):
+    /// rlxd's own `PATH` has the stub's folder first ([`stub_claude_dir`]) and no folder
+    /// that holds a real `claude`, so an rlxd started with `RLXD_CLAUDE_BIN` unset finds
+    /// the stub. And the test fails here, before anything starts, when what it gives rlxd
+    /// would let it start a real one ([`TestHome::refuse_a_real_claude`]).
     pub fn command_of(&self, program: &Path, args: &[&str]) -> Command {
+        self.refuse_a_real_claude(args);
+        let path = self
+            .envs
+            .iter()
+            .rev()
+            .find(|(name, _)| name.eq_ignore_ascii_case("PATH"))
+            .map(|(_, value)| OsString::from(value))
+            .or_else(|| std::env::var_os("PATH"))
+            .unwrap_or_default();
         let mut command = Command::new(program);
         // Not the identity of an agent the tests run under (its role, fleet agent, config
         // dir, tmux pane): rlx's hooks would act on it.
@@ -316,6 +357,7 @@ impl TestHome {
         command
             .args(args)
             .envs(self.envs.iter().map(|(k, v)| (k, v)))
+            .env("PATH", self.rlxd_path(&path))
             .env("AISQUARE_HOME", &self.root)
             .env_remove("RLX_HOME")
             .env(
@@ -329,6 +371,105 @@ impl TestHome {
                 self.rlx.clone().unwrap_or_else(|| self.root.join("no-rlx")),
             );
         command
+    }
+
+    /// rlxd's own `PATH`, from `base`: the stub's folder first ([`stub_claude_dir`]), then
+    /// `base` without the folders that hold a real `claude`.
+    pub fn rlxd_path(&self, base: &OsStr) -> OsString {
+        let mut dirs = vec![stub_claude_dir().to_path_buf()];
+        dirs.extend(std::env::split_paths(base).filter(|dir| self.real_claude_in(dir).is_none()));
+        std::env::join_paths(dirs).expect("a PATH")
+    }
+
+    /// The test's own `PATH`, without the folders that hold a real `claude`: for a test
+    /// that gives the app's `PATH` more than its own folders.
+    pub fn path_without_real_claude(&self) -> Vec<PathBuf> {
+        std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())
+            .filter(|dir| self.real_claude_in(dir).is_none())
+            .collect()
+    }
+
+    /// A `claude` rlxd could find in `dir` that no test made: `dir` is absolute (rlxd skips
+    /// relative entries), outside this home and the stub's folder, and holds one.
+    pub fn real_claude_in(&self, dir: &Path) -> Option<PathBuf> {
+        if !dir.is_absolute() || self.made_by_tests(dir) {
+            return None;
+        }
+        claude_names()
+            .iter()
+            .map(|name| dir.join(name))
+            .find(|program| program.is_file())
+    }
+
+    /// Whether `path` is the tests': in this home, the stub's folder, or the fixtures.
+    fn made_by_tests(&self, path: &Path) -> bool {
+        path.starts_with(&self.root)
+            || path.starts_with(stub_claude_dir())
+            || path.starts_with(workspace().join("tests").join("fixtures"))
+    }
+
+    /// Fails the test if an rlxd started with `args` in this home could start a real
+    /// Claude Code: through `RLXD_CLAUDE_BIN` ([`TestHome::with_claude`]) naming a program
+    /// no test made, or an app `PATH` with a folder holding a real `claude`, in `args`
+    /// (`env.set`'s params, `--env`) or in the home's `rlxd/env.json`.
+    pub fn refuse_a_real_claude(&self, args: &[&str]) {
+        if thread::panicking() || args == ["stop"] {
+            // `stop`, as a drop guard runs it, starts nothing.
+            return;
+        }
+        if let Some(program) = &self.claude
+            && program.exists()
+            && !self.made_by_tests(program)
+        {
+            panic!(
+                "this test would have rlxd start {} as Claude Code: RLXD_CLAUDE_BIN must \
+                 name a stub the test made (no test may start a real claude)",
+                program.display()
+            );
+        }
+        for arg in args {
+            if let Ok(value) = serde_json::from_str::<Value>(arg) {
+                self.refuse_a_real_claude_on(&value, "its arguments");
+            }
+        }
+        let stored = self.root.join("rlxd").join("env.json");
+        if let Some(value) = std::fs::read_to_string(&stored)
+            .ok()
+            .and_then(|text| serde_json::from_str::<Value>(&text).ok())
+        {
+            self.refuse_a_real_claude_on(&value, "rlxd/env.json");
+        }
+    }
+
+    /// Fails the test if `value` holds a `PATH` with a folder that holds a real `claude`.
+    fn refuse_a_real_claude_on(&self, value: &Value, whence: &str) {
+        match value {
+            Value::Object(object) => {
+                for (key, value) in object {
+                    match value.as_str() {
+                        Some(path) if key == "PATH" => {
+                            for dir in std::env::split_paths(path) {
+                                if let Some(real) = self.real_claude_in(&dir) {
+                                    panic!(
+                                        "this test would have rlxd start a real Claude Code, \
+                                         {}, on the app's PATH in {whence}: give the app only \
+                                         folders the test made (no test may start a real claude)",
+                                        real.display()
+                                    );
+                                }
+                            }
+                        }
+                        _ => self.refuse_a_real_claude_on(value, whence),
+                    }
+                }
+            }
+            Value::Array(items) => {
+                for item in items {
+                    self.refuse_a_real_claude_on(item, whence);
+                }
+            }
+            _ => {}
+        }
     }
 
     /// `rlxd serve --detach`, which must succeed.
@@ -687,6 +828,58 @@ pub fn alive(pid: u64) -> bool {
             .status()
             .is_ok_and(|status| status.success())
     }
+}
+
+/// The names of a `claude` rlxd could find in a folder of a `PATH`, on this OS.
+fn claude_names() -> &'static [&'static str] {
+    if cfg!(windows) {
+        &[
+            "claude",
+            "claude.exe",
+            "claude.com",
+            "claude.cmd",
+            "claude.bat",
+        ]
+    } else {
+        &["claude"]
+    }
+}
+
+/// The folder of the stand-in `claude` first on every test rlxd's own `PATH`
+/// ([`TestHome::command_of`]): fake-claude, which answers `--version` and
+/// `auth status --json` as `probe@example.com`, and plays no run. One per test process, in
+/// Cargo's scratch folder for tests, where it can be linked rather than copied (the
+/// binary's volume); those of test processes that have ended are removed.
+pub fn stub_claude_dir() -> &'static Path {
+    static DIR: OnceLock<PathBuf> = OnceLock::new();
+    DIR.get_or_init(|| {
+        let scratch = Path::new(env!("CARGO_TARGET_TMPDIR"));
+        let own = std::process::id();
+        for entry in std::fs::read_dir(scratch).into_iter().flatten().flatten() {
+            let ended = entry
+                .file_name()
+                .to_string_lossy()
+                .strip_prefix("stub-claude-")
+                .and_then(|pid| pid.parse::<u32>().ok())
+                .is_some_and(|pid| pid != own && !alive(u64::from(pid)));
+            if ended {
+                let _ = std::fs::remove_dir_all(entry.path());
+            }
+        }
+        let dir = scratch.join(format!("stub-claude-{own}"));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let stub = dir.join(if cfg!(windows) {
+            "claude.exe"
+        } else {
+            "claude"
+        });
+        let binary = Path::new(env!("CARGO_BIN_EXE_fake-claude"));
+        if std::fs::hard_link(binary, &stub).is_err() {
+            std::fs::copy(binary, &stub).unwrap();
+        }
+        dir
+    })
 }
 
 /// `rlxd/tests/fixtures/fake-claude/<scenario>`.

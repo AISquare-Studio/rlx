@@ -757,8 +757,10 @@ impl ConnectorLoginDone {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum LoginErrorCode {
-    /// Claude Code was not found.
+    /// Claude Code was not found where rlxd looked (4.3).
     ClaudeNotFound,
+    /// The `claude` found first is a batch file, which rlxd does not run (4.3).
+    ClaudeNotRunnable,
     /// It printed no URL to open.
     NoUrl,
     /// The URL it printed is not `https://`: rlxd doesn't pass it on.

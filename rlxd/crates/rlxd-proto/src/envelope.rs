@@ -415,6 +415,9 @@ pub mod codes {
     /// every run's gate hook runs by (never a name looked up on `PATH`). The message says
     /// why.
     pub const HOOK_NOT_FOUND: &str = "hook_not_found";
+    /// `env.set` or `hello`'s `env` named a key that is not `PATH`, `CLAUDE_CONFIG_DIR` or
+    /// `CLAUDE_SECURESTORAGE_CONFIG_DIR` (4.3). Nothing changed.
+    pub const BAD_ENV_KEY: &str = "bad_env_key";
     /// `connectors.list {refresh: true}`: rlxd has no route to Claude Code's connectors
     /// that makes no model turn yet. `allow_turn: true` lets it take one. And
     /// `connectors.call`: no route to one call with no model turn (no capability
@@ -429,8 +432,15 @@ pub mod codes {
     /// write (`.claude/settings.json` or `.claude/settings.local.json`, `detail.path`),
     /// whose rules or hooks could let the call past the gate. No call is made.
     pub const UNTRUSTED_SETTINGS: &str = "untrusted_settings";
-    /// `connectors.list {refresh: true, allow_turn: true}`: Claude Code was not found.
+    /// Claude Code could not start: no `claude` on the app's `PATH` (4.3), or rlxd's own
+    /// when the app set none, and `RLXD_CLAUDE_BIN` names none. Refuses `run.start`,
+    /// `run.resume`, `connectors.call` and `connectors.list {refresh: true, allow_turn:
+    /// true}`. Agreed with the runner (7.5).
     pub const CLAUDE_NOT_FOUND: &str = "claude_not_found";
+    /// Claude Code could not start: the `claude` found first is a batch file, such as
+    /// npm's `claude.cmd` shim on Windows, which rlxd does not run through `cmd` (4.3).
+    /// Refuses what `claude_not_found` does.
+    pub const CLAUDE_NOT_RUNNABLE: &str = "claude_not_runnable";
     /// `connectors.list {refresh: true, allow_turn: true}`: the one-turn probe ended
     /// without a `system/init`. The message says why.
     pub const PROBE_FAILED: &str = "probe_failed";

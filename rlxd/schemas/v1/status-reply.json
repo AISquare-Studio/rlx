@@ -164,8 +164,18 @@
           "type": "string"
         },
         "installed": {
-          "description": "Whether rlxd found the program: `RLXD_CLAUDE_BIN` when it is set, else `claude`\non `PATH`.",
+          "description": "Whether rlxd found the program: `RLXD_CLAUDE_BIN` when it is set, else `claude`\non the app's `PATH` (4.3), else on rlxd's own.",
           "type": "boolean"
+        },
+        "path": {
+          "description": "The program rlxd starts as Claude Code, an absolute path as it was found, links\nkept: resolved when the app sets `PATH` and when rlxd starts, never at a run's\nstart (4.3). Absent when it is not installed.",
+          "type": "string",
+          "minLength": 1
+        },
+        "path_source": {
+          "description": "Where rlxd looked for it: `app`, the app's `PATH` (4.3); `rlxd`, rlxd's own `PATH`,\nas the app set none; or `rlxd_claude_bin`, `RLXD_CLAUDE_BIN` in rlxd's own\nenvironment, which tests set ([`Claude::PATH_SOURCES`]). Set whether or not it was\nfound, so the app can tell when its `PATH` was not the one searched.",
+          "type": "string",
+          "minLength": 1
         },
         "plan": {
           "description": "The account's plan, such as `pro` or `max`.",

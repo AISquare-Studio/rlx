@@ -28,9 +28,14 @@
       "description": "Why a login failed.",
       "oneOf": [
         {
-          "description": "Claude Code was not found.",
+          "description": "Claude Code was not found where rlxd looked (4.3).",
           "type": "string",
           "const": "claude_not_found"
+        },
+        {
+          "description": "The `claude` found first is a batch file, which rlxd does not run (4.3).",
+          "type": "string",
+          "const": "claude_not_runnable"
         },
         {
           "description": "It printed no URL to open.",

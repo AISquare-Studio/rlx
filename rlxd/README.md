@@ -136,7 +136,9 @@ rlxd gate unpair [<device>]              # unpair one device, or every device
   an `ok` envelope: see below. `rlxd events` exits 4 when its `--timeout` runs out.
 
 The `status` reply's shape is `schemas/v1/status-reply.json`. `RLXD_CLAUDE_BIN` names the
-program rlxd runs as Claude Code; tests point it at `tests/fixtures/fake-claude/`.
+program rlxd runs as Claude Code; tests point it at `tests/fixtures/fake-claude/`. It is
+read from rlxd's own environment only, and wins over the app's `PATH` (see [The app's
+environment](#the-apps-environment-for-claude-code)).
 
 ## The event bus
 
@@ -228,6 +230,77 @@ token reads every one.
   credential is replaced, can no longer change a protected key.
   `crates/rlxd/tests/settings.rs` pairs a device for real, in gate dev mode.
 
+## The app's environment for Claude Code
+
+A GUI app's `PATH` lacks the user's shell `PATH`, so rlx.app reads `PATH`,
+`CLAUDE_CONFIG_DIR` and `CLAUDE_SECURESTORAGE_CONFIG_DIR` once from a login shell and
+hands them to rlxd (handoff 0.10.3, 4.3). They decide which `claude` every gated run
+starts and where it reads its settings, so only the gate holder sets them.
+
+```sh
+rlxd call --as-app env.set '{"CLAUDE_CONFIG_DIR":"/Users/u/.claude-work"}'
+rlxd call --as-app --env '{"PATH":"/opt/homebrew/bin:/usr/bin:/bin"}' status
+rlxd call env.get
+```
+
+- **`env.set {<key>: <value>, …}`**, and `env` in a `hello`, are taken only from an
+  app-role connection that holds the gate (5.1). Anything else gets `not_gate`, and
+  nothing changes: an `env.set` from a `cli` or `tui` client, a `hello` with `env` that
+  doesn't take the app role, or an app `hello` the gate refuses, whatever keys its `env`
+  holds. **`env.get`** is open to every client. Each replies with every value now: `schemas/v1/env.json`.
+- **Keys.** Exactly the three. Any other key gets `bad_env_key`, and so does the whole
+  request, valid keys included: nothing changes, and an app `hello` refused so takes no
+  hold of the gate. A key the request doesn't name keeps
+  its value, and an empty value removes its key.
+- **Values** are strings of at most 64 KiB with no NUL (`invalid_params` otherwise),
+  kept as sent: a relative `CLAUDE_CONFIG_DIR` stays relative.
+- **`<home>/rlxd/env.json`** (0600) keeps them, written whole and durably (a 0600
+  sibling, fsynced, renamed over it), so an rlxd started at login has them too. One that
+  can't be read (not JSON, a key this rlxd doesn't know, a value too long) is moved
+  aside whole to `env.json.unreadable-<time>`, logged as an error, and rlxd starts with
+  no app environment, as the settings do. If it can't be moved either, every change is
+  refused until it is fixed and rlxd restarted. A change that can't be written (that, or
+  a full disk) refuses its request with why (`internal`), an app `hello` carrying `env`
+  included: the app then holds no gate until the file is fixed, or it says hello
+  without `env`.
+- **`claude`** is resolved when the values are taken in (`env.set`, an app `hello`'s
+  `env`) and when rlxd starts, never when a run starts: the first `claude` on the app's
+  `PATH`, in order, else on rlxd's own `PATH` when the app set none. Empty and relative
+  entries are skipped. The path is kept as found, an absolute path with links
+  unresolved. `RLXD_CLAUDE_BIN`, from rlxd's own environment only, wins over both.
+  `status.claude` reports it: `installed`; `path`, the program a run starts; and
+  `path_source`, where rlxd looked: `app` (the app's `PATH`), `rlxd` (its own, as the
+  app set none) or `rlxd_claude_bin`.
+  - **Windows** tries `claude` with each of `PATHEXT`'s extensions, so `claude.exe`. A
+    batch file found first on a `PATH`, such as npm's `claude.cmd` shim, isn't run: Rust
+    starts one through `cmd`, whose rules no escaping makes safe for a prompt. `status`
+    then says Claude Code isn't installed. `RLXD_CLAUDE_BIN`, the tests' override, is
+    taken as it names, as the `auth-status.cmd` fixture needs.
+- **Runs** start that `claude`, by its absolute path, with the values raw on top of
+  rlxd's own environment. A run takes the values and the `claude` current when its
+  attempt's process starts: one still queued picks up a change made before it starts,
+  and one running keeps what it started with. `run.start` and `run.resume` refuse
+  `claude_not_found` when no `claude` was found where rlxd looked, and
+  `claude_not_runnable` when the one found is a batch file. The message says where it
+  looked. Every other Claude Code rlxd starts does the same: a connector's login, a
+  `connectors.call`, and the connectors' reads and one-turn probe, each on its account's
+  environment ([Connectors](#connectors)).
+- **The brain** (`rlx brain --stdio`) runs with the values raw on top of rlxd's own
+  environment too, as they are when it starts. A change that alters them starts it again
+  with the new values once it is idle: the request it runs ends first, and the next one,
+  queued or not, runs on the new brain. It is stopped as rlxd's stop stops it and started
+  at once, with no backoff and no `error`; `status.brain.restarts` counts it. A change to
+  the values it already has doesn't restart it.
+- **Keychain.** rlx keeps `/usr/bin/security` as the only Keychain reader, and rlxd
+  links no Keychain crate. `deny.toml` bans `security-framework` and `keyring` for
+  `rlxd.yml`'s `cargo deny`. `tests/env.rs` runs 4.3's line as written (`cargo tree
+  --manifest-path rlxd/Cargo.toml --target all -e normal > tree.txt && …`) through `sh`
+  on macOS and Linux, and its `cargo tree` and `grep` on every OS.
+
+`crates/rlxd/tests/env.rs` runs 4.3's Accept lines that start no run, and
+`crates/rlxd/tests/env_runs.rs` those that do, with fake-claude's `print-env`, on three
+OSes.
+
 ## PTYs
 
 rlxd holds processes on pseudo-terminals (handoff 1.4), as tmux held the fleet's panes:
@@ -302,9 +375,12 @@ rlxd runs Claude Code headless, with no tmux and no PTY (handoff 0.10.3, 2.1, 2.
   [--strict-mcp-config] [--json-schema …] [--append-system-prompt …]
   [--include-partial-messages] --settings <home>/rlxd/runs/<run_id>/<attempt>/settings.json
   --setting-sources project --permission-mode dontAsk`, never `--allowedTools` or `--bare`.
-  Claude Code is resolved to an absolute path when each attempt starts
-  (`RLXD_CLAUDE_BIN`, from rlxd's own environment only, else `claude` on rlxd's `PATH`).
-  Its environment is rlxd's own until 4.3 passes the app's.
+  Each attempt starts the absolute `claude` resolved when the app last set its
+  environment, or when rlxd started (4.3, never a lookup at the run's start), with the
+  app's `PATH`, `CLAUDE_CONFIG_DIR` and `CLAUDE_SECURESTORAGE_CONFIG_DIR` on top of rlxd's
+  own environment ([The app's environment](#the-apps-environment-for-claude-code)).
+  `run.start`, `run.resume` and `connectors.call` refuse `claude_not_found` when that
+  resolved to none, and `claude_not_runnable` when to a batch file.
 - **Each attempt's settings** hold one PreToolUse hook (matcher `*`) running `rlxd-hook
   pre-tool-use --run <run_id> --attempt <n> --deadline-ms <deadline_ms>` by the absolute
   path of the `rlxd-hook` beside rlxd (quoted when it must be; on Windows in forward
@@ -416,9 +492,10 @@ listing, 5.5 and 7.7): `crate::connectors`, and the gate in `crate::runner::conn
   states before it sends the prompt. A `needs-auth` or `failed` connector stops the gate
   at once. When it gives up, the run ends `run.failed {reason: "connectors", connectors:
   [{id, status}]}`, after `needs_you.raised {reason: "auth"}` when a connector's sign-in
-  lapsed. That needs-you is kept in the run's record, and cleared once rlxd sees each
-  connector it names `connected` again (a login's end, or any later `system/init`), or
-  by a resume or the space's erase. A run that never reached `run.started` has no
+  lapsed. That needs-you is kept in the run's record, with the home the run's attempt
+  ran on, and cleared once rlxd sees each connector it names `connected` again on that
+  home's account (a login's end, or any later `system/init`), never another's, or by a
+  resume or the space's erase. A run that never reached `run.started` has no
   session to resume (`no_session`): a new run is the way on.
 - **What a missed try leaves.** Nothing of a try ended unconfirmed stays in the run's
   session: a miss, or any other end before its connectors are confirmed (a cancel, the
@@ -435,22 +512,31 @@ listing, 5.5 and 7.7): `crate::connectors`, and the gate in `crate::runner::conn
   account's connectors: the cache is keyed by each account's home, so a run's init is
   filed under the entry the brain gave for that home (its mark kept), and a new mark is a
   new sign-in, to read at once. The file is rlxd's alone (0600); the homes and the mark
-  are never on the wire, in an event, or in rlxd's log. When rlxd's own environment
-  names a `CLAUDE_CONFIG_DIR`, it asks the brain once at its start, so it knows which
-  account its own runs use (with none named, they use the plain account). Without a
+  are never on the wire, in an event, or in rlxd's log. When the runs'
+  `CLAUDE_CONFIG_DIR` names one (the app's when it set one, as runs get it, 4.3; else
+  rlxd's own), or a run's init waits, rlxd asks the brain, at its start and after an
+  `env.set` that leaves it unknown, so it knows which account each run used (with none
+  named, the plain account). The ask runs on its own: an `env.set` made meanwhile is
+  taken at once. Without a
   brain, there is the plain account alone; with the brain unavailable, the accounts stay
   as they were. A managed account is read only with both of its homes as rlx gave them:
   one whose `CLAUDE_CODE_TMPDIR` rlxd doesn't know (a restart with no brain to say it) is
   not read, `account_unknown`, rather than read with rlxd's own. An account gone from its
   list is dropped, with a `connector.removed {account, id}` for each of its connectors.
-- **The cache.** Each `system/init` rlxd takes as a run's truth updates the account the
-  runs use, as the brain gave it: the plain account when rlxd's environment names no
-  `CLAUDE_CONFIG_DIR`, else the account whose `CLAUDE_CONFIG_DIR` it is, matched by its
-  resolved path. Until rlx has said which accounts there are, rlxd holds the latest init
-  and files it then; one that is no account rlx knows is filed nowhere, never under a
-  guess. That is an ungated run's (not `no_tools`, which lists none), a gated run's once
+- **The cache.** Each `system/init` rlxd takes as a run's truth updates the account its
+  own attempt ran on, as the brain gave it: by the `CLAUDE_CONFIG_DIR` that attempt
+  started with (the app's then, when it set one, else rlxd's own), never the runs' home
+  now, which an `env.set` may have changed since. That is the account whose
+  `CLAUDE_CONFIG_DIR` it is, matched by its resolved path, or the plain account when it
+  names none. Until rlx has said which accounts there are, rlxd holds the latest init
+  with that home and files it by it then; one that is no account rlx knows is filed
+  nowhere, never under a guess. That is an ungated run's (not `no_tools`, which lists none), a gated run's once
   confirmed, the last try's of one that failed, and a one-turn probe's. So does a
-  `connectors.call` that finds its connector `needs-auth` or `failed`. A read that lists
+  `connectors.call` that finds its connector `needs-auth` or `failed`, and a login's
+  end: each in the account of the home its own start read (the app's `CLAUDE_CONFIG_DIR`
+  then, else rlxd's own), and nowhere when that is no account rlx knows. The runs'
+  account now only says what a run, call or login started now runs on; it never files
+  a result. A read that lists
   no server at all empties nothing, since a Claude Code that loaded none (E9's stdin at
   EOF) says the same. A server's `source` is its kind (`claude.ai`, or `mcp` for a local
   one), init's where it gives one (`claudeai` is a claude.ai connector), and its tools
@@ -474,8 +560,15 @@ listing, 5.5 and 7.7): `crate::connectors`, and the gate in `crate::runner::conn
     time: started on a control channel in `<home>/rlxd/connectors-read/<slot>/` (which
     must hold no Claude Code settings rlxd didn't write, as a `connectors.call`'s folder
     must not: else `untrusted_settings`), with no tools, no session and project settings
-    only, on the account's environment (both
-    variables taken away for the default account, both set for a managed one). It writes
+    only. It starts the `claude` the app's environment resolved to, on the account's
+    environment: a run's (the app's values on top of rlxd's own), then a managed slot's
+    `CLAUDE_CONFIG_DIR` and `CLAUDE_CODE_TMPDIR` from its record, or neither for the
+    default account, even when the app's values carry `CLAUDE_CONFIG_DIR`. No account's
+    read gets `CLAUDE_SECURESTORAGE_CONFIG_DIR`, the app's or rlxd's: it picks whose
+    Keychain login Claude Code reads, which then keys on the account's own
+    `CLAUDE_CONFIG_DIR` (the default item for the plain account). A managed account rlx
+    gives its own (`secure_storage_dir`, once rlx pins one) is read with it. Runs keep the
+    app's. It writes
     no user line and makes no call: `initialize`, then `mcp_status` every 250 ms until it
     lists a server and none is `pending`, and `model_turns: 0`, `from: "listing"`. An
     account that hasn't settled in 15 s keeps what was read before, with `error:
@@ -487,8 +580,11 @@ listing, 5.5 and 7.7): `crate::connectors`, and the gate in `crate::runner::conn
     one-turn probe of one account, `account` or the default one, never more: not a run,
     with the user's MCP servers loaded and every tool call it attempts denied by rlxd
     itself (its settings' hook is `rlxd __probe-deny`, which opens no connection), and
-    reports `model_turns: 1`. rlxd's log says when each probe and each read ran, of which
-    slot, and holds neither a probe's prompt nor what either listed.
+    reports `model_turns: 1`. Like a read, the probe starts the `claude` the app's
+    environment resolved to, on the account's environment, and is refused
+    `claude_not_found` or `claude_not_runnable` as `run.start` is. rlxd's log says when
+    each probe and each read ran, of which slot, and holds neither a probe's prompt nor
+    what either listed.
   - **Identity** (task #14, step 2; `crate::identity`): after an explicit refresh's reads
     by an `app`, `cli` or `tui` client (a `remote` refresh reads the statuses alone, as
     `connectors.call` refuses `remote`), and only with the capability `connectors.call`
@@ -497,12 +593,15 @@ listing, 5.5 and 7.7): `crate::connectors`, and the gate in `crate::runner::conn
     email?}`. One call per account and connector, at most, of the table's read tool with
     its fixed input, and only when that account's own listing holds the connector
     `connected` and the tool with `read_only_hint: true`. Each is a `connectors.call` run
-    on that account's environment, a gated `watch` run in `run.list` and the ledger
+    on that account's environment (as a read's: the app's `claude` and values, then the
+    account's homes, and no Keychain login dir but its own), a gated `watch` run in
+    `run.list` and the ledger
     started by `rlxd-identity`, and the app decides it. Its result is the identity
     reader's alone: the run's `run.tool_result` carries no content (`null`), so no event
     and nothing in the run's folder holds it; only the identity read from it, in the cache
     and `connectors.list`'s reply. A deny, a failure or an answer that says nothing
-    changes nothing; an identity stays as read until the account is signed in as someone
+    changes nothing, and an identity read raises no needs-you: a connector it finds
+    signed out is filed so under its account, and `connector.changed` tells the app; an identity stays as read until the account is signed in as someone
     else, and a new mark forgets it at once, before any read. Never from a tick, and
     never in rlxd's log. A release
     build's table is empty until the owner's probe (M4) names each connector's tool; a
@@ -522,8 +621,10 @@ listing, 5.5 and 7.7): `crate::connectors`, and the gate in `crate::runner::conn
   an `https://` one is `connector.login.open_url` then `connector.login.waiting`, and
   the login's exit 0 is `connector.login.done {status: "connected"}`; anything else is
   `connector.login.error {code}` (`not_https`, `no_url`, `failed`, `timed_out`,
-  `claude_not_found`). No URL's query, where a login's secrets are, is ever in rlxd's
-  log. The PTY is killed when the login ends.
+  `claude_not_found`, `claude_not_runnable`). Its `claude` and environment are a run's:
+  the app's (4.3), on top of rlxd's own, and its sign-in is filed in the account of the
+  home it started on. No URL's query, where a login's secrets are, is
+  ever in rlxd's log. The PTY is killed when the login ends.
 - **`connectors.call {run_id, connector, tool, input}`** (5.3 phase 2; spike #5, route a)
   makes exactly one call of the connector's tool through Claude Code's own MCP client,
   with no model turn, for `app`, `cli` and `tui` (`remote` gets `role_not_allowed`). It
@@ -533,7 +634,7 @@ listing, 5.5 and 7.7): `crate::connectors`, and the gate in `crate::runner::conn
   connector, `pinned_call` its tool and its input's RFC 8785 SHA-256, never resumed
   (`not_resumable`). Its Claude Code is started on a control channel (`--permission-mode
   manual --permission-prompts host --permission-prompt-tool stdio`, no `--settings`, no
-  session) and is never written a user line: `initialize`, whose capabilities must list
+  session), the `claude` and environment a run's (4.3), and is never written a user line: `initialize`, whose capabilities must list
   `mcp_call_check_permissions_v1` (else the run fails `error`, naming it, and the call is
   `no_route`: an older Claude Code would run it unchecked); `mcp_status`, polled until the
   connector is `connected`, whose tools (named as Claude Code names them) and

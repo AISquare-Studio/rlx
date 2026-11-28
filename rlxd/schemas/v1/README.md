@@ -95,7 +95,7 @@ bound both validators agree on.
 | `connector-login-open-url.json` | `connector.login.open_url`'s data: `{login_id, id, url}`, `url` always `https://` |
 | `connector-login-waiting.json` | `connector.login.waiting`'s data: `{login_id}` |
 | `connector-login-done.json` | `connector.login.done`'s data: `{login_id, id, status}` |
-| `connector-login-error.json` | `connector.login.error`'s data: `{login_id, code, message}`, `code` one of `claude_not_found`, `no_url`, `not_https`, `failed` and `timed_out` |
+| `connector-login-error.json` | `connector.login.error`'s data: `{login_id, code, message}`, `code` one of `claude_not_found`, `claude_not_runnable`, `no_url`, `not_https`, `failed` and `timed_out` |
 
 Validate a document with `uvx check-jsonschema --schemafile rlxd/schemas/v1/<schema> <file>`.
 

@@ -52,6 +52,7 @@ mod config;
 mod connector_map;
 mod connectors;
 mod durable;
+mod env;
 mod events;
 mod files;
 mod gate;

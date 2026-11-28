@@ -19,11 +19,14 @@
 //! - **`connectors.list`** gives the cache: `from: "init"`, `model_turns: 0`.
 //! - **`connectors.login {id}`** runs `claude mcp login <id>` in an rlxd PTY and reports
 //!   its steps as `connector.login.*` events. Only an `https://` URL is passed on, and no
-//!   URL's query, which holds the login's secrets, is ever in rlxd's log.
+//!   URL's query, which holds the login's secrets, is ever in rlxd's log. It starts the
+//!   `claude` the app's environment resolved to, with that environment, as a run does
+//!   (4.3).
 
 use std::collections::{BTreeMap, HashMap};
 use std::ffi::OsString;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -33,15 +36,16 @@ use rlxd_proto::{
     ConnectorLoginDone, ConnectorLoginError, ConnectorLoginOpenUrl, ConnectorLoginWaiting,
     ConnectorState, ConnectorTool, ConnectorsList, ConnectorsLoginData, DEFAULT_ACCOUNT, ErrorBody,
     ListedFrom, LoginErrorCode, McpServer, PtyKillParams, PtyScreenParams, PtySpawnParams,
-    capabilities, connector_types, topics,
+    capabilities, codes, connector_types, topics,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::bus::Bus;
+use crate::env::Env;
 use crate::log::{info, warning};
 use crate::pty::Host;
-use crate::{claude, clock, durable};
+use crate::{clock, durable};
 
 /// The cache's file, under `<home>/rlxd/`.
 const FILE: &str = "connectors.json";
@@ -78,9 +82,20 @@ impl Default for GateTimes {
     }
 }
 
-/// Told every connector the default account holds `connected`, after a change left one
-/// so.
-pub type OnConnected = Box<dyn Fn(&[String]) + Send + Sync>;
+/// What a login or call ran on, to file what it found under (4.3).
+#[derive(Clone, Copy, Debug)]
+pub enum RanOn<'a> {
+    /// The `CLAUDE_CONFIG_DIR` its own snapshot of the app's values gave (`None`: rlxd's
+    /// own): the account a run's init on that home is filed under
+    /// ([`Connectors::slot_of_home`]).
+    Home(Option<&'a str>),
+    /// An account's own read (an identity read): that account, when rlx knows it.
+    Account(u32),
+}
+
+/// Told an account's slot and every connector it holds `connected`, after a change left
+/// one so.
+pub type OnConnected = Box<dyn Fn(u32, &[String]) + Send + Sync>;
 
 /// One Claude Code account rlx knows: its slot, and the environment Claude Code runs on
 /// there. The brain says which there are (`accounts`); with no brain, only the default.
@@ -98,6 +113,12 @@ pub struct Account {
     /// Its `CLAUDE_CODE_TMPDIR`, which goes with `config_dir`.
     #[serde(default)]
     pub tmp_dir: Option<PathBuf>,
+    /// Its `CLAUDE_SECURESTORAGE_CONFIG_DIR`, which picks the Keychain login Claude Code
+    /// reads: a seam the brain fills once rlx pins one for the account (0.10.2's
+    /// `keychain_pin`). Without it, a read of the account has none, and Claude Code keys
+    /// on its `CLAUDE_CONFIG_DIR`. Never set for the default account.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub secure_storage_dir: Option<PathBuf>,
     /// An opaque mark of who is signed in there: another one is another sign-in.
     #[serde(default)]
     pub login: Option<String>,
@@ -111,12 +132,14 @@ impl Account {
             label: None,
             config_dir: None,
             tmp_dir: None,
+            secure_storage_dir: None,
             login: None,
         }
     }
 
-    /// What Claude Code's environment adds for this account: a managed one's two
-    /// variables, or nothing for the default account.
+    /// What Claude Code's environment adds for this account: a managed one's two homes,
+    /// and its `CLAUDE_SECURESTORAGE_CONFIG_DIR` when rlx gave one, or nothing for the
+    /// default account.
     pub fn env(&self) -> Vec<(OsString, OsString)> {
         let mut env = Vec::new();
         if self.slot == DEFAULT_ACCOUNT {
@@ -127,6 +150,9 @@ impl Account {
         }
         if let Some(dir) = &self.tmp_dir {
             env.push(("CLAUDE_CODE_TMPDIR".into(), dir.clone().into_os_string()));
+        }
+        if let Some(dir) = &self.secure_storage_dir {
+            env.push((SECURE_STORAGE.into(), dir.clone().into_os_string()));
         }
         env
     }
@@ -139,12 +165,21 @@ impl Account {
     }
 
     /// What Claude Code's environment takes away for this account: for the default one,
-    /// both variables, as rlxd itself may run under a managed slot's.
+    /// both homes, as rlxd itself may run under a managed slot's; for every account,
+    /// `CLAUDE_SECURESTORAGE_CONFIG_DIR`, which would read another account's Keychain
+    /// login, unless rlx gave a managed one its own ([`Account::env`]).
     pub fn unset(&self) -> Vec<OsString> {
         if self.slot == DEFAULT_ACCOUNT {
-            return vec!["CLAUDE_CONFIG_DIR".into(), "CLAUDE_CODE_TMPDIR".into()];
+            return vec![
+                "CLAUDE_CONFIG_DIR".into(),
+                "CLAUDE_CODE_TMPDIR".into(),
+                SECURE_STORAGE.into(),
+            ];
         }
-        Vec::new()
+        if self.secure_storage_dir.is_some() {
+            return Vec::new();
+        }
+        vec![SECURE_STORAGE.into()]
     }
 
     /// Whether `self` is signed in as someone else than when `entry` was read: its
@@ -154,15 +189,27 @@ impl Account {
     }
 }
 
+/// The variable that picks which Keychain login Claude Code reads.
+const SECURE_STORAGE: &str = "CLAUDE_SECURESTORAGE_CONFIG_DIR";
+
 /// `dir`, resolved, or as it is when it can't be.
 fn canonical(dir: &std::path::Path) -> PathBuf {
     std::fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf())
 }
 
-/// Which account rlxd's own runs use, as they run on rlxd's environment.
+/// The `CLAUDE_CONFIG_DIR` a run runs on, resolved: `app`'s, the app's value, when it is
+/// one, as the run's Claude Code gets it (4.3), else rlxd's own (`rlxd`, resolved already).
+fn runs_home(app: Option<&str>, rlxd: Option<&std::path::Path>) -> Option<PathBuf> {
+    app.filter(|dir| !dir.is_empty())
+        .map(|dir| canonical(std::path::Path::new(dir)))
+        .or_else(|| rlxd.map(std::path::Path::to_path_buf))
+}
+
+/// Which account rlxd's own runs use, as they run on their `CLAUDE_CONFIG_DIR`: the app's
+/// when it set one (4.3), else rlxd's own.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Runs {
-    /// rlxd's environment names a `CLAUDE_CONFIG_DIR`, and rlx hasn't yet said which
+    /// The runs' environment names a `CLAUDE_CONFIG_DIR`, and rlx hasn't yet said which
     /// accounts there are: a run's init is held until it has.
     Waiting,
     /// This slot's.
@@ -181,8 +228,8 @@ impl Runs {
     }
 }
 
-/// Which account rlxd's own runs use: the plain one when rlxd's environment names no
-/// `CLAUDE_CONFIG_DIR` (`own`, resolved); else, once rlx has said which accounts there
+/// Which account rlxd's own runs use: the plain one when their environment names no
+/// `CLAUDE_CONFIG_DIR` (`own`, resolved: the app's, else rlxd's own); else, once rlx has said which accounts there
 /// are or couldn't (`told`), the one whose resolved `CLAUDE_CONFIG_DIR` it is. While no
 /// brain has ever listed the accounts (`listed`, kept in the file across restarts), rlx
 /// knows the plain account alone, so it is the plain one's, as before accounts; once one
@@ -212,6 +259,14 @@ fn runs_of(
         None if !listed => Runs::Slot(DEFAULT_ACCOUNT),
         None => Runs::Nowhere,
     }
+}
+
+/// Logs that a run's `system/init` is filed under no account.
+fn filed_nowhere() {
+    info!(
+        "connectors: a run's connectors are filed under no account: its CLAUDE_CONFIG_DIR is \
+         no account rlx knows"
+    );
 }
 
 /// What a run's `system/init` listed, kept until rlx says which account it belongs to.
@@ -372,14 +427,21 @@ pub struct Connectors {
     /// The accounts rlx knows, by slot: the default one at least. Lock order: the
     /// cache's, then this; never this, then the cache's.
     accounts: Mutex<BTreeMap<u32, Account>>,
-    /// rlxd's own `CLAUDE_CONFIG_DIR`, resolved once: the home its runs, calls and logins
-    /// use, when its environment names one.
-    own_dir: Option<PathBuf>,
-    /// Which account rlxd's runs use ([`Connectors::runs_account`]).
+    /// rlxd's own `CLAUDE_CONFIG_DIR`, resolved once, when its environment names one.
+    rlxd_dir: Option<PathBuf>,
+    /// Whether rlx has said which accounts there are, or couldn't.
+    told: AtomicBool,
+    /// Held while an account is worked out for the runs or for a run's init and taken, so
+    /// that never crosses a change to the accounts.
+    settling: Mutex<()>,
+    /// Which account rlxd's runs use now: what a run, call or login started now runs on,
+    /// the plain one when their environment names no `CLAUDE_CONFIG_DIR` (the app's when
+    /// it set one, 4.3, else rlxd's own), else the one whose resolved `CLAUDE_CONFIG_DIR`
+    /// it is.
     runs: Mutex<Runs>,
-    /// The latest run's `system/init` that came before then: taken as that account's once
-    /// rlx has said which it is.
-    held: Mutex<Option<Seen>>,
+    /// The latest run's `system/init` that came before rlx said which accounts there are,
+    /// with the resolved home its attempt ran on: filed by that home once rlx has said.
+    held: Mutex<Option<(Seen, Option<PathBuf>)>>,
     /// Whether this Claude Code reports connector states before the first message (5.5,
     /// route 1): the capability `connectors.gate_before_turn`.
     route_1: bool,
@@ -394,20 +456,28 @@ pub struct Connectors {
     logins: Mutex<HashMap<String, String>>,
     /// Who is told when a change leaves a connector `connected`: the runner.
     on_connected: OnceLock<OnConnected>,
+    /// The app's environment (4.3): a login's `claude` and the environment it gets.
+    env: Arc<Env>,
 }
 
 impl Connectors {
     /// The connectors of `home`, as its file last held them, their events published on
-    /// `bus`.
-    pub fn new(home: Home, bus: Arc<Bus>) -> Arc<Self> {
+    /// `bus`. A login starts the `claude` `env` resolved to, with its values, as do the
+    /// connectors' reads, on each account's environment.
+    pub fn new(home: Home, bus: Arc<Bus>, env: Arc<Env>) -> Arc<Self> {
         let own_dir = std::env::var_os("CLAUDE_CONFIG_DIR")
             .filter(|v| !v.is_empty())
             .map(PathBuf::from);
-        Self::with_own_dir(home, bus, own_dir.as_deref())
+        Self::with_own_dir(home, bus, env, own_dir.as_deref())
     }
 
     /// [`Connectors::new`], rlxd's own `CLAUDE_CONFIG_DIR` being `own_dir`.
-    fn with_own_dir(home: Home, bus: Arc<Bus>, own_dir: Option<&std::path::Path>) -> Arc<Self> {
+    fn with_own_dir(
+        home: Home,
+        bus: Arc<Bus>,
+        env: Arc<Env>,
+        own_dir: Option<&std::path::Path>,
+    ) -> Arc<Self> {
         let path = home.rlxd_dir().join(FILE);
         let saved = match std::fs::read_to_string(&path) {
             Ok(text) => Saved::read(&text).unwrap_or_else(|e| {
@@ -428,6 +498,7 @@ impl Connectors {
                 label: entry.label.clone(),
                 config_dir: entry.config_dir.clone(),
                 tmp_dir: entry.tmp_dir.clone(),
+                secure_storage_dir: None,
                 login: entry.login.clone(),
             };
             accounts.insert(
@@ -443,14 +514,20 @@ impl Connectors {
                 },
             );
         }
-        let own_dir = own_dir.map(canonical);
-        let runs = runs_of(own_dir.as_deref(), &accounts, false, saved.listed);
+        let rlxd_dir = own_dir.map(canonical);
+        let runs_dir = runs_home(
+            env.values().claude_config_dir.as_deref(),
+            rlxd_dir.as_deref(),
+        );
+        let runs = runs_of(runs_dir.as_deref(), &accounts, false, saved.listed);
         Arc::new(Self {
             home,
             bus,
             cache: Mutex::new(saved),
             accounts: Mutex::new(accounts),
-            own_dir,
+            rlxd_dir,
+            told: AtomicBool::new(false),
+            settling: Mutex::new(()),
             runs: Mutex::new(runs),
             held: Mutex::new(None),
             route_1: test_route_1(),
@@ -459,6 +536,7 @@ impl Connectors {
             gate: GateTimes::default(),
             logins: Mutex::new(HashMap::new()),
             on_connected: OnceLock::new(),
+            env,
         })
     }
 
@@ -472,10 +550,37 @@ impl Connectors {
     }
 
     /// Tells [`Connectors::on_connected`]'s callee who is connected now.
-    fn tell_connected(&self, connected: &[String]) {
+    fn tell_connected(&self, slot: u32, connected: &[String]) {
         if let Some(told) = self.on_connected.get() {
-            told(connected);
+            told(slot, connected);
         }
+    }
+
+    /// The account a run, call or login ran on, whose attempt started with `home`, the
+    /// `CLAUDE_CONFIG_DIR` its snapshot of the app's values gave (`None`: rlxd's own), by
+    /// the rules a run's init is filed by ([`Connectors::observe`]): `None` while rlx has
+    /// yet to say which accounts there are, and when that home is none of theirs. What it
+    /// found is filed there, or nowhere. Takes no lock of the runs'.
+    /// The account `on` names: [`Connectors::slot_of_home`] for a start's home, or an
+    /// account's own read's, when rlx knows it. `None`: what it found is filed nowhere.
+    pub fn slot_of(&self, on: RanOn<'_>) -> Option<u32> {
+        match on {
+            RanOn::Home(home) => self.slot_of_home(home),
+            RanOn::Account(slot) => self.known().contains_key(&slot).then_some(slot),
+        }
+    }
+
+    pub fn slot_of_home(&self, home: Option<&str>) -> Option<u32> {
+        let home = runs_home(home, self.rlxd_dir.as_deref());
+        let known = self.known().clone();
+        let listed = self.cache().listed;
+        runs_of(
+            home.as_deref(),
+            &known,
+            self.told.load(Ordering::SeqCst),
+            listed,
+        )
+        .slot()
     }
 
     fn cache(&self) -> MutexGuard<'_, Saved> {
@@ -501,10 +606,16 @@ impl Connectors {
         self.no_turn
     }
 
-    /// What the runs' account's cache says of `connector`'s `tool`: its
-    /// `read_only_hint`, or `None` when it doesn't list that tool of that connector.
-    pub fn read_only_hint(&self, connector: &str, tool: &str) -> Option<Option<bool>> {
-        let slot = self.runs_slot()?;
+    /// What the cache of the account a call runs on (`on`) says of `connector`'s `tool`:
+    /// its `read_only_hint`, or `None` when it doesn't list that tool of that connector, or
+    /// that account is not known ([`Connectors::slot_of`]).
+    pub fn read_only_hint(
+        &self,
+        connector: &str,
+        tool: &str,
+        on: RanOn<'_>,
+    ) -> Option<Option<bool>> {
+        let slot = self.slot_of(on)?;
         let cache = self.cache();
         cache
             .accounts
@@ -546,53 +657,81 @@ impl Connectors {
         self.known().get(&slot).cloned()
     }
 
-    /// The account rlxd's runs, calls and logins use, as they run on rlxd's own
-    /// environment, as rlx knows it (its mark included): the plain one when rlxd's
-    /// environment names no `CLAUDE_CONFIG_DIR`, else the one whose resolved
-    /// `CLAUDE_CONFIG_DIR` it is. `None` while rlx hasn't said which accounts there are,
-    /// and when it is none of theirs.
-    pub fn runs_account(&self) -> Option<Account> {
-        let slot = self.runs_slot()?;
-        self.account(slot)
-    }
-
-    /// Whether rlx has yet to say which account rlxd's runs use: only while rlxd's
-    /// environment names a `CLAUDE_CONFIG_DIR`.
+    /// Whether rlx has yet to say which accounts there are while it matters: the runs'
+    /// environment names a `CLAUDE_CONFIG_DIR`, or a run's init waits for it.
     pub fn runs_account_unknown(&self) -> bool {
         self.runs_now() == Runs::Waiting
+            || self
+                .held
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .is_some()
     }
 
     fn runs_now(&self) -> Runs {
         *self.runs.lock().unwrap_or_else(|p| p.into_inner())
     }
 
-    fn runs_slot(&self) -> Option<u32> {
-        self.runs_now().slot()
-    }
-
     /// Notes that rlx couldn't say which accounts there are: the accounts stay as they
     /// were, and rlxd's runs are filed by them from now on.
     pub fn unanswered(&self) {
+        let _settling = self.settling.lock().unwrap_or_else(|p| p.into_inner());
+        self.told.store(true, Ordering::SeqCst);
         let known = self.known().clone();
         let listed = self.cache().listed;
-        self.settle_runs(runs_of(self.own_dir.as_deref(), &known, true, listed));
+        let home = self.runs_home_now();
+        self.settle_runs(runs_of(home.as_deref(), &known, true, listed));
     }
 
-    /// Takes `runs` as the runs' account, and files the `system/init` held until it was
-    /// known, or, when it is no account rlx knows, lets it go.
+    /// The `CLAUDE_CONFIG_DIR` a run started now runs on, resolved: the app's when it set
+    /// one (4.3), else rlxd's own.
+    fn runs_home_now(&self) -> Option<PathBuf> {
+        runs_home(
+            self.env.values().claude_config_dir.as_deref(),
+            self.rlxd_dir.as_deref(),
+        )
+    }
+
+    /// Works out again which account rlxd's runs use now, after a change to the app's
+    /// values: what a run, call or login started from now on runs on. A run's
+    /// `system/init` is filed by the home its own attempt ran on ([`Connectors::observe`]),
+    /// never by this. Resolves the home: never under the cache's lock.
+    pub fn env_changed(&self) {
+        let _settling = self.settling.lock().unwrap_or_else(|p| p.into_inner());
+        let home = self.runs_home_now();
+        let known = self.known().clone();
+        let listed = self.cache().listed;
+        let told = self.told.load(Ordering::SeqCst);
+        *self.runs.lock().unwrap_or_else(|p| p.into_inner()) =
+            runs_of(home.as_deref(), &known, told, listed);
+    }
+
+    /// Each change to the app's values from here on: what [`Connectors::env_changed`]
+    /// follows.
+    pub fn env_changes(&self) -> tokio::sync::watch::Receiver<rlxd_proto::EnvValues> {
+        self.env.subscribe()
+    }
+
+    /// Takes `runs` as the runs' account now, and files the `system/init` held until rlx
+    /// said which accounts there are, by the home its own attempt ran on: under the
+    /// account whose home that is, or nowhere when it is no account rlx knows.
     fn settle_runs(&self, runs: Runs) {
         *self.runs.lock().unwrap_or_else(|p| p.into_inner()) = runs;
         if runs == Runs::Waiting {
             return;
         }
         let held = self.held.lock().unwrap_or_else(|p| p.into_inner()).take();
-        match (held, self.runs_account()) {
-            (Some(seen), Some(account)) => self.observe_on(&account, seen.observed(), Read::Init),
-            (Some(_), None) => info!(
-                "connectors: a run's connectors are filed under no account: rlxd's \
-                 CLAUDE_CONFIG_DIR is no account rlx knows"
-            ),
-            (None, _) => {}
+        let Some((seen, home)) = held else {
+            return;
+        };
+        let known = self.known().clone();
+        let listed = self.cache().listed;
+        match runs_of(home.as_deref(), &known, true, listed) {
+            Runs::Slot(slot) => match known.get(&slot) {
+                Some(account) => self.observe_on(account, seen.observed(), Read::Init),
+                None => filed_nowhere(),
+            },
+            Runs::Waiting | Runs::Nowhere => filed_nowhere(),
         }
     }
 
@@ -601,6 +740,8 @@ impl Connectors {
     /// in as someone else since it was read (another mark). An account no longer listed
     /// is dropped from the cache, with `connector.removed` for each of its connectors.
     pub fn set_accounts(&self, listed: Vec<Account>) -> Vec<Account> {
+        let _settling = self.settling.lock().unwrap_or_else(|p| p.into_inner());
+        self.told.store(true, Ordering::SeqCst);
         let mut now = BTreeMap::from([(DEFAULT_ACCOUNT, Account::default_one())]);
         for account in listed {
             if account.slot == 0 {
@@ -621,7 +762,8 @@ impl Connectors {
             now.insert(account.slot, account);
         }
         // Each home resolved before the cache's lock is taken.
-        let runs = runs_of(self.own_dir.as_deref(), &now, true, true);
+        let home = self.runs_home_now();
+        let runs = runs_of(home.as_deref(), &now, true, true);
         let mut cache = self.cache();
         let mut changed = !cache.listed;
         cache.listed = true;
@@ -726,21 +868,39 @@ impl Connectors {
         .with_accounts(listed)
     }
 
-    /// Takes a run's `system/init` as the runs' account's connectors now
-    /// ([`Connectors::observe_on`]), as rlx knows that account. Until rlx has said which
-    /// account that is, the latest init is held, and taken then; when it is no account
-    /// rlx knows, it is filed nowhere.
-    pub fn observe(&self, init: Observed<'_>) {
-        match (self.runs_now(), self.runs_account()) {
-            (Runs::Slot(_), Some(account)) => self.observe_on(&account, init, Read::Init),
-            (Runs::Waiting, _) => {
-                info!("connectors: a run's connectors wait for rlx to say which account it is");
-                *self.held.lock().unwrap_or_else(|p| p.into_inner()) = Some(Seen::of(init));
+    /// Takes a run's `system/init` as the connectors now of the account its attempt ran on
+    /// ([`Connectors::observe_on`]), as rlx knows that account: the one whose resolved
+    /// `CLAUDE_CONFIG_DIR` is `home`'s, the plain account when it names none, and none
+    /// when no account has that home. `home` is the `CLAUDE_CONFIG_DIR` the app's values
+    /// gave that attempt when it started, `None` when they gave none: then it ran on
+    /// rlxd's own. Never the runs' home now, which an `env.set` may have changed since.
+    /// Until rlx has said which accounts there are, the latest such init is held with its
+    /// home, and filed by it then.
+    pub fn observe(&self, init: Observed<'_>, home: Option<&str>) {
+        let home = runs_home(home, self.rlxd_dir.as_deref());
+        let account = {
+            let _settling = self.settling.lock().unwrap_or_else(|p| p.into_inner());
+            let known = self.known().clone();
+            let listed = self.cache().listed;
+            match runs_of(
+                home.as_deref(),
+                &known,
+                self.told.load(Ordering::SeqCst),
+                listed,
+            ) {
+                Runs::Waiting => {
+                    info!("connectors: a run's connectors wait for rlx to say which account it is");
+                    *self.held.lock().unwrap_or_else(|p| p.into_inner()) =
+                        Some((Seen::of(init), home));
+                    return;
+                }
+                Runs::Slot(slot) => known.get(&slot).cloned(),
+                Runs::Nowhere => None,
             }
-            _ => info!(
-                "connectors: a run's connectors are filed under no account: rlxd's \
-                 CLAUDE_CONFIG_DIR is no account rlx knows"
-            ),
+        };
+        match account {
+            Some(account) => self.observe_on(&account, init, Read::Init),
+            None => filed_nowhere(),
         }
     }
 
@@ -781,7 +941,6 @@ impl Connectors {
             .checked_at(at.clone());
             now.insert(server.name.clone(), connector);
         }
-        let runs = self.runs_slot();
         let mut cache = self.cache();
         let entry = cache.entry(slot);
         if now.is_empty() && !entry.connectors.is_empty() {
@@ -840,7 +999,7 @@ impl Connectors {
             Read::Listing => ListedFrom::Listing,
         };
         entry.keep(account);
-        let connected = (connected_now && Some(slot) == runs).then(|| connected_in(entry));
+        let connected = connected_now.then(|| connected_in(entry));
         // Kept, then published, both under the cache's lock: two reads' changes are
         // written and published in their order, and none is published before it is
         // kept.
@@ -850,7 +1009,7 @@ impl Connectors {
         }
         drop(cache);
         if let Some(connected) = connected {
-            self.tell_connected(&connected);
+            self.tell_connected(slot, &connected);
         }
     }
 
@@ -920,10 +1079,17 @@ impl Connectors {
         self.save(&cache);
     }
 
-    /// Sets the runs' account's `id`'s status, when it has it: a login's end, or a
-    /// call's `mcp_status` that found it `needs-auth` or `failed`.
-    pub fn set_status(&self, id: &str, status: ConnectorState) {
-        let Some(slot) = self.runs_slot() else {
+    /// Sets `id`'s status in the account a login or call ran on (`on`), when it has it: a
+    /// login's end, or a call's `mcp_status` that found it `needs-auth` or `failed`. For a
+    /// start on the app's values, the account a run's init on its own snapshot's home is
+    /// filed under; for an identity read, its account ([`Connectors::slot_of`]); none
+    /// when that is not known. Never the runs' account now, which an `env.set` may have
+    /// changed since it started.
+    pub fn set_status(&self, id: &str, status: ConnectorState, on: RanOn<'_>) {
+        let Some(slot) = self.slot_of(on) else {
+            info!(
+                "connectors: {id}'s status is filed under no account: its home is none rlx knows"
+            );
             return;
         };
         let mut cache = self.cache();
@@ -946,7 +1112,7 @@ impl Connectors {
         );
         drop(cache);
         if let Some(connected) = connected {
-            self.tell_connected(&connected);
+            self.tell_connected(slot, &connected);
         }
     }
 
@@ -1034,17 +1200,20 @@ impl Connectors {
 
     /// Runs and watches one login to its end.
     fn watch_login(&self, host: &Host, id: &str, login_id: &str) {
-        let Some(program) = claude::resolve().and_then(|p| std::path::absolute(p).ok()) else {
-            self.login_failed(
-                login_id,
-                LoginErrorCode::ClaudeNotFound,
-                &format!(
-                    "Claude Code was not found: there is no `claude` on rlxd's PATH, and {} \
-                     names none",
-                    claude::BIN_ENV
-                ),
-            );
-            return;
+        // The `claude` the app's environment resolved to, read with the values it goes
+        // with, and refused as a run's start is (4.3).
+        let (values, resolved) = self.env.snapshot();
+        let program = match crate::runner::claude_from(resolved) {
+            Ok(program) => program,
+            Err(refused) => {
+                let code = if refused.code == codes::CLAUDE_NOT_RUNNABLE {
+                    LoginErrorCode::ClaudeNotRunnable
+                } else {
+                    LoginErrorCode::ClaudeNotFound
+                };
+                self.login_failed(login_id, code, &refused.message);
+                return;
+            }
         };
         // `--` first, so no id is read as an option (`connectors.login` refuses one that
         // begins with `-` anyway).
@@ -1058,8 +1227,8 @@ impl Connectors {
         let spawned = PtySpawnParams::new(argv, LOGIN_COLS, 50)
             .map(|params| {
                 // Claude Code's environment, as a run's (run_env): rlxd's own, which the
-                // PTY inherits, and what the app adds.
-                crate::runner::run_env()
+                // PTY inherits, and the app's (4.3), raw.
+                crate::runner::run_env(&values)
                     .into_iter()
                     .filter_map(|(name, value)| {
                         Some((name.into_string().ok()?, value.into_string().ok()?))
@@ -1096,7 +1265,8 @@ impl Connectors {
                 connector_types::LOGIN_DONE,
                 json_of(&ConnectorLoginDone::new(login_id, id, status)),
             );
-            self.set_status(id, status);
+            // On the account this login ran on: its own snapshot's home.
+            self.set_status(id, status, RanOn::Home(values.claude_config_dir.as_deref()));
         }
     }
 
@@ -1415,7 +1585,9 @@ mod tests {
 
         fn connectors(&self) -> Arc<Connectors> {
             let bus = crate::bus::Bus::open_at(self.0.join("seq"), crate::bus::Limits::DEFAULT);
-            Connectors::with_own_dir(Home::at(&self.0), Arc::new(bus.unwrap()), None)
+            let home = Home::at(&self.0);
+            let env = Arc::new(Env::open(&home));
+            Connectors::with_own_dir(home, Arc::new(bus.unwrap()), env, None)
         }
     }
 
@@ -1445,8 +1617,8 @@ mod tests {
         let none = (HashMap::new(), HashMap::new());
         let slack = [McpServer::new("claude.ai Slack", "connected")];
         let tools = ["mcp__claude_ai_Slack__read".to_owned()];
-        connectors.observe(seen(&slack, &tools, &none));
-        connectors.observe(seen(&[], &[], &none));
+        connectors.observe(seen(&slack, &tools, &none), None);
+        connectors.observe(seen(&[], &[], &none), None);
         let list = connectors.list(0, None);
         assert_eq!(list.connectors.len(), 1);
         assert_eq!(list.connectors[0].tools.len(), 1);
@@ -1459,13 +1631,16 @@ mod tests {
         let told = Arc::new(Mutex::new(Vec::new()));
         connectors.on_connected(Box::new({
             let told = Arc::clone(&told);
-            move |ids| told.lock().unwrap().push(ids.to_vec())
+            move |slot, ids: &[String]| {
+                assert_eq!(slot, DEFAULT_ACCOUNT, "the account it changed in");
+                told.lock().unwrap().push(ids.to_vec());
+            }
         }));
         let none = (HashMap::new(), HashMap::new());
         let slack = |status| McpServer::new("claude.ai Slack", status);
         let local = McpServer::new("local", "connected");
         for status in ["needs-auth", "needs-auth", "connected", "connected"] {
-            connectors.observe(seen(&[slack(status), local.clone()], &[], &none));
+            connectors.observe(seen(&[slack(status), local.clone()], &[], &none), None);
         }
         let both = vec!["claude.ai Slack".to_owned(), "local".to_owned()];
         // local's coming, then Slack's sign-in back; nothing for no change.
@@ -1473,8 +1648,16 @@ mod tests {
             *told.lock().unwrap(),
             [vec!["local".to_owned()], both.clone()]
         );
-        connectors.set_status("claude.ai Slack", ConnectorState::NeedsAuth);
-        connectors.set_status("claude.ai Slack", ConnectorState::Connected);
+        connectors.set_status(
+            "claude.ai Slack",
+            ConnectorState::NeedsAuth,
+            RanOn::Home(None),
+        );
+        connectors.set_status(
+            "claude.ai Slack",
+            ConnectorState::Connected,
+            RanOn::Home(None),
+        );
         assert_eq!(told.lock().unwrap().len(), 3);
         assert_eq!(told.lock().unwrap()[2], both);
     }
@@ -1485,6 +1668,7 @@ mod tests {
             label: Some(format!("slot{slot}")),
             config_dir: Some(PathBuf::from(format!("/accounts/{slot}"))),
             tmp_dir: Some(PathBuf::from(format!("/tmp-accounts/{slot}"))),
+            secure_storage_dir: None,
             login: Some(login.to_owned()),
         }
     }
@@ -1496,7 +1680,7 @@ mod tests {
         let none = (HashMap::new(), HashMap::new());
         assert_eq!(connectors.set_accounts(vec![managed(2, "b")]).len(), 2);
         let slack = |status| [McpServer::new("claude.ai Slack", status)];
-        connectors.observe(seen(&slack("connected"), &[], &none));
+        connectors.observe(seen(&slack("connected"), &[], &none), None);
         connectors.observe_on(
             &managed(2, "b"),
             seen(&slack("needs-auth"), &[], &none),
@@ -1545,7 +1729,7 @@ mod tests {
         assert_eq!(connectors.stale(Duration::from_secs(1)).len(), 1);
         let none = (HashMap::new(), HashMap::new());
         let slack = [McpServer::new("claude.ai Slack", "connected")];
-        connectors.observe(seen(&slack, &[], &none));
+        connectors.observe(seen(&slack, &[], &none), None);
         assert!(connectors.stale(Duration::from_secs(3600)).is_empty());
     }
 
@@ -1555,11 +1739,12 @@ mod tests {
         let slot = dir.0.join("slot-2");
         std::fs::create_dir_all(&slot).unwrap();
         let bus = crate::bus::Bus::open_at(dir.0.join("seq"), crate::bus::Limits::DEFAULT);
-        let connectors =
-            Connectors::with_own_dir(Home::at(&dir.0), Arc::new(bus.unwrap()), Some(&slot));
+        let home = Home::at(&dir.0);
+        let env = Arc::new(Env::open(&home));
+        let connectors = Connectors::with_own_dir(home, Arc::new(bus.unwrap()), env, Some(&slot));
         let none = (HashMap::new(), HashMap::new());
         let slack = [McpServer::new("claude.ai Slack", "connected")];
-        connectors.observe(seen(&slack, &[], &none));
+        connectors.observe(seen(&slack, &[], &none), None);
         assert!(
             connectors.list(0, None).accounts[0].connectors.is_empty(),
             "held"
@@ -1575,7 +1760,10 @@ mod tests {
             list.connectors.is_empty(),
             "the top level is the plain account's"
         );
-        assert_eq!(connectors.read_only_hint("claude.ai Slack", "x"), None);
+        assert_eq!(
+            connectors.read_only_hint("claude.ai Slack", "x", RanOn::Home(None)),
+            None
+        );
     }
 
     fn row_of(list: &ConnectorsList, slot: u32) -> AccountConnectors {
@@ -1595,12 +1783,15 @@ mod tests {
         let sources = HashMap::new();
         let read = |status: &str, tools: &[String], hints: &HashMap<String, bool>| {
             let servers = [McpServer::new("claude.ai Fixture", status)];
-            connectors.observe(Observed {
-                servers: &servers,
-                sources: &sources,
-                tools,
-                hints,
-            });
+            connectors.observe(
+                Observed {
+                    servers: &servers,
+                    sources: &sources,
+                    tools,
+                    hints,
+                },
+                None,
+            );
             connectors
                 .identity_sources(DEFAULT_ACCOUNT)
                 .iter()
@@ -1664,13 +1855,13 @@ mod tests {
         let connectors = dir.connectors();
         let none = (HashMap::new(), HashMap::new());
         let slack = [McpServer::new("claude.ai Slack", "connected")];
-        connectors.observe(seen(&slack, &[], &none));
+        connectors.observe(seen(&slack, &[], &none), None);
         let error = ErrorBody::new("no_route", "no mcp_status").unwrap();
         connectors.refresh_failed(&Account::default_one(), error.clone());
         let list = connectors.list(0, None);
         assert_eq!(list.connectors.len(), 1);
         assert_eq!(list.accounts[0].error.as_ref(), Some(&error));
-        connectors.observe(seen(&slack, &[], &none));
+        connectors.observe(seen(&slack, &[], &none), None);
         assert_eq!(connectors.list(0, None).accounts[0].error, None);
     }
 

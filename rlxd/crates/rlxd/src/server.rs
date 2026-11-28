@@ -41,11 +41,11 @@ use std::time::{Duration, Instant};
 use rlxd_client::Home;
 use rlxd_proto::{
     Claude, Clients, ConnectorsCallParams, ConnectorsListParams, ConnectorsLoginParams, Data,
-    Envelope, ErrorBody, Event, HelloData, HelloParams, JobListParams, JobPutParams, JobRef,
-    PROTOCOL_VERSION, PROTOCOL_VERSIONS, Params, Paths, PtyKillParams, PtyResizeParams,
-    PtyScreenParams, PtySpawnParams, PtySubscribeParams, PtyWriteParams, Request, RequestId, Role,
-    RunDecideParams, RunEventsParams, RunListParams, RunRef, RunResumeParams, RunStartParams,
-    SettingsDeleteParams, SettingsGetParams, SettingsListParams, SettingsSetParams,
+    EnvRefusal, EnvValues, Envelope, ErrorBody, Event, HelloData, HelloParams, JobListParams,
+    JobPutParams, JobRef, PROTOCOL_VERSION, PROTOCOL_VERSIONS, Params, Paths, PtyKillParams,
+    PtyResizeParams, PtyScreenParams, PtySpawnParams, PtySubscribeParams, PtyWriteParams, Request,
+    RequestId, Role, RunDecideParams, RunEventsParams, RunListParams, RunRef, RunResumeParams,
+    RunStartParams, SettingsDeleteParams, SettingsGetParams, SettingsListParams, SettingsSetParams,
     SpaceEnsureData, SpaceParams, StatusData, SubscribeParams, VERSION, codes, event_types,
     methods, setting_keys, topics,
 };
@@ -58,6 +58,7 @@ use crate::brain::Brain;
 use crate::bus::{self, Bus, Cursor, Line, Topics};
 use crate::connector_map::ConnectorMap;
 use crate::connectors::Connectors;
+use crate::env::Env;
 use crate::gate::{self, AnswerError, Gate, Hold, Refused, Route, UnpairError};
 use crate::listener::Hangup;
 use crate::log::{info, warning};
@@ -111,6 +112,8 @@ pub struct Daemon {
     /// The scheduler, or why it couldn't start (its database couldn't be made).
     scheduler: Result<Arc<Scheduler>, String>,
     settings: Settings,
+    /// The app's environment for Claude Code (4.3), and the `claude` it resolves to.
+    env: Arc<Env>,
     ptys: Arc<Host>,
     stopping: AtomicBool,
     stop: watch::Sender<bool>,
@@ -205,8 +208,10 @@ enum Frame {
 
 impl Daemon {
     /// An rlxd serving `home` with `token`, whose gate is `gate`, publishing on `bus`,
-    /// serving `settings`, and asking `brain`.
+    /// serving `settings` and the app's environment `env`, and asking `brain`, which runs
+    /// with `env`.
     /// `pipe_acl` is what `status` says of the pipe's DACL, on Windows.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         home: Home,
         token: String,
@@ -214,11 +219,17 @@ impl Daemon {
         gate: Gate,
         bus: Bus,
         settings: Settings,
+        env: Arc<Env>,
         brain: Arc<Brain>,
     ) -> Arc<Self> {
         let bus = Arc::new(bus);
-        let connectors = Connectors::new(home.clone(), Arc::clone(&bus));
-        let runner = Runner::new(home.clone(), Arc::clone(&bus), Arc::clone(&connectors));
+        let connectors = Connectors::new(home.clone(), Arc::clone(&bus), Arc::clone(&env));
+        let runner = Runner::new(
+            home.clone(),
+            Arc::clone(&bus),
+            Arc::clone(&env),
+            Arc::clone(&connectors),
+        );
         let gate = Arc::new(gate);
         runner.follow_apps(gate.apps());
         let map = ConnectorMap::new(
@@ -248,6 +259,7 @@ impl Daemon {
             map,
             scheduler,
             settings,
+            env,
             stopping: AtomicBool::new(false),
             stop: watch::Sender::new(false),
             gate,
@@ -391,17 +403,44 @@ impl Daemon {
             let error = error(codes::UNAUTHORIZED, "the token is wrong").with_hint(hint);
             return Err(Envelope::err(error).with_optional_id(id));
         }
+        // env (4.3) is the app's alone: any other hello carrying it is refused not_gate,
+        // as is an app hello the gate refuses, whatever its env (7.2). The app's is checked
+        // whole once the gate would admit it, and before it takes the gate, so a hello
+        // refused for its env takes no hold.
+        if hello.env.is_some() && hello.role != Role::App {
+            info!(
+                "hello refused: env from {} as {} (not_gate)",
+                hello.client,
+                role_name(hello.role)
+            );
+            return Err(Envelope::err(env_not_gate("hello's env")).with_optional_id(id));
+        }
+        let mut env_change = None;
         let (app, counted) = if hello.role == Role::App {
-            match self.admit_app(&hello, &peer).await {
-                Ok(hold) => (Some(hold), None),
-                Err(message) => {
-                    info!(
-                        "hello refused: role app, from {} ({peer}): {message} (not_gate)",
-                        hello.client
-                    );
-                    let error = error(codes::NOT_GATE, &message).with_hint(NOT_GATE_HINT);
-                    return Err(Envelope::err(error).with_optional_id(id));
+            let not_gate = |message: &str| {
+                info!(
+                    "hello refused: role app, from {} ({peer}): {message} (not_gate)",
+                    hello.client
+                );
+                let error = error(codes::NOT_GATE, message).with_hint(NOT_GATE_HINT);
+                Err(Envelope::err(error).with_optional_id(id))
+            };
+            let credential = match self.vet_app(&hello, &peer).await {
+                Ok(credential) => credential,
+                Err(message) => return not_gate(&message),
+            };
+            if let Some(env) = &hello.env {
+                match EnvValues::from_map(env) {
+                    Ok(change) => env_change = Some(change),
+                    Err(refusal) => {
+                        info!("hello refused: {refusal}");
+                        return Err(Envelope::err(env_refused(refusal)).with_optional_id(id));
+                    }
                 }
+            }
+            match self.gate.attach(credential) {
+                Some(hold) => (Some(hold), None),
+                None => return not_gate("the gate_credential was replaced or unpaired meanwhile"),
             }
         } else {
             let Some(counted) = Counted::new(self, hello.role) else {
@@ -410,6 +449,13 @@ impl Daemon {
             };
             (None, Some(counted))
         };
+        if let Some(change) = env_change.filter(|change| !change.is_empty()) {
+            let who = format!("app {}", hello.client);
+            if let Err(e) = off_worker(|| self.env.set(&change, &who)) {
+                return Err(reply_err(id, codes::INTERNAL, e.to_string()));
+            }
+            *self.claude.lock().await = None;
+        }
         info!(
             "hello: {} {} as {}{}",
             hello.client,
@@ -436,8 +482,13 @@ impl Daemon {
 
     /// Whether a `hello {role: "app"}` may hold the gate: a paired device's credential,
     /// a peer of rlxd's user, and for a device paired locally, a peer that passes the
-    /// identity check (outside dev mode). Its hold, or why not.
-    async fn admit_app(&self, hello: &HelloParams, peer: &Arc<Peer>) -> Result<Hold, String> {
+    /// identity check (outside dev mode). Its credential, to take the gate with
+    /// (`Gate::attach`), or why not.
+    async fn vet_app<'a>(
+        &self,
+        hello: &'a HelloParams,
+        peer: &Arc<Peer>,
+    ) -> Result<&'a str, String> {
         let Some(credential) = hello.gate_credential.as_deref() else {
             return Err("role app needs a gate_credential, which gate.pair mints".to_owned());
         };
@@ -463,9 +514,7 @@ impl Daemon {
                 info!("gate: device {device:?}: {how}");
             }
         }
-        self.gate
-            .attach(credential)
-            .ok_or_else(|| "the gate_credential was replaced or unpaired meanwhile".to_owned())
+        Ok(credential)
     }
 
     /// What one request frame after `hello` gets. On a connection that carries a stream
@@ -560,6 +609,8 @@ impl Daemon {
             methods::SETTINGS_SET => self.settings_set(session, request.params),
             methods::SETTINGS_LIST => self.settings_list(request.params),
             methods::SETTINGS_DELETE => self.settings_delete(session, request.params),
+            methods::ENV_GET => printed(&self.env.values()),
+            methods::ENV_SET => self.env_set(session, request.params).await,
             methods::PTY_SUBSCRIBE if streaming => Err(error(
                 codes::INVALID_REQUEST,
                 "this connection carries a stream already: open another for a second",
@@ -669,6 +720,21 @@ impl Daemon {
         })
         .map_err(refused)?;
         printed(&setting)
+    }
+
+    /// `env.set {…}` (4.3): only an app-role connection that holds the gate, a paired
+    /// device, sets the app's environment; any other gets `not_gate`. A key that is not
+    /// one of the three is `bad_env_key`. Either way, nothing changes.
+    async fn env_set(&self, session: &Session, params: Params) -> Result<Data, ErrorBody> {
+        if !session.app.as_ref().is_some_and(|hold| !hold.is_kicked()) {
+            return Err(env_not_gate("env.set"));
+        }
+        let change = EnvValues::from_object(&params).map_err(env_refused)?;
+        let who = format!("{} {}", role_name(session.role), session.client);
+        let values = off_worker(|| self.env.set(&change, &who))
+            .map_err(|e| error(codes::INTERNAL, &e.to_string()))?;
+        *self.claude.lock().await = None;
+        printed(&values)
     }
 
     /// `settings.list {prefix?}`.
@@ -891,7 +957,8 @@ impl Daemon {
         {
             return claude.clone();
         }
-        let claude = claude::probe().await;
+        let (resolved, source) = self.env.claude();
+        let claude = claude::probe_at(&resolved, source).await;
         *cached = Some((Instant::now(), claude.clone()));
         claude
     }
@@ -2433,6 +2500,8 @@ fn served() -> Vec<&'static str> {
         methods::SETTINGS_SET,
         methods::SETTINGS_LIST,
         methods::SETTINGS_DELETE,
+        methods::ENV_GET,
+        methods::ENV_SET,
         methods::GATE_PAIR,
         methods::GATE_PAIR_REQUESTS,
         methods::GATE_PAIR_ANSWER,
@@ -2483,6 +2552,29 @@ fn error(code: &str, message: &str) -> ErrorBody {
 
 fn reply_err(id: Option<RequestId>, code: &str, message: String) -> Envelope {
     Envelope::err(error(code, &message)).with_optional_id(id)
+}
+
+/// The `not_gate` for `what`, an env change from anything but the gate holder (4.3).
+fn env_not_gate(what: &str) -> ErrorBody {
+    error(
+        codes::NOT_GATE,
+        &format!(
+            "only an app-role connection holding the gate, a paired device, may change the \
+             app's environment ({what})"
+        ),
+    )
+    .with_hint(
+        "PATH, CLAUDE_CONFIG_DIR and CLAUDE_SECURESTORAGE_CONFIG_DIR decide which claude \
+         every run starts, so only rlx's app sets them. `rlxd call env.get` reads them.",
+    )
+}
+
+/// The error a refused env change gets: `bad_env_key`, or `invalid_params` for a value.
+fn env_refused(refusal: EnvRefusal) -> ErrorBody {
+    match &refusal {
+        EnvRefusal::BadKey(_) => error(codes::BAD_ENV_KEY, &refusal.to_string()),
+        EnvRefusal::BadValue { .. } => error(codes::INVALID_PARAMS, &refusal.to_string()),
+    }
 }
 
 /// `value`'s fields, for an envelope's `data`. Every caller passes an object.

@@ -77,11 +77,10 @@ use tokio::time::Instant;
 use super::connector_gate::{Gate, Verdict};
 use super::gate::{self, Call, Via};
 use super::{
-    End, JobTag, Run, RunNote, Runner, argv, blocking, check_start, ended_early, jcs, process,
-    refusal, run_env, store, stream, tail, with_detail,
+    End, JobTag, Run, RunNote, Runner, account_env, argv, blocking, check_start, claude_from,
+    ended_early, jcs, process, refusal, run_env, store, stream, tail, with_detail,
 };
-use crate::claude;
-use crate::connectors::Account;
+use crate::connectors::{Account, RanOn};
 use crate::log::{info, warning};
 
 /// Who an identity read's run is recorded as started by.
@@ -205,6 +204,12 @@ impl CallRun {
 
     fn clear(&self) {
         *self.outcome.lock().unwrap_or_else(|p| p.into_inner()) = None;
+    }
+
+    /// Whether the call is an identity read, made on an account's environment for that
+    /// account ([`Runner::identity_call`]).
+    pub(super) fn is_identity(&self) -> bool {
+        self.account.is_some()
     }
 
     fn outcome(&self) -> Option<Outcome> {
@@ -391,12 +396,19 @@ impl Runner {
             return failed("the run is not a connectors.call".to_owned());
         };
         let params = &run.params;
-        let Some(program) = claude::resolve().and_then(|p| std::path::absolute(p).ok()) else {
-            return failed(format!(
-                "Claude Code was not found: there is no `claude` on rlxd's PATH, and {} \
-                 names none",
-                claude::BIN_ENV
-            ));
+        // A run's `claude` and environment (4.3), read together: refused at the start when
+        // there was none, so this is for an environment changed since.
+        let (values, resolved) = self.env.snapshot();
+        run.inner().home.clone_from(&values.claude_config_dir);
+        // What the call ran on, to file what it finds under: an identity read's account,
+        // else its own snapshot's home, never the runs' account now (4.3).
+        let ran_on = match &call.account {
+            Some(account) => RanOn::Account(account.slot),
+            None => RanOn::Home(values.claude_config_dir.as_deref()),
+        };
+        let program = match claude_from(resolved) {
+            Ok(program) => program,
+            Err(refused) => return failed(refused.message),
         };
         // Its own empty folder, not the space: no project settings (the module's doc).
         let cwd = match blocking(|| run.dir.create_call_dir()) {
@@ -417,7 +429,10 @@ impl Runner {
         if let (Some(pinned), Mount::Connectors { connectors }) =
             (&params.pinned_call, &params.mount)
             && connectors.iter().any(|connector| {
-                self.connectors.read_only_hint(connector, &pinned.tool) == Some(Some(false))
+                // The account this call runs on (4.3).
+                self.connectors
+                    .read_only_hint(connector, &pinned.tool, ran_on)
+                    == Some(Some(false))
             })
         {
             let reason = format!(
@@ -433,10 +448,13 @@ impl Runner {
             .timeout_s
             .unwrap_or_else(|| times.timeout_s(params.deadline_ms));
         let deadline = Instant::now() + Duration::from_secs(timeout_s);
-        let mut env = run_env();
-        if let Some(account) = &call.account {
-            env.extend(account.env());
-        }
+        // A call's environment is a run's; an identity read's is its account's (4.3,
+        // account_env): the app's values, then that account's homes, and no Keychain login
+        // dir but its own.
+        let (mut env, unset) = match &call.account {
+            Some(account) => account_env(&values, account),
+            None => (run_env(&values), Vec::new()),
+        };
         env.push((process::RUN_ID_ENV.into(), params.run_id.as_str().into()));
         {
             // No hook key: no hook decides anything of this run.
@@ -450,11 +468,7 @@ impl Runner {
             args: argv::call_args(),
             cwd: cwd.clone(),
             env,
-            unset: call
-                .account
-                .as_ref()
-                .map(Account::unset)
-                .unwrap_or_default(),
+            unset,
         };
         let (mut child, tree) = match self.spawner.spawn(launch).await {
             Ok(spawned) => spawned,
@@ -495,7 +509,9 @@ impl Runner {
             line: Vec::new(),
             deadline,
         };
-        let driven = self.drive(run, call, &mut channel, &cwd, times).await;
+        let driven = self
+            .drive(run, call, &mut channel, &cwd, times, ran_on)
+            .await;
         drop(channel);
         match &driven {
             Driven::Ran
@@ -598,6 +614,7 @@ impl Runner {
         channel: &mut Channel<'_, R>,
         cwd: &std::path::Path,
         times: Times,
+        ran_on: RanOn<'_>,
     ) -> Driven {
         let Some(pinned) = run.params.pinned_call.clone() else {
             return Driven::Broken("the call's run has no pinned call".to_owned());
@@ -673,13 +690,13 @@ impl Runner {
                 Verdict::Connected => break (listed_of(&rows), servers),
                 Verdict::Stopped(connectors) => {
                     // A connector the call found signed out or failing is so in the map
-                    // too, with no refresh (task #14).
+                    // too, with no refresh (task #14): in the account the call ran on.
                     blocking(|| {
                         for connector in &connectors {
                             let status = ConnectorState::of(&connector.status);
                             if matches!(status, ConnectorState::NeedsAuth | ConnectorState::Failed)
                             {
-                                self.connectors.set_status(&connector.id, status);
+                                self.connectors.set_status(&connector.id, status, ran_on);
                             }
                         }
                     });

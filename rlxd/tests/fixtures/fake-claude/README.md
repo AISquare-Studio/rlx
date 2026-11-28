@@ -40,6 +40,7 @@ the same files.
 | `abort` | Says part of an answer, waits `FAKE_CLAUDE_ABORT_AFTER_MS` (default 0), then dies of `SIGABRT` (an abort), so rlxd reports the signal |
 | `huge` | A successful result of 1.5 MiB of text, more than `run.done` carries |
 | `tool-result` | A recorded connector call and its `tool_result` block, whose content is `tool-result/content.json`. It runs no tool and asks no hook |
+| `print-env` | Answers with the app's environment it got (4.3): `CLAUDE_CONFIG_DIR`, `CLAUDE_SECURESTORAGE_CONFIG_DIR` and `PATH`, those set, as JSON. Started by a name that is no scenario, such as `bin/claude`, fake-claude follows the name's links to its scenario, else takes `FAKE_CLAUDE_SCENARIO` (Windows, where the tests copy it) |
 
 ### The connectors' scenarios (5.5 and 7.7)
 
@@ -58,6 +59,7 @@ One connector, `claude.ai Slack`, with made-up tools (`init-connectors/expected-
 | `connectors-needs-auth` | Slack `needs-auth` throughout |
 | `stdin-eof-empty` | No servers in `system/init` when stdin is at EOF by then, as E9 found; Slack connected while it is open |
 | `mcp-login` | `claude mcp login <name>`: prints an `https://` URL whose query holds made-up secrets, waits, says it signed in, and exits 0 |
+| `mcp-login-slow` | As `mcp-login`, its wait 3 s: room to change the app's environment while it runs |
 | `mcp-login-fails` | The same URL, then says the sign-in failed, and exits 1 |
 | `mcp-login-http` | Prints an `http://` URL, then waits a minute |
 | `mcp-login-silent` | Prints no URL, and exits 0 |
@@ -141,6 +143,7 @@ a watch job's fallback run is), each plays `watch-call`.
 | `mcp-direct-unasked` | Ignores `check_permissions`: runs the call with no `can_use_tool` |
 | `mcp-direct-respelled` | Asks `can_use_tool` with the input's whole numbers written as `1.0` |
 | `mcp-direct-needs-auth` | Lists the connector `needs-auth` |
+| `mcp-direct-needs-auth-slow` | Lists the connector `pending` for 3 s, then `needs-auth` |
 | `mcp-direct-silent` | Never answers `initialize` |
 | `mcp-direct-huge` | Writes a 5 MiB line after `initialize` |
 | `mcp-direct-turn` | Writes an `assistant` line after `initialize` |

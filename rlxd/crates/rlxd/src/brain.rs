@@ -45,8 +45,15 @@
 //!   on a heartbeat of its own (every 5 s, a long hook or not, registering again at a
 //!   beat if it could not at first), and removes it the moment it sees the brain end. If rlxd dies,
 //!   the OS frees the lock, and the brain, its stdin closed, ends too.
-//! - **Its environment** is rlxd's, plus [`Brain::start`]'s `env`: the seam for 4.3, the
-//!   app's `PATH` and Claude Code variables, which rlxd will pass to the brain.
+//! - **Its environment** is rlxd's, plus the app's `PATH`, `CLAUDE_CONFIG_DIR` and
+//!   `CLAUDE_SECURESTORAGE_CONFIG_DIR` (4.3), raw, those the app set, as they are when the
+//!   brain starts: what a run's Claude Code gets (`crate::runner::run_env`). A change
+//!   that alters them (`env.set`, an app `hello`'s `env`) starts the brain again with the
+//!   new values once it is idle: the request it runs ends first, and the next request,
+//!   queued or not, runs on the new brain. It is stopped as rlxd stops it (its stdin
+//!   closed, then signalled, then killed) and started at once, with no backoff and no
+//!   `error`: `restarts` counts it. A change while the brain starts, or waits to restart,
+//!   reaches it the same way, since each start takes the values then.
 
 mod process;
 
@@ -57,7 +64,7 @@ use std::time::Duration;
 
 use rlxd_client::{Home, install};
 use rlxd_proto::{
-    BRAIN_PROTOCOL, BRAIN_PROTOCOLS, BrainInput, BrainOutput, Data, ErrorBody, VERSION,
+    BRAIN_PROTOCOL, BRAIN_PROTOCOLS, BrainInput, BrainOutput, Data, EnvValues, ErrorBody, VERSION,
     brain_codes, codes, daemon_kinds,
 };
 use serde_json::json;
@@ -134,7 +141,6 @@ pub struct Brain {
 /// What the supervisor and `status` share.
 struct Shared {
     home: Home,
-    env: Vec<(String, String)>,
     state: Mutex<rlxd_proto::Brain>,
     log: Arc<Mutex<LogFile>>,
 }
@@ -207,26 +213,28 @@ impl Job {
 enum Ended {
     /// rlxd is stopping.
     Stopping,
+    /// The app's environment changed: it was stopped, to start again with the new values.
+    EnvChanged,
     /// It ended or was stopped: why, as `status.brain.error` says.
     Failed(ErrorBody),
 }
 
 impl Brain {
     /// Starts supervising the home's brain, on the current runtime: it starts at once.
-    /// `env` is added to rlxd's environment for the brain.
-    pub fn start(home: &Home, env: Vec<(String, String)>) -> Result<Arc<Self>, String> {
+    /// `env` is the app's environment (`crate::env::Env::subscribe`): each start adds the
+    /// values then to rlxd's environment, and a change starts the brain again once idle.
+    pub fn start(home: &Home, env: watch::Receiver<EnvValues>) -> Result<Arc<Self>, String> {
         let log_path = home.logs().join(LOG_NAME);
         let log = LogFile::open(&log_path, LOG_MAX, LOG_KEEP)
             .map_err(|e| format!("cannot open {}: {e}", log_path.display()))?;
         let shared = Arc::new(Shared {
             home: home.clone(),
-            env,
             state: Mutex::new(rlxd_proto::Brain::default()),
             log: Arc::new(Mutex::new(log)),
         });
         let (jobs, queue) = mpsc::unbounded_channel();
         let (stop, stopping) = watch::channel(false);
-        let task = tokio::spawn(supervise(Arc::clone(&shared), queue, stopping));
+        let task = tokio::spawn(supervise(Arc::clone(&shared), queue, stopping, env));
         Ok(Arc::new(Self {
             shared,
             queued: Arc::new(AtomicUsize::new(0)),
@@ -370,6 +378,7 @@ async fn supervise(
     shared: Arc<Shared>,
     mut queue: mpsc::UnboundedReceiver<Job>,
     mut stopping: watch::Receiver<bool>,
+    mut env: watch::Receiver<EnvValues>,
 ) {
     let mut failures: u32 = 0;
     let mut started_once = false;
@@ -377,9 +386,21 @@ async fn supervise(
         if *stopping.borrow() {
             break;
         }
-        let (ended, ready) = run(&shared, &mut queue, &mut stopping, &mut started_once).await;
+        let (ended, ready) = run(
+            &shared,
+            &mut queue,
+            &mut stopping,
+            &mut env,
+            &mut started_once,
+        )
+        .await;
         let error = match ended {
             Ended::Stopping => break,
+            // Not a failure: the brain that ran was well, so the next start waits nothing.
+            Ended::EnvChanged => {
+                failures = 0;
+                continue;
+            }
             Ended::Failed(error) => error,
         };
         // Healthy is a run from a good hello, not from the start: a brain that hangs
@@ -432,6 +453,7 @@ async fn run(
     shared: &Shared,
     queue: &mut mpsc::UnboundedReceiver<Job>,
     stopping: &mut watch::Receiver<bool>,
+    env: &mut watch::Receiver<EnvValues>,
     started_once: &mut bool,
 ) -> (Ended, Option<Instant>) {
     let beside = std::env::current_exe()
@@ -452,11 +474,13 @@ async fn run(
         return (Ended::Failed(error), None);
     };
     let args = ["brain", "--stdio"];
+    // The values now: a change from here on is seen as the brain serves, and starts it again.
+    let values = env.borrow_and_update().clone();
     let spawned = Process::spawn(
         &program,
         &args,
         shared.home.root(),
-        &shared.env,
+        &crate::runner::run_env(&values),
         Arc::clone(&shared.log),
     );
     let mut brain = match spawned {
@@ -488,7 +512,7 @@ async fn run(
         state.pid = Some(brain.pid);
         state.error = None;
     }
-    let ended = serve(shared, &mut brain, queue, stopping).await;
+    let ended = serve(shared, &mut brain, queue, stopping, env, &values).await;
     record.leave();
     shared.state().pid = None;
     (ended, Some(ready))
@@ -625,12 +649,15 @@ fn register(home: &Home, pid: u32, argv: &[String]) -> Option<Registration> {
     }
 }
 
-/// Serves requests until the brain ends, breaks the protocol, overruns, or rlxd stops.
+/// Serves requests until the brain ends, breaks the protocol, overruns, rlxd stops, or the
+/// app's environment changes from `started_with`, the values the brain started with.
 async fn serve(
     shared: &Shared,
     brain: &mut Process,
     queue: &mut mpsc::UnboundedReceiver<Job>,
     stopping: &mut watch::Receiver<bool>,
+    env: &mut watch::Receiver<EnvValues>,
+    started_with: &EnvValues,
 ) -> Ended {
     let mut exit = brain.exit_watch();
     let mut next_id: u64 = 0;
@@ -640,6 +667,8 @@ async fn serve(
             () = stopped(stopping) => Next::Stop,
             said = exit.wait() => Next::Ended(said),
             frame = brain.frames.recv() => Next::Unasked(frame),
+            // Here, and so only between requests: one running ends first.
+            Ok(()) = env.changed() => Next::EnvChanged,
             Some(job) = queue.recv() => Next::Job(job),
         };
         match next {
@@ -648,6 +677,14 @@ async fn serve(
                 return Ended::Stopping;
             }
             Next::Ended(said) => return exited(&format!("it ended ({said})")),
+            Next::EnvChanged => {
+                if *env.borrow_and_update() == *started_with {
+                    continue;
+                }
+                info!("brain: the app's environment changed (4.3): starting it again with it");
+                stop(brain).await;
+                return Ended::EnvChanged;
+            }
             Next::Unasked(frame) => {
                 if frame.is_none()
                     && let Ok(said) = timeout(STOP_GRACE, exit.wait()).await
@@ -693,6 +730,8 @@ enum Next {
     Ended(String),
     /// It wrote a frame no request asked for, or its stdout ended.
     Unasked(Option<process::Frame>),
+    /// The app's environment changed.
+    EnvChanged,
     /// A request.
     Job(Job),
 }
@@ -819,6 +858,7 @@ async fn refuse(
     let why = match &ended {
         Ended::Failed(error) => error.message.clone(),
         Ended::Stopping => "rlxd is stopping".to_owned(),
+        Ended::EnvChanged => "the app's environment changed".to_owned(),
     };
     if matches!(seen, Drained::Accepted(Some(_))) {
         shared.state().handled += 1;

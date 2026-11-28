@@ -281,6 +281,12 @@ pub mod methods {
     /// Test builds only: sets the scheduler's test clock, as `debug.clock_advance` moves
     /// it: [`ClockSetParams`](crate::ClockSetParams) in, `{now}` out.
     pub const DEBUG_CLOCK_SET: &str = "debug.clock_set";
+    /// Sets the app's environment for Claude Code (4.3): [`EnvValues`](crate::EnvValues)
+    /// in, every value now out. Only an app-role connection that holds the gate.
+    pub const ENV_SET: &str = "env.set";
+    /// The app's environment for Claude Code: [`EnvValues`](crate::EnvValues) out. Every
+    /// client.
+    pub const ENV_GET: &str = "env.get";
 }
 
 impl Request {

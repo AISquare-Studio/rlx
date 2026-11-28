@@ -4,6 +4,8 @@
 //! wait for the browser. The URLs and their secrets are made up.
 //!
 //! - `mcp-login` signs in: after the wait, it says so and exits 0.
+//! - `mcp-login-slow` signs in as `mcp-login` does, after a wait of [`SLOW_MS`]: room
+//!   for a check to change the app's environment while it runs.
 //! - `mcp-login-fails` says the sign-in failed after the wait, and exits 1.
 //! - `mcp-login-http` prints an `http://` URL, then waits a minute, as for a browser.
 //! - `mcp-login-silent` prints no URL, and exits 0.
@@ -26,6 +28,9 @@ pub type Login = fn(&[String], &str) -> i32;
 pub const ALL: &[(&str, Login)] = &[
     ("mcp-login", |argv, id| {
         play(argv, id, Some(HTTPS), Ending::SignedIn)
+    }),
+    ("mcp-login-slow", |argv, id| {
+        play(argv, id, Some(HTTPS), Ending::SignedInSlowly)
     }),
     ("mcp-login-fails", |argv, id| {
         play(argv, id, Some(HTTPS), Ending::Fails)
@@ -57,11 +62,16 @@ pub fn find(name: &str) -> Option<Login> {
         .map(|(_, login)| *login)
 }
 
+/// How long `mcp-login-slow` waits for the browser.
+pub const SLOW_MS: u64 = 3000;
+
 /// How a login ends.
 #[derive(Clone, Copy)]
 enum Ending {
     /// Signed in: exit 0.
     SignedIn,
+    /// Signed in after [`SLOW_MS`]: exit 0.
+    SignedInSlowly,
     /// Failed: exit 1.
     Fails,
     /// Waits a minute, as for a browser that never comes.
@@ -85,8 +95,12 @@ fn play(argv: &[String], id: &str, url: Option<&str>, ending: Ending) -> i32 {
             ));
             say("Waiting for authentication…");
             match ending {
-                Ending::SignedIn => {
-                    thread::sleep(Duration::from_millis(800));
+                Ending::SignedIn | Ending::SignedInSlowly => {
+                    let wait = match ending {
+                        Ending::SignedInSlowly => SLOW_MS,
+                        _ => 800,
+                    };
+                    thread::sleep(Duration::from_millis(wait));
                     say(&format!("✔ Authenticated with {id}."));
                     0
                 }

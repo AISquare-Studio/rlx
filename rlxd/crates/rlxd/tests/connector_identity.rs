@@ -646,3 +646,85 @@ fn an_identity_asked_under_one_sign_in_that_lands_once_another_is_heard_is_dropp
         assert_eq!(unknown.error_code(), "no_such_account", "{unknown:?}");
     });
 }
+
+#[test]
+fn an_identity_read_that_finds_a_sign_in_lapsed_files_it_under_its_account_and_raises_no_needs_you()
+{
+    // #4216 IN (and Q7): the app's home is slot 2's. Slot 1's Fixture is connected when
+    // slot 1 is read, and signed out by the time its identity read asks; slot 2's is
+    // signed out throughout, so it gets no identity read.
+    let mut signed_out = fixture("WS-two", "u2", true);
+    signed_out[0]["status"] = Value::from("needs-auth");
+    let (home, managed) = identity_home(&fixture("WS-one", "u1", true), &signed_out, &[]);
+    let change = json!({"CLAUDE_CONFIG_DIR": managed.to_str().unwrap()});
+    let set = home.rlxd(&["call", "--as-app", "env.set", &change.to_string()]);
+    assert_eq!(set.code(), Some(0), "{set:?}");
+    eventually("the app's call is gone", || home.app_clients() == 0);
+    let _app = App::open(&home);
+    let since = seq(&home);
+    // Once slot 2's read has started, slot 1's read is over: its Fixture is signed out.
+    let log = home.root().join("fake-claude.log.json");
+    let plain = home
+        .root()
+        .join("user-home")
+        .join(".claude")
+        .join("fake-connectors.json");
+    let lapsed = signed_out.to_string();
+    let flip = std::thread::spawn(move || {
+        let deadline = Instant::now() + Duration::from_secs(60);
+        loop {
+            let starts = std::fs::read_to_string(&log)
+                .ok()
+                .and_then(|text| serde_json::from_str::<Value>(&text).ok())
+                .and_then(|log| log["starts"].as_array().map(Vec::len))
+                .unwrap_or(0);
+            if starts >= 2 {
+                std::fs::write(&plain, lapsed).unwrap();
+                return;
+            }
+            assert!(Instant::now() < deadline, "slot 2's read never started");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    });
+    let (_, asked) = refresh_deciding(&home, "allow");
+    flip.join().unwrap();
+    assert!(asked.is_empty(), "no call was made: {asked:#?}");
+    // Slot 1's read made one identity start, after the two reads.
+    let started = starts(&home);
+    assert_eq!(started.len(), 3, "{started:#?}");
+    assert_eq!(
+        started[2]["env"].get("CLAUDE_CONFIG_DIR"),
+        None,
+        "{started:#?}"
+    );
+    // Its finding is slot 1's (RanOn::Account), though the app's home is slot 2's.
+    let events = home
+        .rlxd(&[
+            "events",
+            "--topics",
+            "connector",
+            "--since",
+            &since.to_string(),
+        ])
+        .lines();
+    let changed: Vec<&Value> = events
+        .iter()
+        .filter(|e| e["type"] == "connector.changed")
+        .collect();
+    assert_eq!(changed.len(), 1, "{events:#?}");
+    assert_eq!(changed[0]["data"]["account"], 1, "{events:#?}");
+    assert_eq!(changed[0]["data"]["id"], FIXTURE, "{events:#?}");
+    assert_eq!(changed[0]["data"]["status"], "needs-auth", "{events:#?}");
+    // And no needs-you: nobody waits on an identity read.
+    let needs_you = home
+        .rlxd(&[
+            "events",
+            "--as-app",
+            "--topics",
+            "needs_you",
+            "--since",
+            &since.to_string(),
+        ])
+        .lines();
+    assert!(needs_you.is_empty(), "{needs_you:#?}");
+}

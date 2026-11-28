@@ -9,16 +9,16 @@ use std::path::{Path, PathBuf};
 
 use rlxd_proto::{
     Auth, BRAIN_PROTOCOL, BRAIN_PROTOCOLS, BrainInput, BrainOutput, DaemonRecord, Data, Detail,
-    Envelope, ErrorBody, Event, HOOK_ENV_NAMES, HOOK_ENV_VALUE_MOST, HOOK_EVENTS, HelloData,
-    HelloParams, HereData, HookEventData, HookParams, HookReply, InstalledRlx, InstalledRlxd,
-    Invalid, PRE_TOOL_USE, PROTOCOL_VERSION, PROTOCOL_VERSIONS, Paths, PtyCursor, PtyExited,
-    PtyInfo, PtyKillParams, PtyList, PtyOutput, PtyRef, PtyResizeParams, PtyScreen,
+    EnvValues, Envelope, ErrorBody, Event, HOOK_ENV_NAMES, HOOK_ENV_VALUE_MOST, HOOK_EVENTS,
+    HelloData, HelloParams, HereData, HookEventData, HookParams, HookReply, InstalledRlx,
+    InstalledRlxd, Invalid, PRE_TOOL_USE, PROTOCOL_VERSION, PROTOCOL_VERSIONS, Paths, PtyCursor,
+    PtyExited, PtyInfo, PtyKillParams, PtyList, PtyOutput, PtyRef, PtyResizeParams, PtyScreen,
     PtyScreenParams, PtySpawnParams, PtySubscribeParams, PtyWriteParams, Request, RequestId, Role,
     RunScope, SCHEMA_VERSION, Setting, SettingsChanged, SettingsDeleteParams, SettingsGetParams,
     SettingsList, SettingsListParams, SettingsSetParams, StatusData, SubscribeParams, b64,
-    brain_codes, codes, daemon_kinds, deny_output, event_types, hook_codes, hook_env_forwarded,
-    hook_event_type, methods, protocol_version_of, schema_version_of, schemas, send_safety_lowers,
-    send_safety_modes, setting_is_protected, setting_keys, topics,
+    brain_codes, codes, daemon_kinds, deny_output, env_keys, event_types, hook_codes,
+    hook_env_forwarded, hook_event_type, methods, protocol_version_of, schema_version_of, schemas,
+    send_safety_lowers, send_safety_modes, setting_is_protected, setting_keys, topics,
 };
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -2227,6 +2227,43 @@ fn send_safety_mode_is_strict_for_a_writer_and_additive_for_a_reader() {
         "setting.json",
         json!({"key": "send_safety_mode", "version": 7, "value": {"default": "often"},
                "updated_at": "2026-11-26T12:00:00.000Z"}),
+    );
+}
+
+#[test]
+fn env_documents_and_the_env_type_agree() {
+    // 4.3: env.set's params, env.get's reply, and <home>/rlxd/env.json.
+    for doc in [
+        json!({}),
+        json!({"PATH": "/opt/homebrew/bin:/usr/bin:/bin"}),
+        json!({"PATH": "/bin", "CLAUDE_CONFIG_DIR": "cc-test",
+               "CLAUDE_SECURESTORAGE_CONFIG_DIR": "/Users/u/.claude-store"}),
+        json!({"PATH": "x".repeat(rlxd_proto::ENV_MAX_VALUE)}),
+    ] {
+        assert_eq!(agrees::<EnvValues>("env.json", &doc), doc);
+    }
+    for wrong in [
+        json!({"HOME": "x"}),
+        json!({"PATH": 1}),
+        json!({"PATH": null}),
+        json!({"PATH": "a\u{0}b"}),
+        json!({"PATH": "x".repeat(rlxd_proto::ENV_MAX_VALUE + 1)}),
+        json!(["PATH"]),
+    ] {
+        both_refuse::<EnvValues>("env.json", wrong);
+    }
+    assert_eq!(methods::ENV_SET, "env.set");
+    assert_eq!(methods::ENV_GET, "env.get");
+    assert_eq!(codes::BAD_ENV_KEY, "bad_env_key");
+    assert_eq!(codes::CLAUDE_NOT_FOUND, "claude_not_found");
+    assert_eq!(codes::CLAUDE_NOT_RUNNABLE, "claude_not_runnable");
+    assert_eq!(
+        env_keys::ALL,
+        [
+            "PATH",
+            "CLAUDE_CONFIG_DIR",
+            "CLAUDE_SECURESTORAGE_CONFIG_DIR"
+        ]
     );
 }
 

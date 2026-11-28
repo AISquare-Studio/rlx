@@ -35,9 +35,12 @@
 //!   three tries, each its own Claude Code, and starts no turn until each named
 //!   connector is `connected`. Each `system/init` taken as a run's truth updates the
 //!   connectors' cache ([`crate::connectors`]).
-//! - **Claude Code's environment** is rlxd's own ([`run_env`] is where the app's `PATH`
-//!   and config directories plug in, 4.3). `RLXD_CLAUDE_BIN` is read from rlxd's own
-//!   environment only, when each attempt starts; no client names the program.
+//! - **Claude Code's environment** is rlxd's own with the app's `PATH` and config
+//!   directories on top, raw ([`run_env`], 4.3), and its program the absolute `claude`
+//!   the app's environment resolved to ([`claude_from`]), both read together when each
+//!   attempt starts. `RLXD_CLAUDE_BIN` is read from rlxd's own environment only; no
+//!   client names the program. A `connectors.call`'s attempt, the connectors' probe and a
+//!   connector's login start Claude Code the same way.
 //!
 //! Locks: the runner's (its runs and pools), then a run's, never the other way round.
 
@@ -50,7 +53,7 @@ use std::time::{Duration, Instant, UNIX_EPOCH};
 
 use rlxd_client::Home;
 use rlxd_proto::{
-    Data, ErrorBody, Event, FailReason, Mount, NeedsYouClearedData, NeedsYouRaisedData,
+    Data, EnvValues, ErrorBody, Event, FailReason, Mount, NeedsYouClearedData, NeedsYouRaisedData,
     NeedsYouReason, RunCancelData, RunDoneData, RunEventsData, RunEventsParams, RunFailedData,
     RunGetData, RunId, RunKind, RunListData, RunListParams, RunNeedsYouData, RunQueuedData,
     RunRateLimitedData, RunRef, RunResumeData, RunResumeParams, RunStartParams, RunStartedData,
@@ -63,9 +66,11 @@ use tokio::process::{ChildStderr, ChildStdin};
 use tokio::sync::watch;
 
 use crate::bus::{self, Bus};
-use crate::connectors::Connectors;
+use crate::claude::{self, Resolved};
+use crate::connectors::{Account, Connectors};
+use crate::env::Env;
 use crate::log::{info, warning};
-use crate::{claude, clock, spaces};
+use crate::{clock, spaces};
 
 mod argv;
 mod call;
@@ -154,6 +159,9 @@ pub use gate::{HOOK_KEY_ENV, output as hook_output};
 pub struct Runner {
     home: Home,
     bus: Arc<Bus>,
+    /// The app's environment (4.3): passed raw to every Claude Code, and the absolute
+    /// `claude` it resolved to when the app set it or rlxd started, which every run starts.
+    env: Arc<Env>,
     /// The connectors' cache, which each run's `system/init` updates.
     connectors: Arc<Connectors>,
     spawner: Spawner,
@@ -322,8 +330,13 @@ struct RunInner {
     /// The `needs_you.raised` the run has out, to clear when it goes on or ends.
     needs_you: Option<String>,
     /// The connectors its `needs_you {reason: "auth"}` waits on (5.5): it is cleared,
-    /// too, once each is `connected` again. Empty when it has none out.
+    /// too, once each is `connected` again on the account [`RunInner::home`] is. Empty
+    /// when it has none out.
     auth: Vec<String>,
+    /// The `CLAUDE_CONFIG_DIR` the app's values gave its latest attempt when it started
+    /// (4.3), `None` when they gave none: then it ran on rlxd's own. Whose sign-in its
+    /// `auth` waits on.
+    home: Option<String>,
     /// Events appended to the log since its last fsync.
     unsynced: u32,
     /// The last `run_seq` in the run's log: an event whose append failed is not counted,
@@ -449,7 +462,7 @@ impl Runner {
     /// "engine_restarted"}`, after its process tree, if it still runs, is killed: its
     /// leader's pid is killed only when the process with that pid started when the
     /// record says, so a pid the OS has given another process since is left alone.
-    pub fn new(home: Home, bus: Arc<Bus>, connectors: Arc<Connectors>) -> Arc<Self> {
+    pub fn new(home: Home, bus: Arc<Bus>, env: Arc<Env>, connectors: Arc<Connectors>) -> Arc<Self> {
         let rlxd = std::env::current_exe().ok();
         // An erase holds a folder open per level it is down.
         #[cfg(unix)]
@@ -459,6 +472,7 @@ impl Runner {
         let runner = Arc::new(Self {
             home,
             bus,
+            env,
             connectors,
             spawner: Spawner::start(),
             hook: argv::hook_beside(rlxd.as_deref()),
@@ -486,11 +500,13 @@ impl Runner {
         });
         runner.load();
         let told = Arc::downgrade(&runner);
-        runner.connectors.on_connected(Box::new(move |connected| {
-            if let Some(runner) = told.upgrade() {
-                runner.signed_in(connected);
-            }
-        }));
+        runner
+            .connectors
+            .on_connected(Box::new(move |slot, connected| {
+                if let Some(runner) = told.upgrade() {
+                    runner.signed_in(slot, connected);
+                }
+            }));
         runner
     }
 
@@ -630,6 +646,7 @@ impl Runner {
                     reply: None,
                     needs_you,
                     auth,
+                    home: record.home.clone(),
                     unsynced: 0,
                     logged: tail.last_run_seq,
                     // A call still executing when its rlxd stopped may have run: unknown.
@@ -729,6 +746,12 @@ impl Runner {
         self.runs.lock().unwrap_or_else(|p| p.into_inner())
     }
 
+    /// The `claude` a run starts: the absolute path the app's environment resolved to
+    /// (4.3), or the refusal `run.start` gives when it resolved to none rlxd runs.
+    fn claude_to_run(&self) -> Result<PathBuf, ErrorBody> {
+        claude_from(self.env.claude())
+    }
+
     /// Every run rlxd knows now, to read with the runner's lock let go.
     fn snapshot(&self) -> Vec<Arc<Run>> {
         self.runs().by_id.values().cloned().collect()
@@ -750,8 +773,9 @@ impl Runner {
 
     /// `run.start`: the run is recorded, and started or queued. Refused with
     /// `kind_mount_mismatch`, `pinned_call_required` (only that it is there: the gate
-    /// enforces it, 5.1), `run_exists`, or `run_start_failed` when rlxd is stopping or the
-    /// run's record can't be written.
+    /// enforces it, 5.1), `run_exists`, `claude_not_found` or `claude_not_runnable` when
+    /// the `claude` resolved for the app's environment (4.3) is none rlxd runs, or
+    /// `run_start_failed` when rlxd is stopping or the run's record can't be written.
     pub fn start(
         self: &Arc<Self>,
         params: RunStartParams,
@@ -791,6 +815,7 @@ impl Runner {
                 ),
             ));
         }
+        self.claude_to_run()?;
         let id = params.run_id.clone();
         let dir = RunDir::of(&self.home, &id);
         {
@@ -849,6 +874,7 @@ impl Runner {
                 reply: None,
                 needs_you: None,
                 auth: Vec::new(),
+                home: None,
                 unsynced: 0,
                 logged: 0,
                 session_started: false,
@@ -1009,7 +1035,8 @@ impl Runner {
     /// `run_id` and `--resume <run_id>`, its own settings file, and the app's reply (or
     /// "Continue.") as its first message. It takes its place in its pool, as a start does.
     /// Refused: `run_alive` for a queued or running run, `not_resumable` for a
-    /// `send_executor` (a send is never retried), `no_session` for a session-less run.
+    /// `send_executor` (a send is never retried), `no_session` for a session-less run, and
+    /// `claude_not_found` or `claude_not_runnable` as `run.start` is (4.3).
     pub fn resume(self: &Arc<Self>, params: RunResumeParams) -> Result<RunResumeData, ErrorBody> {
         if self.stopping.load(Ordering::SeqCst) {
             return Err(refusal(
@@ -1018,6 +1045,7 @@ impl Runner {
             ));
         }
         let run = self.find(&params.run_id)?;
+        self.claude_to_run()?;
         let id = params.run_id;
         {
             // The run is held for this resume under the runner's lock, and no run's lock
@@ -1614,13 +1642,18 @@ impl Runner {
                 )
             }
             End::Failed(failed) => {
-                auth = failed
-                    .connectors
-                    .iter()
-                    .flatten()
-                    .filter(|c| c.status == rlxd_proto::ConnectorState::NeedsAuth.as_str())
-                    .map(|c| c.id.clone())
-                    .collect::<Vec<_>>();
+                // An identity read raises no needs-you (#4218): nobody waits on it, it is
+                // never resumed, and what it found is filed under its account already
+                // (`connector.changed` tells the app).
+                if !run.call.as_ref().is_some_and(call::CallRun::is_identity) {
+                    auth = failed
+                        .connectors
+                        .iter()
+                        .flatten()
+                        .filter(|c| c.status == rlxd_proto::ConnectorState::NeedsAuth.as_str())
+                        .map(|c| c.id.clone())
+                        .collect::<Vec<_>>();
+                }
                 (
                     RunState::Failed,
                     run_types::FAILED,
@@ -1755,11 +1788,28 @@ impl Runner {
     }
 
     /// Clears each failed run's `needs_you {reason: "auth"}` whose connectors are all
-    /// among `connected` (5.5): their sign-in is back. Called with no run's lock held.
-    fn signed_in(&self, connected: &[String]) {
+    /// among `connected` on account `slot` (5.5), when its own attempt ran on that account
+    /// ([`RunInner::home`]): their sign-in is back there. A run on another home keeps its
+    /// needs-you. Called with no run's lock held.
+    fn signed_in(&self, slot: u32, connected: &[String]) {
+        let waits = |inner: &RunInner| {
+            !inner.auth.is_empty() && inner.auth.iter().all(|id| connected.contains(id))
+        };
         for run in self.snapshot() {
+            let home = {
+                let inner = run.inner();
+                if !waits(&inner) {
+                    continue;
+                }
+                inner.home.clone()
+            };
+            // Only a sign-in on the account its own attempt ran on (4.3), worked out with no
+            // run's lock held.
+            if self.connectors.slot_of_home(home.as_deref()) != Some(slot) {
+                continue;
+            }
             let mut inner = run.inner();
-            if inner.auth.is_empty() || !inner.auth.iter().all(|id| connected.contains(id)) {
+            if !waits(&inner) || inner.home != home {
                 continue;
             }
             info!(
@@ -1841,12 +1891,14 @@ impl Runner {
                 run.inner().text.clone(),
             ))
         };
-        let Some(program) = claude::resolve().and_then(|p| std::path::absolute(p).ok()) else {
-            return failed(format!(
-                "Claude Code was not found: there is no `claude` on rlxd's PATH, and {} \
-                 names none",
-                claude::BIN_ENV
-            ));
+        // The absolute path resolved when the app set its environment or rlxd started,
+        // never a lookup now (4.3), read with the values it goes with. Refused at run.start
+        // when there was none; this is for an environment changed since.
+        let (values, resolved) = self.env.snapshot();
+        run.inner().home.clone_from(&values.claude_config_dir);
+        let program = match claude_from(resolved) {
+            Ok(program) => program,
+            Err(refused) => return failed(refused.message),
         };
         let prepared = blocking(|| -> std::io::Result<(PathBuf, PathBuf)> {
             let space = spaces::ensure(&self.home, &params.space)?;
@@ -1887,6 +1939,7 @@ impl Runner {
                     run,
                     attempt,
                     &program,
+                    &values,
                     &space,
                     &settings,
                     gate.as_ref(),
@@ -1929,7 +1982,9 @@ impl Runner {
                         continue;
                     }
                     if let Some(init) = init.filter(|_| reads_connectors(params)) {
-                        blocking(|| self.connectors.observe(init.observed()));
+                        // Filed by the home this attempt ran on, never the runs' home now.
+                        let home = values.claude_config_dir.as_deref();
+                        blocking(|| self.connectors.observe(init.observed(), home));
                     }
                     End::Failed(
                         RunFailedData::new(
@@ -2063,6 +2118,7 @@ impl Runner {
         run: &Arc<Run>,
         attempt: u64,
         program: &std::path::Path,
+        values: &EnvValues,
         space: &std::path::Path,
         settings: &std::path::Path,
         gate: Option<&Gate>,
@@ -2081,7 +2137,7 @@ impl Runner {
         if let Some(reason) = ending {
             return Tried::End(ended_early(run, reason));
         }
-        let mut env = run_env();
+        let mut env = run_env(values);
         // Every process of the run inherits it: the start sweep's way to know them.
         env.push((process::RUN_ID_ENV.into(), params.run_id.as_str().into()));
         // The attempt's hook key: its hooks inherit it, and the gate wants it back (5.1).
@@ -2144,6 +2200,7 @@ impl Runner {
                 gate,
                 deadline,
                 confirmed,
+                values.claude_config_dir.as_deref(),
             )
             .await;
         let end = match streamed {
@@ -2247,6 +2304,7 @@ impl Runner {
         gate: Option<&Gate>,
         deadline: Option<Instant>,
         delivered: &mut bool,
+        home: Option<&str>,
     ) -> Streamed {
         let params = &run.params;
         let try_started = Instant::now();
@@ -2498,7 +2556,9 @@ impl Runner {
                 // only after the gate has what the init listed: a hook that asks about the
                 // turn's first call never waits on the cache (5.1).
                 if let Some(init) = seen {
-                    blocking(|| self.connectors.observe(init.observed()));
+                    // Filed by the home this attempt ran on (4.3), never the runs' home now,
+                    // which an env.set may have changed since it started.
+                    blocking(|| self.connectors.observe(init.observed(), home));
                 }
             }
         }
@@ -2741,6 +2801,7 @@ impl Run {
             calls: inner.calls.clone(),
             pinned_call_used: inner.pinned_call_used,
             auth: inner.auth.clone(),
+            home: inner.home.clone(),
             connectors_call: self.call.is_some(),
         }
     }
@@ -2969,11 +3030,72 @@ fn needs_you(params: &RunStartParams, done: &RunDoneData) -> Option<RunNeedsYouD
     Some(RunNeedsYouData::question(question))
 }
 
-/// The environment a run's Claude Code gets beyond rlxd's own, which it inherits. The
-/// app's `PATH`, `CLAUDE_CONFIG_DIR` and `CLAUDE_SECURESTORAGE_CONFIG_DIR` (4.3) plug in
-/// here; until then there is nothing to add.
-pub(crate) fn run_env() -> Vec<(OsString, OsString)> {
-    Vec::new()
+/// The `claude` Claude Code starts as, for a run (a `connectors.call`'s too), the
+/// connectors' probe or a connector's login, from what the app's environment resolved to and where it looked (`Env::claude`,
+/// `Env::snapshot`): its absolute path (4.3), or the refusal (`claude_not_found`,
+/// `claude_not_runnable`), which says where rlxd looked.
+pub(crate) fn claude_from(
+    (resolved, source): (Resolved, claude::Source),
+) -> Result<PathBuf, ErrorBody> {
+    let looked = match source {
+        claude::Source::App => "on the app's PATH".to_owned(),
+        claude::Source::Rlxd => "on rlxd's PATH, as the app set none".to_owned(),
+        claude::Source::RlxdClaudeBin => format!("where {} names", claude::BIN_ENV),
+    };
+    match resolved {
+        Resolved::Found(program) => Ok(program),
+        Resolved::NotFound => Err(refusal(
+            codes::CLAUDE_NOT_FOUND,
+            format!(
+                "Claude Code was not found: there is no claude {looked}. rlxd looks when \
+                 the app sets PATH and when it starts"
+            ),
+        )),
+        Resolved::NotRunnable(program) => Err(refusal(
+            codes::CLAUDE_NOT_RUNNABLE,
+            format!(
+                "the claude found first {looked}, {}, is a batch file, which rlxd does not \
+                 run through cmd: install Claude Code's native build",
+                program.display()
+            ),
+        )),
+    }
+}
+
+/// The environment a run's Claude Code gets beyond rlxd's own, which it inherits: the
+/// app's `PATH`, `CLAUDE_CONFIG_DIR` and `CLAUDE_SECURESTORAGE_CONFIG_DIR` (4.3), raw, those
+/// it set. A run takes the values current when its attempt starts, and the brain those
+/// current when it starts (`crate::brain`).
+pub(crate) fn run_env(values: &EnvValues) -> Vec<(OsString, OsString)> {
+    values
+        .pairs()
+        .into_iter()
+        .map(|(key, value)| (OsString::from(key), OsString::from(value)))
+        .collect()
+}
+
+/// The environment of an account's own Claude Code, the connectors' reads (no-turn
+/// discovery and the one-turn probe), and what it takes away: a run's ([`run_env`], the
+/// app's values), then the account's. A managed slot's `CLAUDE_CONFIG_DIR` and
+/// `CLAUDE_CODE_TMPDIR` are those of its record, in place of the app's. The plain account
+/// gets neither, even when the app's values carry `CLAUDE_CONFIG_DIR`: both are left out
+/// and taken away from rlxd's own. No account gets `CLAUDE_SECURESTORAGE_CONFIG_DIR`,
+/// the app's or rlxd's, which picks whose Keychain login Claude Code reads: Claude Code
+/// then keys on the account's own `CLAUDE_CONFIG_DIR`, or the default item for the plain
+/// account. Only a managed slot rlx gave one gets its own ([`Account::env`],
+/// [`Account::unset`]). A run keeps the app's values as they are.
+pub(crate) fn account_env(
+    values: &EnvValues,
+    account: &Account,
+) -> (Vec<(OsString, OsString)>, Vec<OsString>) {
+    let set = account.env();
+    let unset = account.unset();
+    let mut env: Vec<(OsString, OsString)> = run_env(values)
+        .into_iter()
+        .filter(|(name, _)| !unset.contains(name) && !set.iter().any(|(own, _)| own == name))
+        .collect();
+    env.extend(set);
+    (env, unset)
 }
 
 /// Adds `text` to `kept`, which holds at most the last [`PARTIAL_TEXT`] bytes.
@@ -3142,6 +3264,99 @@ fn blocking<T>(work: impl FnOnce() -> T) -> T {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_accounts_read_keeps_to_its_own_homes_and_keychain_login() {
+        let mut values = EnvValues::default();
+        values.path = Some("/app/bin".to_owned());
+        values.claude_config_dir = Some("/app/claude".to_owned());
+        values.claude_securestorage_config_dir = Some("/app/secure".to_owned());
+        let named = |env: &[(OsString, OsString)], name: &str| {
+            env.iter()
+                .find(|(each, _)| each == name)
+                .map(|(_, value)| value.to_str().unwrap().to_owned())
+        };
+        let homes = [
+            "CLAUDE_CONFIG_DIR",
+            "CLAUDE_CODE_TMPDIR",
+            "CLAUDE_SECURESTORAGE_CONFIG_DIR",
+        ];
+        // A run keeps the app's values as they are.
+        let run = run_env(&values);
+        assert_eq!(
+            named(&run, "CLAUDE_CONFIG_DIR").as_deref(),
+            Some("/app/claude")
+        );
+        assert_eq!(
+            named(&run, "CLAUDE_SECURESTORAGE_CONFIG_DIR").as_deref(),
+            Some("/app/secure")
+        );
+
+        // The plain account: the app's PATH, and none of the three, here or inherited.
+        let (env, unset) = account_env(&values, &Account::default_one());
+        assert_eq!(named(&env, "PATH").as_deref(), Some("/app/bin"));
+        for name in homes {
+            assert_eq!(named(&env, name), None, "{name}: {env:?}");
+            assert!(unset.iter().any(|each| each == name), "{name}: {unset:?}");
+        }
+
+        // A managed slot: its own two homes, never the app's, and no Keychain login dir.
+        let mut managed = Account {
+            slot: 2,
+            label: None,
+            config_dir: Some(PathBuf::from("/accounts/2")),
+            tmp_dir: Some(PathBuf::from("/accounts/2-tmp")),
+            secure_storage_dir: None,
+            login: None,
+        };
+        let (env, unset) = account_env(&values, &managed);
+        assert_eq!(named(&env, "PATH").as_deref(), Some("/app/bin"));
+        assert_eq!(
+            named(&env, "CLAUDE_CONFIG_DIR").as_deref(),
+            Some("/accounts/2")
+        );
+        assert_eq!(
+            named(&env, "CLAUDE_CODE_TMPDIR").as_deref(),
+            Some("/accounts/2-tmp")
+        );
+        assert_eq!(
+            named(&env, "CLAUDE_SECURESTORAGE_CONFIG_DIR"),
+            None,
+            "{env:?}"
+        );
+        assert_eq!(unset, ["CLAUDE_SECURESTORAGE_CONFIG_DIR"]);
+        for name in homes {
+            let set = env.iter().filter(|(each, _)| each == name).count();
+            assert!(set <= 1, "{name} set once at most: {env:?}");
+        }
+
+        // The seam: a managed slot rlx gave its own Keychain login dir reads with it.
+        managed.secure_storage_dir = Some(PathBuf::from("/accounts/2-secure"));
+        let (env, unset) = account_env(&values, &managed);
+        assert_eq!(
+            named(&env, "CLAUDE_SECURESTORAGE_CONFIG_DIR").as_deref(),
+            Some("/accounts/2-secure")
+        );
+        assert_eq!(
+            env.iter()
+                .filter(|(each, _)| each == "CLAUDE_SECURESTORAGE_CONFIG_DIR")
+                .count(),
+            1,
+            "{env:?}"
+        );
+        assert!(unset.is_empty(), "{unset:?}");
+        // The plain account never takes one.
+        let plain = Account {
+            secure_storage_dir: Some(PathBuf::from("/accounts/1-secure")),
+            ..Account::default_one()
+        };
+        let (env, _) = account_env(&values, &plain);
+        assert_eq!(
+            named(&env, "CLAUDE_SECURESTORAGE_CONFIG_DIR"),
+            None,
+            "{env:?}"
+        );
+    }
 
     #[test]
     fn partial_text_keeps_the_last_mebibyte_on_a_character_boundary() {
