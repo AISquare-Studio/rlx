@@ -554,3 +554,95 @@ fn only_the_tables_tool_qualifies() {
     assert!(mcp_calls(&home).iter().all(|(tool, _)| tool == WHOAMI));
     assert_eq!(identity_runs(&home), 1, "none even started for slot 2");
 }
+
+/// The hold-then-sign-in sequence: slot 2's identity call held while slot 2 is signed in
+/// as someone else and rlxd hears it (`hear`), then allowed: its answer is dropped.
+fn held_across_a_new_sign_in(hear: fn(&TestHome)) {
+    let (home, _) = identity_home(
+        &fixture("Tidewater Works", "Zoltan", true),
+        &fixture("Kestrel Works", "Quinn", true),
+        &[],
+    );
+    let _app = App::open(&home);
+    let since = seq(&home);
+    let mut refresh = home.spawn(&["call", "connectors.list", r#"{"refresh":true}"#]);
+    // The accounts are asked one after the other: slot 1's call, then slot 2's.
+    let asked = |n: usize| {
+        let deadline = Instant::now() + Duration::from_secs(60);
+        loop {
+            let calls: Vec<Value> = home
+                .rlxd(&["events", "--topics", "run", "--since", &since.to_string()])
+                .lines()
+                .into_iter()
+                .filter(|e| e["type"] == "run.tool_call")
+                .map(|e| e["data"].clone())
+                .collect();
+            if calls.len() >= n {
+                return calls[n - 1].clone();
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the app was never asked call {n}"
+            );
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    };
+    let decide = |call: &Value| {
+        let params = json!({"run_id": call["run_id"], "call_id": call["call_id"],
+            "decision": "allow", "reason": "the test said so"});
+        let run = home.rlxd(&["call", "--as-app", "run.decide", &params.to_string()]);
+        assert_eq!(run.code(), Some(0), "{run:?}");
+    };
+    decide(&asked(1));
+    // Slot 2's call is held while slot 2 is signed in as someone else, and rlxd hears it.
+    let held = asked(2);
+    let listed = home.root().join("accounts.json");
+    let mut accounts: Value =
+        serde_json::from_str(&std::fs::read_to_string(&listed).unwrap()).unwrap();
+    accounts[1]["login"] = json!("another-mark");
+    std::fs::write(&listed, accounts.to_string()).unwrap();
+    hear(&home);
+    // Then the held call is allowed, and its answer, the old sign-in's, lands.
+    decide(&held);
+    let out = refresh.wait().unwrap();
+    assert!(out.success());
+    let data = list(&home);
+    assert_eq!(
+        fixture_row(&data, 2)["identity"],
+        Value::Null,
+        "dropped: {data:#}"
+    );
+    assert_eq!(
+        fixture_row(&data, 1)["identity"]["user"],
+        "Zoltan",
+        "{data:#}"
+    );
+    assert!(
+        home.log()
+            .contains("identity on claude.ai Fixture is dropped")
+    );
+}
+
+#[test]
+fn an_identity_asked_under_one_sign_in_that_lands_after_a_read_of_another_is_dropped() {
+    // A remote refresh: the new mark heard, and slot 2 read under it.
+    held_across_a_new_sign_in(|home| {
+        let remote = home.rlxd(&[
+            "call",
+            "--role",
+            "remote",
+            "connectors.list",
+            r#"{"refresh":true}"#,
+        ]);
+        assert_eq!(remote.code(), Some(0), "{remote:?}");
+    });
+}
+
+#[test]
+fn an_identity_asked_under_one_sign_in_that_lands_once_another_is_heard_is_dropped() {
+    // Only heard, no read yet: rlxd's account has the new mark, the entry the old.
+    held_across_a_new_sign_in(|home| {
+        let unknown = home.rlxd(&["call", "connectors.list", r#"{"account":9}"#]);
+        assert_eq!(unknown.error_code(), "no_such_account", "{unknown:?}");
+    });
+}

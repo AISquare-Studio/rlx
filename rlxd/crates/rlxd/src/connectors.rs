@@ -873,18 +873,34 @@ impl Connectors {
             .collect()
     }
 
-    /// Takes `identity` as who `slot`'s account is on `id`, when it still lists `id`.
-    pub fn set_identity(&self, slot: u32, id: &str, identity: ConnectorIdentity) {
+    /// Takes `identity`, read under the sign-in `login`, as who `slot`'s account is on
+    /// `id`: only while both rlx's account of that slot and its entry are still that
+    /// sign-in, and the entry still lists `id`. A call that came back after the account
+    /// was signed in as someone else is dropped, so its answer is never the new sign-in's.
+    /// Whether it was stored.
+    pub fn set_identity(
+        &self,
+        slot: u32,
+        login: Option<&str>,
+        id: &str,
+        identity: ConnectorIdentity,
+    ) -> bool {
+        let known = self
+            .account(slot)
+            .is_some_and(|account| account.login.as_deref() == login);
         let mut cache = self.cache();
-        let Some(connector) = cache
-            .accounts
-            .get_mut(&slot)
-            .and_then(|entry| entry.connectors.iter_mut().find(|c| c.id == id))
-        else {
-            return;
+        let Some(entry) = cache.accounts.get_mut(&slot) else {
+            return false;
+        };
+        if !known || entry.login.as_deref() != login {
+            return false;
+        }
+        let Some(connector) = entry.connectors.iter_mut().find(|c| c.id == id) else {
+            return false;
         };
         connector.identity = Some(identity);
         self.save(&cache);
+        true
     }
 
     /// Notes that a refresh of `account` failed with `error`: its connectors stay as they

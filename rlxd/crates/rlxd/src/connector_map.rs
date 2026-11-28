@@ -240,11 +240,24 @@ impl ConnectorMap {
             };
             match identity {
                 Some(identity) => {
-                    off_worker(|| {
-                        self.connectors
-                            .set_identity(account.slot, source.connector, identity);
+                    // Under the sign-in it was asked under, or not at all.
+                    let stored = off_worker(|| {
+                        self.connectors.set_identity(
+                            account.slot,
+                            account.login.as_deref(),
+                            source.connector,
+                            identity,
+                        )
                     });
-                    read += 1;
+                    if stored {
+                        read += 1;
+                    } else {
+                        info!(
+                            "connectors: account {}'s identity on {} is dropped: signed_in_again",
+                            account.slot, source.connector
+                        );
+                        unread += 1;
+                    }
                 }
                 None => unread += 1,
             }
