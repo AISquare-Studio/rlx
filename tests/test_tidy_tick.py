@@ -26,13 +26,13 @@ from pydantic import ValidationError
 from typer.testing import CliRunner
 
 from aisquare.cli.app import app
-from aisquare.core import locking
+from aisquare.core import locking, paths
 from aisquare.core import program as prog
 from aisquare.core.config import TidySettings, WatchSettings, load_config, save_config
 from aisquare.core.store import store_session
 from aisquare.models import ProjectInfo, TeamSession
 from aisquare.services import fleet as fleet_service
-from aisquare.services import remote_needs, tidy
+from aisquare.services import home_migration, remote_needs, tidy
 from aisquare.services import team as team_service
 from aisquare.services import watch as watch_service
 from tests.test_remote_needs import Fleet, _sources
@@ -265,6 +265,107 @@ def test_a_pass_that_looked_before_another_finished_asks_again_under_the_lock(
 
     assert tidy.periodic_pass(T0 + timedelta(minutes=1)) is None
     assert len(looks) == 2 and len(plans.calls) == 1
+
+
+# --- never during a move of the home (manager #3815) -----------------------------------------
+
+
+@posix_only
+def test_no_pass_runs_while_a_move_of_the_home_is_unfinished(plans: Plans) -> None:
+    """The first tick after an upgrade cannot race the cutover: an unfinished journal (one
+    whose steps do not say done, or that cannot be read) holds every pass, and it stays due."""
+    journal = paths.aisquare_home().joinpath(*paths.MOVE_JOURNAL)
+    journal.parent.mkdir(parents=True)
+    journal.write_text(json.dumps({"steps": ["back up the store"]}), encoding="utf-8")
+    assert paths.unfinished_home_move() == journal
+
+    assert tidy.periodic_pass(T0) is None and _watcher().tick(T0).tidied is None
+    assert plans.calls == [] and not tidy.stamp_path().exists()
+    journal.write_text("{", encoding="utf-8")
+    assert tidy.periodic_pass(T0) is None
+    journal.write_text(json.dumps({"steps": ["back up the store", "done"]}), encoding="utf-8")
+    assert tidy.periodic_pass(T0) is not None
+
+
+@posix_only
+def test_no_pass_runs_while_a_move_holds_its_lock_and_a_lock_a_crash_left_holds_none(
+    tmp_path: Path, plans: Plans
+) -> None:
+    folder = tidy._move_lock_folder()
+    assert folder.resolve().is_relative_to(tmp_path.resolve()), "the sandbox's, never ~"
+    lock = folder / f"{home_migration.MOVE_LOCK_PREFIX}{'a' * 16}.lock"
+    assert home_migration.move_lock_path(str(paths.aisquare_home()), named=True).parent == folder
+
+    with locking.holding(lock, wait_s=0):
+        assert tidy.a_home_move_runs()
+        assert tidy.periodic_pass(T0) is None
+    assert plans.calls == [] and lock.exists()  # left by a crash: held by nothing
+    assert not tidy.a_home_move_runs()
+    assert tidy.periodic_pass(T0) is not None
+
+
+# --- its own lock, never tidied ------------------------------------------------------------
+
+
+@posix_only
+def test_tidys_lock_rule_never_takes_the_passs_own_lock(the_real_job: Path) -> None:
+    """Rule 4 frees stale ``rlx-home-migration-<16 hex>.lock`` files alone: the pass's lock,
+    however old, is never in a plan, and a pass leaves it where it is."""
+    own = tidy.pass_lock()
+    assert own is not None and own.parent == the_real_job
+    own.write_bytes(b"")
+    old = (datetime.now(UTC) - timedelta(days=30)).timestamp()
+    os.utime(own, (old, old))
+
+    assert tidy.LOCK_NAME.fullmatch(own.name) is None
+    assert all(item.path != own for item in tidy.plan().items)
+    assert tidy.periodic_pass() is not None and own.exists()
+
+
+# --- the stamp (manager #3815) -------------------------------------------------------------
+
+
+@posix_only
+@pytest.mark.parametrize("torn", ["{", "", "[1, 2]", '{"last_pass_at": "yesterday"}'])
+def test_a_torn_stamp_is_due_and_written_again(plans: Plans, torn: str) -> None:
+    stamp = tidy.stamp_path()
+    stamp.parent.mkdir(parents=True, exist_ok=True)
+    stamp.write_text(torn, encoding="utf-8")
+
+    assert tidy.periodic_pass(T0) is not None
+    assert tidy.read_stamp()["last_pass_at"] == T0.isoformat()
+    assert tidy.periodic_pass(T0 + timedelta(minutes=1)) is None
+
+
+@posix_only
+def test_a_stamp_that_is_no_file_is_set_aside_never_deleted_and_written_anew(
+    plans: Plans,
+) -> None:
+    """A folder where the stamp goes: no replace could go over it, and every tick would run
+    a pass. It is renamed aside, with what it holds, and the stamp written."""
+    stamp = tidy.stamp_path()
+    stamp.mkdir(parents=True)
+    (stamp / "kept.txt").write_text("someone's\n", encoding="utf-8")
+
+    assert tidy.periodic_pass(T0) is not None
+    assert stamp.is_file() and tidy.read_stamp()["last_pass_at"] == T0.isoformat()
+    [aside] = [p for p in stamp.parent.iterdir() if p.name.startswith("tidy.json.unreadable-")]
+    assert (aside / "kept.txt").read_text(encoding="utf-8") == "someone's\n"
+    assert tidy.periodic_pass(T0 + timedelta(minutes=1)) is None
+
+
+@pytest.mark.skipif(
+    sys.platform == "win32" or not hasattr(os, "getuid") or os.getuid() == 0,
+    reason="needs a mode that denies reading: not as root, nor on Windows",
+)
+def test_a_stamp_that_cannot_be_read_is_due_and_written_again(plans: Plans) -> None:
+    stamp = tidy.stamp_path()
+    stamp.parent.mkdir(parents=True, exist_ok=True)
+    stamp.write_text(json.dumps({"last_pass_at": T0.isoformat()}), encoding="utf-8")
+    stamp.chmod(0)
+
+    assert tidy.periodic_pass(T0 + timedelta(minutes=1)) is not None
+    assert tidy.read_stamp()["last_pass_at"] == (T0 + timedelta(minutes=1)).isoformat()
 
 
 # --- quiet, and its one line ---------------------------------------------------------------

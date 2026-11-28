@@ -1130,8 +1130,9 @@ def periodic_pass(now: datetime | None = None) -> PassReport | None:
     :func:`apply`. Its stamp is written under the lock, whether the pass finished or raised,
     so a pass that keeps failing is tried once per interval, never every tick. Quiet: it wakes
     and nudges no one; a pass that freed :data:`RECEIPT_BYTES` or more says so in one line on
-    one board (:func:`_say_it`). ``None``: not due, off, or another pass is running. Never on
-    native Windows, where tidy deletes nothing (:data:`DELETES`)."""
+    one board (:func:`_say_it`). ``None``: not due, off, another pass is running, or a move of
+    the home is (:func:`a_home_move_runs`). Never on native Windows, where tidy deletes nothing
+    (:data:`DELETES`)."""
     if not DELETES:
         return None
     every = _settings().every_minutes
@@ -1154,6 +1155,8 @@ def periodic_pass(now: datetime | None = None) -> PassReport | None:
             raise
         if not is_due(at, every):
             return None  # one ran between the first look and the lock
+        if a_home_move_runs():
+            return None  # never during a move of the home: it stays due (manager #3815)
         try:
             made = plan(now=at, size_kept=False)
             done = apply(made)
@@ -1173,9 +1176,73 @@ def _totals(report: PassReport) -> dict[str, Any]:
 
 
 def _write_stamp(data: dict[str, Any]) -> None:
+    """The stamp written whole (a temp file replaced into place, in its own folder): a reader
+    never sees half of one. Whatever is at its path that is not a file (a folder, a link) is
+    renamed aside first, never deleted, or no replace could go over it and every tick would be
+    due (manager #3815: a torn or unreadable stamp is due, and is written again)."""
     path = stamp_path()
     path.parent.mkdir(parents=True, exist_ok=True)
-    atomic.write_replacing(path, json.dumps(data), durable=False)
+    try:
+        mode = os.lstat(path).st_mode
+    except FileNotFoundError:
+        mode = None
+    if mode is not None and not stat.S_ISREG(mode):
+        aside = _now().strftime("%Y%m%dT%H%M%S%fZ")
+        os.rename(path, path.with_name(f"{path.name}.unreadable-{aside}"))
+    # Never the old file's mode: one that could not be read (mode 000) would be written as
+    # unreadable again, and every tick would find a pass due.
+    atomic.write_replacing(path, json.dumps(data), durable=False, keep_mode=False)
+
+
+def a_home_move_runs() -> bool:
+    """Whether H2's move of this home is under way (manager #3815): its journal is there and
+    unfinished (``paths.unfinished_home_move``), or a move holds its lock, ``.rlx-home-move-
+    <digest>.lock`` in the folder the move keeps it in. That file is removed as a move lets go
+    (#62), so one that is there is taken at once to ask: held, a move runs; free, a crash left
+    it, and nothing runs. Never a wait."""
+    from aisquare.services import home_migration
+
+    if paths.unfinished_home_move() is not None:
+        return True
+    folder = _move_lock_folder()
+    try:
+        with os.scandir(folder) as listing:
+            names = [
+                entry.name
+                for entry in listing
+                if entry.name.startswith(home_migration.MOVE_LOCK_PREFIX)
+                and entry.name.endswith(".lock")
+            ]
+    except OSError:
+        return False
+    for name in names:
+        try:
+            fd = locking.open_lock_file(folder / name, create=False)
+        except OSError:
+            continue
+        try:
+            locking.acquire(fd, wait_s=0)
+        except TimeoutError:
+            return True
+        except OSError:
+            continue
+        else:
+            with contextlib.suppress(OSError):
+                locking.unlock(fd)
+        finally:
+            os.close(fd)
+    return False
+
+
+def _move_lock_folder() -> Path:
+    """Where a move of this home keeps its lock (``home_migration.move_lock_path``): beside a
+    home a variable names, by its real path; beside ``~/.aisquare`` for the default home."""
+    from aisquare.services import home_migration
+
+    named = paths.named_home()
+    if named is not None and not home_migration._names_the_default_home():
+        return Path(os.path.realpath(named)).parent
+    return Path.home()
 
 
 def _pass_report(at: datetime, done: Report) -> PassReport:
