@@ -2631,6 +2631,9 @@ def test_a_refresh_between_the_nicknames_write_and_its_report_leaves_ctrl_z_the_
             await pilot.pause(0.01)
         page.show_project(from_store())  # a frame in the Undo's window too: codename back
         await pilot.pause()
+        # Not typed in (it shows what it last kept), the field follows the frame: the name
+        # Undo wrote, before Undo's report is heard (#56: typing is judged by the field's kept).
+        seen["framed_undo"] = (field.value, field.kept)
         undo_let_go.set()
         await settle(pilot)
         seen["undone"] = (from_store().nickname, field.value, len(page.changes))
@@ -2645,6 +2648,7 @@ def test_a_refresh_between_the_nicknames_write_and_its_report_leaves_ctrl_z_the_
     assert seen["framed"] == (True, "Auth"), "the premise: the frame held the new name"
     assert seen["kept"] == ("Auth", 1), seen["kept"]
     assert seen["undone"] == (None, "", 0), "one ctrl+z: the old name, on disk and shown"
+    assert seen["framed_undo"] == ("", ""), "the frame in Undo's window: the field follows it"
     assert [m for m in seen["said"] if m.endswith("(was auth)")], seen["said"]
 
 
