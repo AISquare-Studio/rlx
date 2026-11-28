@@ -8,134 +8,138 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
-- `rlx service` keeps Remote, the accounts' usage reads and the fleet's held-back nudges
-  going with no rlx window open (`rlx service start | stop | status`); an rlx window that
-  finds it running leaves them to it, and takes them back if it stops.
-- rlx's background service now starts when you log in, on by default: a LaunchAgent on
+- **`rlx service` keeps rlx's background work going with no rlx window open** (`rlx service
+  start | stop | status`): the accounts' usage reads, the fleet's held-back nudges, and
+  Remote while it is on. An rlx window that finds it running leaves them to it, and takes
+  them back if it stops.
+- **rlx's background service now starts when you log in, on by default:** a LaunchAgent on
   macOS, a systemd user unit on Linux and in WSL. Turn it off in App settings ▸ User
   preferences, with `rlx service uninstall`, or in your OS's startup settings, and rlx won't
   turn it back on.
-- The rlx service shows rlx's `\` in the macOS menu bar or the Linux tray (Open rlx, Restart
-  rlx, Quit rlx, the agents and accounts at a glance), with the `tray` extra the installer
-  adds; App settings ▸ User preferences ▸ Tray switches it.
-- `rlx tidy` frees the disk rlx's ended agents and sessions left (their worktrees, temp
-  checkouts and build output, by the CACHEDIR.TAG standard), keeping anything with work
-  found nowhere else; `--dry-run` lists every path with its size and why.
-- The watcher runs `rlx tidy`'s rules on its own every hour (`[tidy] every_minutes`), one
-  pass at a time and never during a home move, and says so on a board only when it frees 1
-  GB or more.
-- `rlx doctor` gains a disk row: what rlx's worktrees, build caches and temp take, and what
-  `rlx tidy` would free, warning at 1 GB or more.
-- Settings has a tmux page: every window on rlx's tmux server and whose it is, with Open,
-  Stop for windows no agent owns, and Adopt for a Claude Code or Codex left running outside
-  the fleet; other tmux servers are listed read-only.
-- A one-line "needs you" bar sits at the top of every screen while any project has something
-  that needs you: how many, then the first with its project. F6 or a click opens that
-  project's board on it; with nothing to show, it takes no space.
-- A fleet's manager can be woken on a schedule (`rlx fleet manager-policy manager_wake
+- **The rlx service shows rlx's `\` in the macOS menu bar or the Linux tray** (Open rlx,
+  Restart rlx, Quit rlx, the agents and accounts at a glance), with the `tray` extra the
+  installer adds; App settings ▸ User preferences ▸ Tray switches it.
+- **`rlx tidy` frees the disk rlx's ended agents and sessions left** (their worktrees, temp
+  files and build output, by the CACHEDIR.TAG standard), keeping any worktree with work
+  found nowhere else and every git repository; `--dry-run` lists every path with its size
+  and why. On native Windows it only reports in 0.10.2; the fleet runs in WSL, where it
+  frees.
+- **The watcher runs `rlx tidy`'s rules on its own every hour** (`[tidy] every_minutes`),
+  one pass at a time and never during a home move, and says so on a board only when it frees
+  1 GB or more. On native Windows, where tidy only reports in 0.10.2, the watcher runs no
+  pass; the fleet runs in WSL, where it does.
+- **`rlx doctor` gains a disk row:** what rlx's worktrees, build caches and temp take, and
+  what `rlx tidy` would free, warning at 1 GB or more.
+- **Settings has a tmux page:** every window on rlx's tmux server and whose it is, with
+  Open, Stop for windows no agent owns, and Adopt for a Claude Code or Codex left running
+  outside the fleet; other tmux servers are listed read-only.
+- **A one-line "needs you" bar sits at the top of every screen** while any project has
+  something that needs you: how many, then the first with its project. F6 or a click opens
+  that project's board on it; with nothing to show, it takes no space.
+- **A fleet's manager can be woken on a schedule** (`rlx fleet manager-policy manager_wake
   schedule`): urgent news at once, routine news at most every 15 minutes (or N), read in one
   turn; `team standby` now holds while tasks are in flight. Thanks to Arbind (arbind-ais).
-- Sidebar groups can now be renamed, deleted, pinned, collapsed and moved from their own
-  menu (⋯, right-click or `.`), and an empty group says so.
-- Below 70 columns (SSH, phones) rlx shows the sidebar or the open view, one at a time; F12
-  or the bar on top switches between them.
-- A usage-limited agent's view and ⋯ menu offer "Move to `<account>` (N% left)" or "Wait",
-  and Move hands it to the account with the most room. The Agent view's header shows the
-  task the agent is on (#N and title) and names its account by email, with no tmux pane id.
-  The spawn picker says Presets.
-- rlx sends one anonymous "active today" ping a day (date, version, OS, CPU type, install
-  method; no id), whether usage sharing is on or off, with its own switch in Settings ▸
-  Usage & stats; the sharing question now shows your own last 30 days first.
-- The README shows how agents on different accounts reach each other: `rlx --json fleet top`
-  to find one, and `rlx fleet tell -P <project_id> <label>` to message it. Claude Code's own
-  `/peers` and `SendMessage` reach only one account. Thanks to Vaibhav (VBajaj113).
+- **Sidebar groups can now be renamed, deleted, pinned, collapsed and moved from their own
+  menu** (⋯, right-click or `.`), and an empty group says so.
+- **Below 70 columns (SSH, phones) rlx shows the sidebar or the open view, one at a time;**
+  F12 or the bar on top switches between them.
+- **A usage-limited agent's view and ⋯ menu offer "Move to `<account>` (N% left)" or
+  "Wait",** and Move hands it to the account with the most room. The Agent view's header
+  shows the task the agent is on (#N and title) and names its account by email, with no tmux
+  pane id. The spawn picker says Presets.
+- **rlx sends one anonymous "active today" ping a day** (date, version, OS, CPU type,
+  install method; no id), whether usage sharing is on or off, with its own switch in
+  Settings ▸ Usage & stats; the sharing question now shows your own last 30 days first.
+- **The README shows how agents on different accounts reach each other:** `rlx --json fleet
+  top` to find one, and `rlx fleet tell -P <project_id> <label>` to message it. Claude
+  Code's own `/peers` and `SendMessage` reach only one account. Thanks to Vaibhav
+  (VBajaj113).
 
 ### Changed
 
-- rlx's home is now `~/.rlx` (set `RLX_HOME` to put it elsewhere; `AISQUARE_HOME` still
+- **rlx's home is now `~/.rlx`** (set `RLX_HOME` to put it elsewhere; `AISQUARE_HOME` still
   works), laid out as docs/home-layout.md describes; an existing `~/.aisquare` keeps working
   as it is until it is migrated.
-- `rlx upgrade`, and the app's ⬆ Move rlx's home, now move a home from before 0.10.2
-  (`~/.aisquare`) to `~/.rlx` in the new layout, only while nothing runs on it, and leave
+- **`rlx upgrade`, and the app's ⬆ Move rlx's home, now move a home from before 0.10.2
+  (`~/.aisquare`) to `~/.rlx`** in the new layout, only while nothing runs on it, and leave
   `~/.aisquare` as a link for one release (from 0.10.1, run `rlx upgrade` twice; do not move
   back to a release before 0.10.2 afterwards).
-- Each agent now runs with a temporary folder of its own under rlx's home (`TMPDIR`),
+- **Each agent now runs with a temporary folder of its own** under rlx's home (`TMPDIR`),
   removed after the agent ends, so the test files and build scraps agents leave behind no
   longer pile up on disk.
-- rlx opens on your last-used project's Manager tab instead of Welcome, and the logo and the
-  Home key take you back there; `w` still opens Welcome.
-- The board is laid out as what needs you, the work and the stream: a "needs you" lane you
-  can act on by number, Work grouped by status with Done folded, a Stream with agent, kind
-  and status chips and a `/` filter, a full-height task reader with its history, one column
-  at a time on narrow screens, a key for every click, and folds and filters remembered per
-  project.
-- The board answers its keys as soon as its tab opens, dates every time that is not today's,
-  keeps your place when you scroll up (with a "↓ N new" count), names every event kind,
-  shows why a task is blocked or done, fits a 90-column footer, and `rlx board` prints a
-  readable text board.
-- Settings save as you change them. A switch or a pick is kept at once, and a text field
+- **rlx opens on your last-used project's Manager tab instead of Welcome,** and the logo and
+  the Home key take you back there; `w` still opens Welcome.
+- **The board is laid out as what needs you, the work and the stream:** a "needs you" lane
+  you can act on by number, Work grouped by status with Done folded, a Stream with agent,
+  kind and status chips and a `/` filter, a full-height task reader with its history, one
+  column at a time on narrow screens, a key for every click, and folds and filters
+  remembered per project.
+- **The board answers its keys as soon as its tab opens,** dates every time that is not
+  today's, keeps your place when you scroll up (with a "↓ N new" count), names every event
+  kind, shows why a task is blocked or done, fits a 90-column footer, and `rlx board` prints
+  a readable text board.
+- **Settings save as you change them.** A switch or a pick is kept at once, and a text field
   when you press Enter or leave it; a "Saved … · Undo: ctrl+z" notification says so, and
   `ctrl+z` on the page takes the last change back. A value rlx refuses is said beside its
   field, and nothing is written. The settings pages have no Save, Apply or Reload button
   now; the dialogs that create something, the SKILL.md editor and the boxes that ask before
   an action keep theirs.
-- Agents now spread across your Claude accounts by each account's plan, weekly room and
+- **Agents now spread across your Claude accounts** by each account's plan, weekly room and
   reset day, with managers on the longest runway and testers on the soonest reset, and 20%
   kept free on the account you use yourself; the spawn line says why, and `rlx accounts
   usage` shows each account's agents and fair share.
-- The Doctor shows what is wrong first and folds the passing checks into one line; it can
-  move a usage-limited agent to an account with room and restart the watcher in one click,
-  and it speaks of rlx's agent server, not tmux sockets.
-- Welcome's Start fleet opens the manager to answer its folder question and starts the
+- **The Doctor shows what is wrong first** and folds the passing checks into one line; it
+  can move a usage-limited agent to an account with room and restart the watcher in one
+  click, and it speaks of rlx's agent server, not tmux sockets.
+- **Welcome's Start fleet opens the manager to answer its folder question** and starts the
   coders once it is answered; Sign in opens Claude Code's login directly; finished steps
   fold to one line; and the usage-sharing question waits until your fleet is up.
-- Remote is one page, opened by `R`, Settings ▸ Remote control and App settings alike; New
-  link and Regenerate ask first; the phone page says why writes are off in the machine's own
-  words and shows the `r\x` logo; the Captain box moves to the end of App settings' Agent
-  settings.
-- Settings has an Experimental section with Captain and Remote, both off by default; a Mac
-  where Remote was already set up keeps it on, and Remote off loads nothing of it.
-- Settings ▸ Accounts names each account by its email, says why a row has no usage in words,
-  and fits a 120-column terminal; the AISquare sign-in's outcome shows beside its button,
-  and `aisquare login` keeps "The code expired before it was approved" on screen.
-- The sidebar uses ⏸ only for paused and a muted ◦ for waiting, says your accounts in words
-  ("Claude: 2 accounts · 58% left"), counts usage-limited agents on each card, groups the
-  card menu, offers Adopt a conversation from its + menu, drops the codename, shows ✓ in
+- **Settings has an Experimental section with Captain and Remote, both off by default;** a
+  home where Remote was already set up keeps it on, and Remote off loads nothing of it.
+- **With Remote on, its settings are one page,** opened by `R`, Settings ▸ Remote control
+  and App settings alike; New link and Regenerate ask first; the phone page says why writes
+  are off in the machine's own words and shows the `r\x` logo.
+- **Settings ▸ Accounts names each account by its email,** says why a row has no usage in
+  words, and fits a 120-column terminal; the AISquare sign-in's outcome shows beside its
+  button, and `aisquare login` keeps "The code expired before it was approved" on screen.
+- **The sidebar uses ⏸ only for paused and a muted ◦ for waiting,** says your accounts in
+  words ("Claude: 2 accounts · 58% left"), counts usage-limited agents on each card, groups
+  the card menu, offers Adopt a conversation from its + menu, drops the codename, shows ✓ in
   ticked checkboxes, and reads at 4.5:1 on every theme.
-- Personas are yours alone: rlx copies each project's own personas to yours once (keeping
-  yours where the names clash), no longer writes into a project (`--project` is retired),
-  and the Personas page has a title and no layer checkboxes.
-- The footer now starts with `?` help and shows `w` welcome and `+` add project; the help
-  explains every agent mark and the agent menu; quitting says how many agents keep running;
-  Resume's toast says resumed; the spawn toast drops tmux ids; and restarting an agent no
-  longer warns that its pane is gone.
-- Dialogs speak plainly: Stop and Pause say an agent is asked to quit and closed, the pause
-  toast no longer lists agents you unticked, internal issue numbers are gone from the
+- **Personas are yours alone:** rlx copies each project's own personas to yours once
+  (keeping yours where the names clash), no longer writes into a project (`--project` is
+  retired), and the Personas page has a title and no layer checkboxes.
+- **The footer now starts with `?` help** and shows `w` welcome and `+` add project; the
+  help explains every agent mark and the agent menu; quitting says how many agents keep
+  running; Resume's toast says resumed; the spawn toast drops tmux ids; and restarting an
+  agent no longer warns that its pane is gone.
+- **Dialogs speak plainly:** Stop and Pause say an agent is asked to quit and closed, the
+  pause toast no longer lists agents you unticked, internal issue numbers are gone from the
   restart notes, and the spawn and add-project screens say "Continue from", "Preset" and
   "Add a project".
-- The installer and the WSL installer name the command you will actually type, rlx's Update
-  says up front when another program's rlx is in the way, and copies made inside tmux no
-  longer stay on its paste-buffer list.
-- `rlx doctor` tells a terminal whose Shift+Enter it cannot prove to use Ctrl+J for a
-  newline in an agent pane, rather than to try Shift+Enter. kitty, WezTerm, foot, alacritty,
-  iTerm2, Windows Terminal and the VS Code terminal are now read as unknown. Thanks to
-  Vaibhav (VBajaj113).
-- An agent's pane keeps far fewer rendered rows in memory: four screens' worth at most, and
-  none while it is hidden. Long-running rlx windows stay much smaller, and scrolling looks
-  and feels the same.
-- rlx now drops a stopped agent's view once it is off screen, freeing its pane, and builds
-  it again when the agent is opened; a long-running rlx window no longer grows with every
-  agent ever opened.
-- The rlx app starts lighter: its pages and dialogs load when first opened.
-- The board reads only what it shows at each tick (its open tasks, and the sessions its
+- **The installer and the WSL installer name the command you will actually type,** rlx's
+  Update says up front when another program's rlx is in the way, and copies made inside tmux
+  no longer stay on its paste-buffer list.
+- **`rlx doctor` tells a terminal whose Shift+Enter it cannot prove to use Ctrl+J for a
+  newline in an agent pane, rather than to try Shift+Enter.** kitty, WezTerm, foot,
+  alacritty, iTerm2, Windows Terminal and the VS Code terminal are now read as unknown.
+  Thanks to Vaibhav (VBajaj113).
+- **An agent's pane keeps far fewer rendered rows in memory:** four screens' worth (512 rows
+  at least), and none while it is hidden. Long-running rlx windows stay much smaller, and
+  scrolling looks and feels the same.
+- **rlx now drops a stopped agent's view once it is off screen,** freeing its pane, and
+  builds it again when the agent is opened; a long-running rlx window no longer grows with
+  every agent ever opened.
+- **The rlx app starts lighter:** its pages and dialogs load when first opened.
+- **The board reads only what it shows at each tick** (its open tasks, and the sessions its
   lines and cards name), so rlx stays lighter and quicker with a long board history.
-- rlx reads each account's identity file only when it has changed, and of a collapsed
+- **rlx reads each account's identity file only when it has changed,** and of a collapsed
   group's projects refreshes only the one whose view is on screen (each folded project is
   still checked for exited agents every 30 s), so rlx does less work at every refresh.
   Thanks to Vaibhav (VBajaj113).
-- rlx now runs on typer 0.29 (the cap moves from below 0.29 to below 0.30). On typer 0.29,
-  which a fresh install gets, help pages show each option's type (`<bool>` on every flag,
-  `<list[str]>` and `...` on repeatable options and arguments, `<Path>` in place of
+- **rlx now runs on typer 0.29** (the cap moves from below 0.29 to below 0.30). On typer
+  0.29, which a fresh install gets, help pages show each option's type (`<bool>` on every
+  flag, `<list[str]>` and `...` on repeatable options and arguments, `<Path>` in place of
   `<file>`/`<path>`, `[x>=0]` on bounded options), and usage errors, `--json` messages
   included, use typer's new pydantic wording ("Input should be less than or equal to 65535",
   "Input should be a valid integer…" without the value given, "Value error, 'x' is not one
@@ -146,28 +150,18 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
-- rlx no longer types into Claude Code's session-rating survey when an effort row sits
+- **rlx no longer types into Claude Code's session-rating survey** when an effort row sits
   between it and the input box (Claude Code 2.1.318 and later).
-- On Windows, answering yes to quit another rlx no longer fails with "has not quit within 15
-  s" when that rlx's registry record could not be deleted as it quit.
-- Fixed a rare crash when a notification was redrawn just as it was being dismissed.
-- The needs-you bar's F6 or click, on a project not opened yet, no longer shows that
-  project's Manager tab now and then instead of opening the card it named.
-- A settings field saved with Enter and then left before its save finished no longer saves
-  twice, and one `ctrl+z` undoes it.
-- On a settings page, an undo after a name typed while another was still saving goes back to
-  the right name, and a save that finishes while you type no longer replaces what you typed.
-- rlx no longer leaves an empty lock file in the temp folder after moving a home; the lock
-  now sits beside the home and is removed when the move ends.
-- The rlx app's Doctor and explainability page no longer show a fix that names an rlx
-  command as words to type (`status`, `service`, `tidy` and 22 more were shown as written),
-  and attaching a persona whose board note rlx could not confirm no longer tells you to run
-  `aisquare log`.
-- A Codex agent spawned with Claude Code flags now starts. `--effort` reaches Codex as its
-  reasoning effort, `--model` and `--add-dir` pass as they are, and any flag Codex has no
-  equivalent for is refused before its window opens, with the setting it came from and why.
-  Thanks to Vaibhav (VBajaj113).
-- A paste holding a raw Escape (from coloured log output, say) now arrives as one paste,
+- **On Windows, answering yes to quit another rlx no longer fails with "has not quit within
+  15 s"** when that rlx's registry record could not be deleted as it quit.
+- **A notification redrawn just as it was being dismissed no longer crashes rlx.**
+- **When attaching a persona can't be confirmed, rlx's message no longer tells you to run
+  `aisquare log`.**
+- **A Codex agent spawned with Claude Code flags now starts.** `--effort` reaches Codex as
+  its reasoning effort, `--model` and `--add-dir` pass as they are, and any flag Codex has
+  no equivalent for is refused before its window opens, with the setting it came from and
+  why. Thanks to Vaibhav (VBajaj113).
+- **A paste holding a raw Escape (from coloured log output, say) now arrives as one paste,**
   Escape included; none of it reaches rlx as keystrokes, so an Enter in it no longer sends
   half a prompt. rlx pins Textual to 8.2.8 until
   [textual#6802](https://github.com/Textualize/textual/issues/6802) is fixed upstream.
@@ -175,10 +169,10 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### For contributors
 
-- The test suite can no longer reach your real home or your macOS Keychain: every test runs
-  in a home of its own, and a guard in the test process and in every process a test starts
-  refuses the real home, `/usr/bin/security` and real agents, so running the tests never
-  reads or writes your Claude Code, Codex or rlx state.
+- **The test suite can no longer reach your real home or your macOS Keychain:** every test
+  runs in a home of its own, and a guard in the test process and in every process a test
+  starts refuses the real home, `/usr/bin/security` and real agents, so running the tests
+  never reads or writes your Claude Code, Codex or rlx state.
 
 ## [0.10.1] - 2026-11-18
 
