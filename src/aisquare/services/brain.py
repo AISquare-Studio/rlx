@@ -59,7 +59,7 @@ Usage (task #15)
 ``usage`` gives each of those accounts' room, for rlxd's routes by connector: its fullest
 window, percent used, from the reading on record, and whether it refuses requests now, with
 when that ends. Python owns usage; rlxd only orders what this says. It asks the usage
-endpoint nothing.
+endpoint nothing, reads no Keychain and writes nothing.
 
 Hooks (1.5)
 -----------
@@ -868,10 +868,14 @@ def _usage(params: Mapping[str, Any]) -> Result:
     #15). ``{accounts: [{slot, used_percent, limited, resets_at}]}``, for the accounts
     ``accounts`` lists, in its order.
 
-    Nothing is asked of the usage endpoint: each account's reading is the one ON RECORD
-    for the login it holds now, no older than the cache's five minutes
-    (``services.claude_accounts._on_record``, what ``cached_usage`` serves without a fetch,
-    as ``room_on_record`` reads it), and the limit marks in force (``limit_marks``).
+    Strictly read-only: no request reaches the usage endpoint, no Keychain is read (a read
+    per routed start could ask the user), and nothing is written. Each account's reading is
+    the one ON RECORD for the login it holds now, no older than the cache's five minutes,
+    as ``services.claude_accounts._served`` serves it. Which login that is comes from no
+    Keychain item: a slot whose login is one takes it from the row a process that read the
+    item said (``_LOGIN_KEY``), as a slot whose Keychain is locked does (``_Logins.settle``
+    with nothing to say); any other from its credentials file. With no such row, it has no
+    reading. The limit marks in force are read too (``limit_marks``).
 
     - ``used_percent``: that reading's ``headroom_percent``, its fullest window, percent
       USED; ``None`` with no reading, which rlxd ranks last.
@@ -882,12 +886,10 @@ def _usage(params: Mapping[str, Any]) -> Result:
     - ``resets_at``: for a limited account, when the last of what limits it ends (RFC 3339,
       UTC), or ``None`` when none says.
 
-    Every account rlx reads ``_on_record`` from is one of ``core.claude_accounts``' (the
-    plain one, then each managed one), as ``accounts`` lists them. The private reader is
-    the same on rc/0.10.2 and rc/0.10.3.
+    The private readers it goes through are the same on rc/0.10.2 and rc/0.10.3.
     """
     del params
-    from datetime import UTC
+    from datetime import UTC, timedelta
 
     from aisquare.core import claude_accounts as core
     from aisquare.services import claude_accounts as accounts
@@ -895,10 +897,25 @@ def _usage(params: Mapping[str, Any]) -> Result:
     managed = core.managed_accounts()
     plain = core.default_account(env={})
     listed = [*([plain] if core.plain_home_counts(plain, managed=bool(managed)) else []), *managed]
-    # Both on the accounts code's own clock: the marks in force now, and each reading on
-    # record now whose windows haven't reset since it was taken (``_served``'s rule).
-    marks = accounts.limit_marks()
-    readings = accounts._on_record(listed, max_age=accounts.USAGE_MAX_AGE_SECONDS)
+    # On the accounts code's own clock: the marks in force now, and each reading on record
+    # now whose windows haven't reset since it was taken (``_served``'s rule).
+    now = accounts._now()
+    marks = accounts.limit_marks(now=now)
+    keychain = core.keychain_platform()
+    tokens: dict[int, str] = {}
+    locked = []
+    for account in listed:
+        if keychain:
+            # Never the item: its login as the row a reader of the item said it.
+            if core.has_stored_login(account):
+                locked.append(account)
+            continue
+        token = accounts._token_fingerprint(account, now)
+        if token is not None:
+            tokens[account.slot] = token
+    logins = accounts._Logins(now=now, tokens=tokens, seen=[], locked=locked)
+    since = now - timedelta(seconds=accounts.USAGE_MAX_AGE_SECONDS)
+    readings = accounts._served(listed, logins, since=since, now=now)
     rows: list[dict[str, Any]] = []
     for account in listed:
         reading = readings.get(account.slot)

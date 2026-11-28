@@ -4,12 +4,14 @@ refuses requests now, with when that ends. The usage endpoint is asked nothing."
 
 from __future__ import annotations
 
+import sqlite3
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import pytest
 
 from aisquare.core import claude_accounts as core
+from aisquare.core.store import store_session
 from aisquare.services import brain
 from aisquare.services import claude_accounts as service
 from tests.test_claude_accounts import NOW
@@ -157,3 +159,105 @@ def test_the_later_of_a_mark_and_a_spent_window_is_when_it_resets(
     rows = _usage()
     assert rows[slots[0]]["resets_at"] == _z(later)
     assert rows[slots[1]]["resets_at"] == _z(window)
+
+
+#: Every writer of the store's that a usage read could reach: each fails the test.
+_WRITERS = (
+    "set_ui_state",
+    "replace_ui_state",
+    "set_meta",
+    "set_meta_once",
+    "compare_meta",
+    "delete_meta",
+    "touch_meta",
+    "add_usage_sample",
+    "delete_usage_samples",
+)
+
+#: Every reader of the Keychain's: each fails the test.
+_KEYCHAIN = ("read_keychain", "_ask_keychain", "item_login", "stored_login", "credentials")
+
+
+def _store_rows() -> dict[str, list[str]]:
+    """Every row of rlx's store, read with a connection of the test's own, read-only."""
+    from aisquare.core import paths
+
+    con = sqlite3.connect(f"file:{paths.db_path()}?mode=ro", uri=True)
+    try:
+        tables = [
+            row[0] for row in con.execute("SELECT name FROM sqlite_master WHERE type='table'")
+        ]
+        return {
+            table: sorted(repr(row) for row in con.execute(f'SELECT * FROM "{table}"'))
+            for table in tables
+        }
+    finally:
+        con.close()
+
+
+def _on_a_mac_that_must_not_be_asked(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Logins in Keychain items (``keychain_platform`` True), and a test that fails on any
+    Keychain read and any write of the store."""
+    from aisquare.core.store import ContextStore
+
+    def asked(*_args: Any, **_kwargs: Any) -> Any:
+        raise AssertionError("usage read the Keychain")
+
+    def written(*_args: Any, **_kwargs: Any) -> Any:
+        raise AssertionError("usage wrote to rlx's store")
+
+    monkeypatch.setattr(core, "keychain_platform", lambda: True)
+    for name in _KEYCHAIN:
+        monkeypatch.setattr(core, name, asked)
+    for name in _WRITERS:
+        monkeypatch.setattr(ContextStore, name, written)
+
+
+def test_on_a_mac_usage_reads_no_keychain_and_writes_nothing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    endpoint = _two(
+        monkeypatch,
+        **{
+            "tok-work": _payload(70, resets_at=_later(3)),
+            "tok-home": _payload(20, resets_at=_later(3)),
+        },
+    )
+    _on_record(endpoint)
+    slots = sorted(account.slot for account in core.managed_accounts())
+    until = _later(5).replace(microsecond=0)
+    service.remember_limit(slots[0], "week", until)
+    # Each login said in its row, as a process that read its Keychain item says it.
+    with store_session() as store:
+        for account in core.managed_accounts():
+            key = service._seen_key(account)
+            assert key is not None
+            seen = service.SeenLogin(token=service._token_fingerprint(account, NOW))
+            store.replace_ui_state(key, store.ui_state(key), seen.dump())
+    _on_a_mac_that_must_not_be_asked(monkeypatch)
+    before = _store_rows()
+    rows = _usage()
+    assert _store_rows() == before, "usage changed rlx's store"
+    assert endpoint.calls == []
+    # Served by the logins the rows name, as a slot whose Keychain is locked is.
+    assert [rows[slot]["used_percent"] for slot in slots] == [70.0, 20.0]
+    assert rows[slots[0]]["limited"] is True
+    assert rows[slots[0]]["resets_at"] == _z(until)
+    assert rows[slots[1]]["limited"] is False
+
+
+def test_on_a_mac_a_slot_no_row_names_has_no_reading_and_nothing_is_asked(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    endpoint = _two(
+        monkeypatch,
+        **{"tok-work": _payload(70, resets_at=_later(3)), "tok-home": _payload(20)},
+    )
+    _on_record(endpoint)
+    _on_a_mac_that_must_not_be_asked(monkeypatch)
+    before = _store_rows()
+    rows = _usage()
+    assert _store_rows() == before
+    assert endpoint.calls == []
+    managed = [row for slot, row in rows.items() if slot != 1]
+    assert [row["used_percent"] for row in managed] == [None, None]
