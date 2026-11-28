@@ -139,10 +139,11 @@ class SettingsView(SavesAsYouGo, VerticalScroll):
             return
         if isinstance(field, CommitInput):
             # The stored name, kept whatever the field shows: what is being typed is the
-            # operator's, and leaving the field keeps it.
-            typing = field.value.strip() != before
-            field.kept = project.nickname or ""
-            if not typing:
+            # operator's, and leaving the field keeps it. Typing is a field showing other than
+            # what it last kept: the tab's project may already hold Undo's target (#56).
+            if field.value.strip() != field.kept.strip():
+                field.kept = project.nickname or ""
+            else:
                 field.keep(project.nickname or "")
         elif field.value.strip() == before:
             field.value = project.nickname or ""
