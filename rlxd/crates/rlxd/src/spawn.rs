@@ -10,9 +10,10 @@
 //!
 //! So a program rlxd starts is started holding [`alone`]: the brain (`crate::brain`),
 //! Claude Code's probes (`crate::claude`), and the runner's runs (`crate::runner::process`,
-//! its guard on POSIX and the run itself on Windows). Only the start itself is held, never
-//! the wait for the program's end. The PTY host's start (`crate::pty`, `spawn_command`)
-//! does not take it yet.
+//! its guard on POSIX and the run itself on Windows), and the PTY host's (`crate::pty`:
+//! the pseudo-terminal made, `spawn_command`, and the master's copies taken), so a
+//! `connectors.login` too. Only the start itself is held, never the wait for the
+//! program's end.
 
 use std::sync::{Mutex, MutexGuard, PoisonError};
 

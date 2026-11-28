@@ -1,7 +1,7 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "title": "RunStartParams",
-  "description": "`run.start`'s params (7.5). It returns `{run_id}` (`run-ref.json`).\n\n```json\n{\"run_id\": \"0f8e2d6c-3b1a-4c5d-9e7f-1a2b3c4d5e6f\", \"kind\": \"task\", \"prompt\": \"…\",\n \"mount\": {\"kind\": \"no_tools\"}, \"persist_session\": true, \"space\": \"default\",\n \"partial\": true, \"timeout_s\": 900, \"deadline_ms\": 120000}\n```\n\nrlxd refuses, by error code:\n- `run_exists`: a `run_id` it already knows;\n- `kind_mount_mismatch`: a `check`, `parse_instruction` or `widget_author` run whose\n  mount is not `no_tools`;\n- `pinned_call_required`: a `send_executor` or `watch` run without `pinned_call`;\n- `not_implemented`: a non-empty `needs_connectors`, until the connector gate (5.5);\n- `invalid_params`: anything else these rules or the schema refuse.",
+  "description": "`run.start`'s params (7.5). It returns `{run_id}` (`run-ref.json`).\n\n```json\n{\"run_id\": \"0f8e2d6c-3b1a-4c5d-9e7f-1a2b3c4d5e6f\", \"kind\": \"task\", \"prompt\": \"…\",\n \"mount\": {\"kind\": \"no_tools\"}, \"persist_session\": true, \"space\": \"default\",\n \"partial\": true, \"timeout_s\": 900, \"deadline_ms\": 120000}\n```\n\nrlxd refuses, by error code:\n- `run_exists`: a `run_id` it already knows;\n- `kind_mount_mismatch`: a `check`, `parse_instruction` or `widget_author` run whose\n  mount is not `no_tools`;\n- `pinned_call_required`: a `send_executor` or `watch` run without `pinned_call`;\n- `invalid_params`: anything else these rules or the schema refuse.",
   "type": "object",
   "properties": {
     "append_system_prompt": {
@@ -25,11 +25,13 @@
       "$ref": "#/$defs/Mount"
     },
     "needs_connectors": {
-      "description": "The connectors that must be `connected` before the first turn (5.5). Not yet\nserved: a non-empty list is refused with `not_implemented`.",
+      "description": "The connectors that must be `connected` before the first turn (5.5): rlxd makes\nup to 3 tries, and ends the run `run.failed {reason: \"connectors\"}` when they run\nout, or at once when one is `needs-auth` or `failed`. Each is a connector's id, as\n`connectors.list` gives it. A `no_tools` run loads none, so it names none.",
       "type": "array",
       "default": [],
       "items": {
-        "type": "string"
+        "type": "string",
+        "maxLength": 256,
+        "minLength": 1
       }
     },
     "needs_you_when": {

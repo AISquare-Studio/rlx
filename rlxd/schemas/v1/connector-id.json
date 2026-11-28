@@ -1,0 +1,16 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "ConnectorId",
+  "description": "`connector.added` and `connector.removed`: `{id}`.",
+  "type": "object",
+  "properties": {
+    "id": {
+      "description": "The connector.",
+      "type": "string",
+      "minLength": 1
+    }
+  },
+  "required": [
+    "id"
+  ]
+}

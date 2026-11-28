@@ -40,13 +40,14 @@ use std::time::{Duration, Instant};
 
 use rlxd_client::Home;
 use rlxd_proto::{
-    Claude, Clients, Data, EnvRefusal, EnvValues, Envelope, ErrorBody, Event, HelloData,
-    HelloParams, JobListParams, JobPutParams, JobRef, PROTOCOL_VERSION, PROTOCOL_VERSIONS, Params,
-    Paths, PtyKillParams, PtyResizeParams, PtyScreenParams, PtySpawnParams, PtySubscribeParams,
-    PtyWriteParams, Request, RequestId, Role, RunDecideParams, RunEventsParams, RunListParams,
-    RunRef, RunResumeParams, RunStartParams, SettingsDeleteParams, SettingsGetParams,
-    SettingsListParams, SettingsSetParams, SpaceEnsureData, SpaceParams, StatusData,
-    SubscribeParams, VERSION, codes, event_types, methods, setting_keys, topics,
+    Claude, Clients, ConnectorsListParams, ConnectorsLoginParams, Data, EnvRefusal, EnvValues,
+    Envelope, ErrorBody, Event, HelloData, HelloParams, JobListParams, JobPutParams, JobRef,
+    PROTOCOL_VERSION, PROTOCOL_VERSIONS, Params, Paths, PtyKillParams, PtyResizeParams,
+    PtyScreenParams, PtySpawnParams, PtySubscribeParams, PtyWriteParams, Request, RequestId, Role,
+    RunDecideParams, RunEventsParams, RunListParams, RunRef, RunResumeParams, RunStartParams,
+    SettingsDeleteParams, SettingsGetParams, SettingsListParams, SettingsSetParams,
+    SpaceEnsureData, SpaceParams, StatusData, SubscribeParams, VERSION, codes, event_types,
+    methods, setting_keys, topics,
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -55,6 +56,7 @@ use tokio::sync::watch;
 
 use crate::brain::Brain;
 use crate::bus::{self, Bus, Cursor, Line, Topics};
+use crate::connectors::Connectors;
 use crate::env::Env;
 use crate::gate::{self, AnswerError, Gate, Hold, Refused, Route, UnpairError};
 use crate::listener::Hangup;
@@ -89,8 +91,8 @@ const LINGER: Duration = Duration::from_secs(1);
 /// start Claude Code several times a second.
 const CLAUDE_FRESH: Duration = Duration::from_secs(5);
 
-/// What this rlxd can do, by name, for `hello`'s reply and `status`. The later items add
-/// theirs.
+/// What this rlxd can do, by name, for `hello`'s reply and `status`, beside what its
+/// connectors add ([`Connectors::capabilities`]). The later items add theirs.
 const CAPABILITIES: &[&str] = &[];
 
 /// One running rlxd: what every connection shares.
@@ -103,12 +105,13 @@ pub struct Daemon {
     claude: tokio::sync::Mutex<Option<(Instant, Claude)>>,
     bus: Arc<Bus>,
     runner: Arc<Runner>,
+    connectors: Arc<Connectors>,
     /// The scheduler, or why it couldn't start (its database couldn't be made).
     scheduler: Result<Arc<Scheduler>, String>,
     settings: Settings,
     /// The app's environment for Claude Code (4.3), and the `claude` it resolves to.
     env: Arc<Env>,
-    ptys: Host,
+    ptys: Arc<Host>,
     stopping: AtomicBool,
     stop: watch::Sender<bool>,
     gate: Arc<Gate>,
@@ -217,7 +220,13 @@ impl Daemon {
         brain: Arc<Brain>,
     ) -> Arc<Self> {
         let bus = Arc::new(bus);
-        let runner = Runner::new(home.clone(), Arc::clone(&bus), Arc::clone(&env));
+        let connectors = Connectors::new(home.clone(), Arc::clone(&bus), Arc::clone(&env));
+        let runner = Runner::new(
+            home.clone(),
+            Arc::clone(&bus),
+            Arc::clone(&env),
+            Arc::clone(&connectors),
+        );
         let gate = Arc::new(gate);
         runner.follow_apps(gate.apps());
         let scheduler = Scheduler::new(&home, Arc::clone(&bus), Arc::clone(&runner), gate.apps());
@@ -234,9 +243,10 @@ impl Daemon {
             pipe_acl,
             clients: Mutex::new(Clients::default()),
             claude: tokio::sync::Mutex::new(None),
-            ptys: Host::new(Arc::clone(&bus)),
+            ptys: Arc::new(Host::new(Arc::clone(&bus))),
             bus,
             runner,
+            connectors,
             scheduler,
             settings,
             env,
@@ -435,7 +445,7 @@ impl Daemon {
                 .map(|hold| format!(", device {:?}", hold.device()))
                 .unwrap_or_default()
         );
-        let reply = HelloData::new(PROTOCOL_VERSION, VERSION, capabilities())
+        let reply = HelloData::new(PROTOCOL_VERSION, VERSION, self.capabilities())
             .map(|data| Envelope::ok(object(&data)).with_id(request.id))
             .map_err(|e| reply_err(id, codes::INTERNAL, e.to_string()))?;
         let session = Session {
@@ -600,6 +610,8 @@ impl Daemon {
             methods::GATE_PAIR_REQUESTS => self.gate_pair_requests(session),
             methods::GATE_PAIR_ANSWER => self.gate_pair_answer(session, &request.params),
             methods::GATE_DEVICES => Ok(object(&json!({"devices": self.gate.devices()}))),
+            methods::CONNECTORS_LIST => self.connectors_list(session, request.params).await,
+            methods::CONNECTORS_LOGIN => self.connectors_login(session, request.params),
             methods::GATE_UNPAIR => self.gate_unpair(session, &request.params),
             methods::HELLO => Err(error(
                 codes::INVALID_REQUEST,
@@ -883,7 +895,7 @@ impl Daemon {
         let mut status = StatusData::new(VERSION, self.pid, std::env::consts::OS, paths)
             .map_err(|e| error(codes::INTERNAL, &e.to_string()))?;
         status.protocol_version = session.protocol_version;
-        status.capabilities = capabilities();
+        status.capabilities = self.capabilities();
         status.seq = self.bus.head();
         status.clients = *self.clients();
         status.clients.app = self.gate.app_connections();
@@ -2141,8 +2153,64 @@ fn request_id(frame: &Value) -> Option<RequestId> {
         .and_then(|id| RequestId::deserialize(id).ok())
 }
 
-fn capabilities() -> Vec<String> {
-    CAPABILITIES.iter().map(|&c| c.to_owned()).collect()
+impl Daemon {
+    /// What this rlxd can do, by name.
+    fn capabilities(&self) -> Vec<String> {
+        CAPABILITIES
+            .iter()
+            .copied()
+            .chain(self.connectors.capabilities())
+            .map(str::to_owned)
+            .collect()
+    }
+
+    /// `connectors.list {refresh?, allow_turn?}`: the latest `system/init`'s connectors.
+    /// A refresh needs a route with no turn, which there is not yet: `no_route`, unless
+    /// `allow_turn` lets rlxd run its one-turn probe (5.3).
+    async fn connectors_list(&self, session: &Session, params: Params) -> Result<Data, ErrorBody> {
+        let method = methods::CONNECTORS_LIST;
+        let params = params_of::<ConnectorsListParams>(method, params)?;
+        if !params.refresh() {
+            // The cache's lock is held while its file is written.
+            return printed(&off_worker(|| self.connectors.list(0)));
+        }
+        if !params.allow_turn() {
+            return Err(error(
+                codes::NO_ROUTE,
+                "rlxd has no route to the connectors that makes no model turn yet \
+                 (capability connectors.no_turn)",
+            )
+            .with_hint(
+                "List without refresh for the latest run's connectors, or pass allow_turn: \
+                 true to let rlxd run a one-turn probe.",
+            ));
+        }
+        // A model turn is the user's to spend: not remote's.
+        if !matches!(session.role, Role::App | Role::Cli | Role::Tui) {
+            return Err(role_refused(
+                session.role,
+                method,
+                "app, cli and tui may let rlxd make a model turn (allow_turn); remote may list \
+                 without refresh.",
+            ));
+        }
+        self.runner.probe_connectors().await?;
+        printed(&off_worker(|| self.connectors.list(1)))
+    }
+
+    /// `connectors.login {id}`: for `app`, `cli` and `tui`; `remote` is refused.
+    fn connectors_login(&self, session: &Session, params: Params) -> Result<Data, ErrorBody> {
+        let method = methods::CONNECTORS_LOGIN;
+        if !matches!(session.role, Role::App | Role::Cli | Role::Tui) {
+            return Err(role_refused(
+                session.role,
+                method,
+                "app, cli and tui may sign a connector in; remote may not.",
+            ));
+        }
+        let params = params_of::<ConnectorsLoginParams>(method, params)?;
+        printed(&self.connectors.login(&self.ptys, &params.id))
+    }
 }
 
 /// Runs `work`, which may block on a lock or on the disk, as blocking work: the runtime
@@ -2242,6 +2310,16 @@ fn pty_allowed(role: Role, method: &str) -> bool {
 }
 
 fn role_not_allowed(role: Role, method: &str) -> ErrorBody {
+    role_refused(
+        role,
+        method,
+        "cli and tui may use every pty method; remote may list, read, subscribe read-only \
+         and write; app may list, read and subscribe read-only.",
+    )
+}
+
+/// `role_not_allowed` for `method`, with `hint` saying who may call it.
+fn role_refused(role: Role, method: &str, hint: &str) -> ErrorBody {
     let name = role_name(role);
     let mut detail = Data::new();
     detail.insert("role".to_owned(), Value::from(name.clone()));
@@ -2250,10 +2328,7 @@ fn role_not_allowed(role: Role, method: &str) -> ErrorBody {
         codes::ROLE_NOT_ALLOWED,
         &format!("a {name} connection may not call {method}"),
     )
-    .with_hint(
-        "cli and tui may use every pty method; remote may list, read, subscribe read-only \
-         and write; app may list, read and subscribe read-only.",
-    )
+    .with_hint(hint)
     .with_detail(detail)
     .expect("role_not_allowed's detail is an object")
 }
@@ -2263,10 +2338,10 @@ fn pty_refused(refused: pty::Refused) -> ErrorBody {
     match refused {
         pty::Refused::TooMany => {
             let mut detail = Data::new();
-            detail.insert("max".to_owned(), Value::from(pty::MAX_PTYS));
+            detail.insert("max".to_owned(), Value::from(pty::max_ptys()));
             error(
                 codes::TOO_MANY_PTYS,
-                &format!("the home holds {} ptys, the most it may", pty::MAX_PTYS),
+                &format!("the home holds {} ptys, the most it may", pty::max_ptys()),
             )
             .with_hint("pty.kill one first: an exited pty counts until it is killed.")
             .with_detail(detail)
@@ -2383,6 +2458,8 @@ fn served() -> Vec<&'static str> {
         methods::RUN_DECIDE,
         methods::SPACE_ENSURE,
         methods::SPACE_ERASE,
+        methods::CONNECTORS_LIST,
+        methods::CONNECTORS_LOGIN,
         methods::JOB_PUT,
         methods::JOB_LIST,
         methods::JOB_DELETE,

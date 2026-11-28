@@ -1,0 +1,138 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "ConnectorsList",
+  "description": "`connectors.list`'s reply (`connectors.json`).\n\n```json\n{\"connectors\": [{\"id\": \"claude.ai Slack\", \"source\": \"claude.ai\", \"status\": \"connected\",\n  \"tools\": [{\"name\": \"mcp__claude_ai_Slack__slack_search_public\", \"read_only_hint\": true}]}],\n \"as_of\": \"2026-11-27T09:00:00.000Z\", \"from\": \"init\", \"model_turns\": 0}\n```",
+  "type": "object",
+  "properties": {
+    "as_of": {
+      "description": "When the list's `system/init` came, or `null` before any did.",
+      "type": [
+        "string",
+        "null"
+      ],
+      "format": "date-time"
+    },
+    "connectors": {
+      "description": "The connectors, by `id`. Empty until a run or a refresh has shown any.",
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/Connector"
+      }
+    },
+    "from": {
+      "description": "Where the list came from.",
+      "$ref": "#/$defs/ListedFrom"
+    },
+    "model_turns": {
+      "description": "The model turns this call made: 0 for a plain list, 1 for a one-turn refresh.",
+      "type": "integer",
+      "format": "uint32",
+      "maximum": 1,
+      "minimum": 0
+    }
+  },
+  "required": [
+    "as_of",
+    "connectors",
+    "from",
+    "model_turns"
+  ],
+  "$defs": {
+    "Connector": {
+      "description": "One connector in `connectors.list`.",
+      "type": "object",
+      "properties": {
+        "id": {
+          "description": "Its name, as runs name it in `needs_connectors` and mounts: `claude.ai Slack`.",
+          "type": "string",
+          "maxLength": 256,
+          "minLength": 1
+        },
+        "source": {
+          "description": "Where it comes from: `claude.ai` for a claude.ai connector, else `mcp`.",
+          "type": "string",
+          "minLength": 1
+        },
+        "status": {
+          "description": "Its status.",
+          "$ref": "#/$defs/ConnectorState"
+        },
+        "tools": {
+          "description": "Its tools, as the `system/init` mounted them.",
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/ConnectorTool"
+          }
+        }
+      },
+      "required": [
+        "id",
+        "source",
+        "status",
+        "tools"
+      ]
+    },
+    "ConnectorState": {
+      "description": "A connector's status, as Claude Code's `system/init` reports it.",
+      "oneOf": [
+        {
+          "description": "Connected: its tools are mounted.",
+          "type": "string",
+          "const": "connected"
+        },
+        {
+          "description": "Its sign-in has lapsed: `connectors.login` signs in again.",
+          "type": "string",
+          "const": "needs-auth"
+        },
+        {
+          "description": "Still connecting.",
+          "type": "string",
+          "const": "pending"
+        },
+        {
+          "description": "It could not connect.",
+          "type": "string",
+          "const": "failed"
+        }
+      ]
+    },
+    "ConnectorTool": {
+      "description": "One of a connector's tools.",
+      "type": "object",
+      "properties": {
+        "name": {
+          "description": "Its name, as a run's tool calls name it, such as\n`mcp__claude_ai_Slack__slack_search_public`.",
+          "type": "string",
+          "minLength": 1
+        },
+        "read_only_hint": {
+          "description": "The tool's MCP `readOnlyHint`: `true`, `false`, or `null` when Claude Code doesn't\nsay. Always present.",
+          "type": [
+            "boolean",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "name",
+        "read_only_hint"
+      ]
+    },
+    "ListedFrom": {
+      "description": "Where a list came from.",
+      "oneOf": [
+        {
+          "description": "A `system/init`: a run's, or a one-turn refresh's.",
+          "type": "string",
+          "const": "init"
+        },
+        {
+          "description": "A listing with no model turn (capability `connectors.no_turn`).",
+          "type": "string",
+          "const": "listing"
+        }
+      ]
+    }
+  }
+}
