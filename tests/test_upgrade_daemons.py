@@ -1193,6 +1193,8 @@ class _ClaimWatch:
         self.most = 0
         self._stop = threading.Event()
         self._thread = threading.Thread(target=self._watch, daemon=True)
+        self._passes = 0
+        self._passed = threading.Condition()
 
     def __enter__(self) -> _ClaimWatch:
         self._thread.start()
@@ -1217,7 +1219,19 @@ class _ClaimWatch:
                     continue
                 if upgrade_daemons._claim_helper_pid(claim) is None and claim.exists():
                     self.half_written.append(text)
+            with self._passed:
+                self._passes += 1
+                self._passed.notify_all()
             time.sleep(0.005)
+
+    def settle(self) -> None:
+        """Waits for a whole pass that began after this call: what is on disk now, the watch
+        has seen. Stopped sooner, a loaded runner may not have scheduled it since a claim was
+        made (ci.yml run 46157412521: ``most`` 0)."""
+        with self._passed:
+            since = self._passes
+            done = self._passed.wait_for(lambda: self._passes >= since + 2, timeout=30)
+        assert done, "the watch never finished a pass"
 
 
 def test_a_reader_never_sees_a_claim_without_its_helper_pid(
@@ -1267,6 +1281,14 @@ def test_two_helpers_racing_for_one_daemon_give_exactly_one_claim(
         while refused not in (log.read_text(encoding="utf-8") if log.exists() else ""):
             assert time.monotonic() < deadline, log.read_text(encoding="utf-8")
             time.sleep(0.1)
+        # The loser refuses on the lock alone, and restart_when_gone gives up on the claim
+        # after CLAIM_WAIT_SECONDS: the winner's claim may come later still, so it is waited
+        # for whole, and seen by the watch, before the watch stops.
+        claim = upgrade_daemons.restarts_dir() / f"{old.id}.json"
+        while upgrade_daemons._claim_helper_pid(claim) is None:
+            assert time.monotonic() < deadline, "the winner's claim was never written whole"
+            time.sleep(0.05)
+        watch.settle()
         pending = upgrade_daemons.pending_restarts()
     assert watch.half_written == [], watch.half_written
     assert watch.most == 1, watch.most
