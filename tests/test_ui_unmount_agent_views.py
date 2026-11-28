@@ -7,9 +7,9 @@ paused) or left its project's list, and the view is off screen; opening the agen
 builds it anew. The one shown stays whatever its agent does, and goes once it is left.
 
 Kept as well: a view of a project the frame did not answer for, a view a worker still runs
-on (or whose worker's answer it has not handled yet), and a view holding the keyboard under
-a dialog. The keyboard never stays on a removed widget: it goes where showing the side
-shown puts it.
+on, and a view holding the keyboard under a dialog. A worker that has just finished keeps
+nothing: its answer, queued on the view, is handled before the view closes (round 3). The
+keyboard never stays on a removed widget: it goes where showing the side shown puts it.
 
 Driven through the whole app, the fleet's rows scripted (``tests/test_ui_shell``), each
 frame read as the two-second tick reads it.
@@ -42,6 +42,7 @@ from aisquare.cli.ui.views.agent import (
     pane_words,
     shown_pane,
     start_pause,
+    start_restart,
 )
 from aisquare.cli.ui.views.project import ProjectView
 from aisquare.core.store import store_session
@@ -640,6 +641,60 @@ def test_a_workers_answer_queued_on_a_view_as_it_goes_is_still_handled(
     once, after, left = drive(go)
     assert once == 1, "the premise: the pause said so once"
     assert after == 2, "the answer queued as the view went was still handled"
+    assert left == []
+
+
+def test_a_restarts_answer_queued_on_a_view_as_it_goes_still_reaches_the_shell(
+    tmp_path: Path, script: Script, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Reviewer #3797's minor: what the docstring of ``FleetApp._views_left`` claims for a
+    Restart. Its answer queued on the view as the view goes is handled before the close the
+    removal's ``Prune`` queues, and the ``AgentRestarted`` the view posts to itself as it
+    handles it is handled before that close too, and bubbles to the shell, which says the
+    restart. (A CHILD's bubble in its own last drain is dropped instead: the docstring says
+    why that loses nothing.)
+
+    The view's row stays alive throughout, so no frame takes the view of its own accord:
+    the removal is the test's, at once."""
+    live, after = coder(0), coder(1)
+    two_projects(tmp_path, script, live, after)
+
+    def restart(
+        project: ProjectInfo, label: str, *, size: tuple[int, int] | None = None, **_: object
+    ) -> fleet_service.RestartReceipt:
+        return fleet_service.RestartReceipt(
+            replaced=live.agent,
+            started=after.agent,
+            resumed=True,
+            was_running=True,
+            tmux_session="asq-alpha",
+        )
+
+    monkeypatch.setattr(fleet_service, "restart", restart)
+
+    def restarted(told: list[str]) -> int:
+        return sum(1 for said in told if said.startswith("✓ restarted"))
+
+    async def go(pilot: Pilot[None]) -> tuple[int, int, list[str]]:
+        app = fleet_app(pilot)
+        told = toast_log.record(app)
+        view = await open_agent(app, live)
+        worker = start_restart(view, live.agent)
+        await worker.wait()
+        await settle(app)
+        once = restarted(told)
+        await leave_for(app, "prj_b")
+        # Its answer again, queued on the view, and the view removed at once, its Prune
+        # posted behind the answer: the view's AgentRestarted is posted behind the Prune.
+        view.post_message(Worker.StateChanged(worker, WorkerState.SUCCESS))
+        await app._remove_views([view])
+        del view
+        await settle(app)
+        return once, restarted(told), [v for v in mounted(app) if v == view_of(live)]
+
+    once, twice, left = drive(go)
+    assert once == 1, "the premise: the shell said the restart once"
+    assert twice == 2, "the AgentRestarted posted as the view went still reached the shell"
     assert left == []
 
 

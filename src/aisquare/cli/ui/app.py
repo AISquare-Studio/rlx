@@ -2603,13 +2603,19 @@ class FleetApp(SelectionHost, inherit_bindings=False):
           as it closes. With no dialog up, the keyboard leaves it first
           (:meth:`_keyboard_from`).
 
-        A worker that has just finished keeps nothing: its answer is already queued on its
-        widget, and Textual handles every message a widget has queued before the ``Prune``
-        its removal posts behind them, and goes on until the close that ``Prune`` queues in
-        turn. So a pause's toast is said, and a Restart's or a Move's ``AgentRestarted``,
-        which the view posts as it handles the answer, still bubbles to the shell. Waiting
-        for a quiet queue instead kept a view for frame after frame of its widgets' own
-        layout traffic (#644, round 3: CI 46097779329).
+        A worker that has just finished keeps nothing. Its state setter queues its answer on
+        its widget at once, so the ``Prune`` a removal posts lands behind it (Textual 8.2.8),
+        and the view handles its whole queue before the close that ``Prune`` queues in turn.
+        A pause's toast is said (``notify`` goes to the app directly), and a Restart's or a
+        Move's ``AgentRestarted``, which the view posts to itself as it handles the answer,
+        is handled before that close and bubbles to the shell: the view's own parent is
+        still active. Each child of the view drains its own queue too, after the view's, but
+        a message a child BUBBLES then is dropped, its parent the view being closed by then
+        (``is_parent_active``). That loses nothing today: the only child message the shell
+        handles is the pane's ``EscapeToSidebar``, a keystroke, and a view that goes holds
+        no keyboard (:meth:`_keyboard_from`). Waiting for a quiet queue instead kept a view
+        for frame after frame of its widgets' own layout traffic (#644, round 3: CI
+        46097779329; reviewer #3797 for the child's bubble).
         """
         content = self.content
         under_a_dialog = content.screen.focused if self.screen is not content.screen else None
