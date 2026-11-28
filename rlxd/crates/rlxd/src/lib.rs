@@ -59,6 +59,7 @@ mod gate;
 mod here;
 mod hooks;
 mod host;
+mod identity;
 mod listener;
 mod lock;
 mod log;

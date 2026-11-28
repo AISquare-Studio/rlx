@@ -1097,7 +1097,7 @@ fn start_params(
 }
 
 /// A fresh run id: a random (version 4) UUID, lower case.
-fn fresh_run_id() -> RunId {
+pub(crate) fn fresh_run_id() -> RunId {
     let mut bytes = [0_u8; 16];
     if getrandom::fill(&mut bytes).is_err() {
         // No randomness: the time stands in, unique enough for one rlxd.

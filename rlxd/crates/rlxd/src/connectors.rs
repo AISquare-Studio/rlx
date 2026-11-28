@@ -32,11 +32,11 @@ use std::time::{Duration, Instant};
 
 use rlxd_client::Home;
 use rlxd_proto::{
-    AccountConnectors, Connector, ConnectorChanged, ConnectorId, ConnectorLoginDone,
-    ConnectorLoginError, ConnectorLoginOpenUrl, ConnectorLoginWaiting, ConnectorState,
-    ConnectorTool, ConnectorsList, ConnectorsLoginData, DEFAULT_ACCOUNT, ErrorBody, ListedFrom,
-    LoginErrorCode, McpServer, PtyKillParams, PtyScreenParams, PtySpawnParams, capabilities, codes,
-    connector_types, topics,
+    AccountConnectors, Connector, ConnectorChanged, ConnectorId, ConnectorIdentity,
+    ConnectorLoginDone, ConnectorLoginError, ConnectorLoginOpenUrl, ConnectorLoginWaiting,
+    ConnectorState, ConnectorTool, ConnectorsList, ConnectorsLoginData, DEFAULT_ACCOUNT, ErrorBody,
+    ListedFrom, LoginErrorCode, McpServer, PtyKillParams, PtyScreenParams, PtySpawnParams,
+    capabilities, codes, connector_types, topics,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -80,6 +80,17 @@ impl Default for GateTimes {
             settle: Duration::from_secs(5),
         }
     }
+}
+
+/// What a login or call ran on, to file what it found under (4.3).
+#[derive(Clone, Copy, Debug)]
+pub enum RanOn<'a> {
+    /// The `CLAUDE_CONFIG_DIR` its own snapshot of the app's values gave (`None`: rlxd's
+    /// own): the account a run's init on that home is filed under
+    /// ([`Connectors::slot_of_home`]).
+    Home(Option<&'a str>),
+    /// An account's own read (an identity read): that account, when rlx knows it.
+    Account(u32),
 }
 
 /// Told an account's slot and every connector it holds `connected`, after a change left
@@ -381,10 +392,21 @@ impl Saved {
 impl Entry {
     /// Keeps `account`'s label, homes and mark, as rlx gave them, with what was read.
     fn keep(&mut self, account: &Account) {
+        if account.signed_in_again(self) {
+            self.forget_identities();
+        }
         self.label.clone_from(&account.label);
         self.config_dir.clone_from(&account.config_dir);
         self.tmp_dir.clone_from(&account.tmp_dir);
         self.login.clone_from(&account.login);
+    }
+
+    /// Forgets who the account was on each connector: another sign-in may be another
+    /// workspace's.
+    fn forget_identities(&mut self) {
+        for connector in &mut self.connectors {
+            connector.identity = None;
+        }
     }
 }
 
@@ -402,7 +424,8 @@ pub struct Connectors {
     home: Home,
     bus: Arc<Bus>,
     cache: Mutex<Saved>,
-    /// The accounts rlx knows, by slot: the default one at least.
+    /// The accounts rlx knows, by slot: the default one at least. Lock order: the
+    /// cache's, then this; never this, then the cache's.
     accounts: Mutex<BTreeMap<u32, Account>>,
     /// rlxd's own `CLAUDE_CONFIG_DIR`, resolved once, when its environment names one.
     rlxd_dir: Option<PathBuf>,
@@ -538,6 +561,15 @@ impl Connectors {
     /// the rules a run's init is filed by ([`Connectors::observe`]): `None` while rlx has
     /// yet to say which accounts there are, and when that home is none of theirs. What it
     /// found is filed there, or nowhere. Takes no lock of the runs'.
+    /// The account `on` names: [`Connectors::slot_of_home`] for a start's home, or an
+    /// account's own read's, when rlx knows it. `None`: what it found is filed nowhere.
+    pub fn slot_of(&self, on: RanOn<'_>) -> Option<u32> {
+        match on {
+            RanOn::Home(home) => self.slot_of_home(home),
+            RanOn::Account(slot) => self.known().contains_key(&slot).then_some(slot),
+        }
+    }
+
     pub fn slot_of_home(&self, home: Option<&str>) -> Option<u32> {
         let home = runs_home(home, self.rlxd_dir.as_deref());
         let known = self.known().clone();
@@ -574,17 +606,16 @@ impl Connectors {
         self.no_turn
     }
 
-    /// What the cache of the account a call runs on says of `connector`'s `tool`: its
-    /// `read_only_hint`, or `None` when it doesn't list that tool of that connector, or
-    /// that account is not known ([`Connectors::slot_of_home`]). `home` is the
-    /// `CLAUDE_CONFIG_DIR` the call's own snapshot of the app's values gave.
+    /// What the cache of the account a call runs on (`on`) says of `connector`'s `tool`:
+    /// its `read_only_hint`, or `None` when it doesn't list that tool of that connector, or
+    /// that account is not known ([`Connectors::slot_of`]).
     pub fn read_only_hint(
         &self,
         connector: &str,
         tool: &str,
-        home: Option<&str>,
+        on: RanOn<'_>,
     ) -> Option<Option<bool>> {
-        let slot = self.slot_of_home(home)?;
+        let slot = self.slot_of(on)?;
         let cache = self.cache();
         cache
             .accounts
@@ -761,6 +792,11 @@ impl Connectors {
                 None => to_read.push(account.clone()),
                 Some(entry) => {
                     if account.signed_in_again(entry) {
+                        // Signed in as someone else: who it was is forgotten at once.
+                        if entry.connectors.iter().any(|c| c.identity.is_some()) {
+                            entry.forget_identities();
+                            changed = true;
+                        }
                         to_read.push(account.clone());
                     }
                     if entry.label != account.label {
@@ -776,8 +812,10 @@ impl Connectors {
         for gone in removed {
             self.publish(connector_types::REMOVED, json_of(&gone));
         }
-        drop(cache);
+        // The accounts rlx knows change under the cache's lock, as its forgets do: a
+        // set_identity, which reads them under that lock too, sees both or neither.
         *self.known() = now;
+        drop(cache);
         self.settle_runs(runs);
         to_read
     }
@@ -941,6 +979,17 @@ impl Connectors {
             connector.status == ConnectorState::Connected
                 && before.get(id.as_str()) != Some(&ConnectorState::Connected)
         });
+        // Who the account is on each connector stays as last read, until it is signed in
+        // as someone else.
+        if !account.signed_in_again(entry) {
+            for connector in now.values_mut() {
+                connector.identity = entry
+                    .connectors
+                    .iter()
+                    .find(|c| c.id == connector.id)
+                    .and_then(|c| c.identity.clone());
+            }
+        }
         entry.connectors = now.into_values().collect();
         entry.error = None;
         entry.tried_at = Some(at.clone());
@@ -964,6 +1013,61 @@ impl Connectors {
         }
     }
 
+    /// The connectors whose identity a call may read for `slot` now: each `connected` one
+    /// the identity table has an entry for, whose tool that account's own listing holds
+    /// with `read_only_hint: true`.
+    pub fn identity_sources(&self, slot: u32) -> Vec<crate::identity::Source> {
+        let cache = self.cache();
+        let Some(entry) = cache.accounts.get(&slot) else {
+            return Vec::new();
+        };
+        entry
+            .connectors
+            .iter()
+            .filter(|c| c.status == ConnectorState::Connected)
+            .filter_map(|c| {
+                let source = crate::identity::source_of(&c.id)?;
+                c.tools
+                    .iter()
+                    .any(|tool| tool.name == source.tool && tool.read_only_hint == Some(true))
+                    .then_some(source)
+            })
+            .collect()
+    }
+
+    /// Takes `identity`, read under the sign-in `login`, as who `slot`'s account is on
+    /// `id`: only while both rlx's account of that slot and its entry are still that
+    /// sign-in, and the entry still lists `id`. A call that came back after the account
+    /// was signed in as someone else is dropped, so its answer is never the new sign-in's.
+    /// Whether it was stored.
+    pub fn set_identity(
+        &self,
+        slot: u32,
+        login: Option<&str>,
+        id: &str,
+        identity: ConnectorIdentity,
+    ) -> bool {
+        // rlx's account read under the cache's lock, as set_accounts changes it: so no
+        // forget of a new sign-in can come between this check and the store.
+        let mut cache = self.cache();
+        let known = self
+            .known()
+            .get(&slot)
+            .is_some_and(|account| account.login.as_deref() == login);
+        let Some(entry) = cache.accounts.get_mut(&slot) else {
+            return false;
+        };
+        if !known || entry.login.as_deref() != login {
+            return false;
+        }
+        let Some(connector) = entry.connectors.iter_mut().find(|c| c.id == id) else {
+            return false;
+        };
+        connector.identity = Some(identity);
+        self.save(&cache);
+        true
+    }
+
     /// Notes that a refresh of `account` failed with `error`: its connectors stay as they
     /// were read before.
     pub fn refresh_failed(&self, account: &Account, error: ErrorBody) {
@@ -975,14 +1079,14 @@ impl Connectors {
         self.save(&cache);
     }
 
-    /// Sets `id`'s status in the account a login or call ran on, when it has it: a
-    /// login's end, or a call's `mcp_status` that found it `needs-auth` or `failed`.
-    /// `home` is the `CLAUDE_CONFIG_DIR` that login's or call's own snapshot of the app's
-    /// values gave (4.3): the account is the one a run's init on that home is filed under
-    /// ([`Connectors::slot_of_home`]), and none when that is not known. Never the runs'
-    /// account now, which an `env.set` may have changed since it started.
-    pub fn set_status(&self, id: &str, status: ConnectorState, home: Option<&str>) {
-        let Some(slot) = self.slot_of_home(home) else {
+    /// Sets `id`'s status in the account a login or call ran on (`on`), when it has it: a
+    /// login's end, or a call's `mcp_status` that found it `needs-auth` or `failed`. For a
+    /// start on the app's values, the account a run's init on its own snapshot's home is
+    /// filed under; for an identity read, its account ([`Connectors::slot_of`]); none
+    /// when that is not known. Never the runs' account now, which an `env.set` may have
+    /// changed since it started.
+    pub fn set_status(&self, id: &str, status: ConnectorState, on: RanOn<'_>) {
+        let Some(slot) = self.slot_of(on) else {
             info!(
                 "connectors: {id}'s status is filed under no account: its home is none rlx knows"
             );
@@ -1162,7 +1266,7 @@ impl Connectors {
                 json_of(&ConnectorLoginDone::new(login_id, id, status)),
             );
             // On the account this login ran on: its own snapshot's home.
-            self.set_status(id, status, values.claude_config_dir.as_deref());
+            self.set_status(id, status, RanOn::Home(values.claude_config_dir.as_deref()));
         }
     }
 
@@ -1544,8 +1648,16 @@ mod tests {
             *told.lock().unwrap(),
             [vec!["local".to_owned()], both.clone()]
         );
-        connectors.set_status("claude.ai Slack", ConnectorState::NeedsAuth, None);
-        connectors.set_status("claude.ai Slack", ConnectorState::Connected, None);
+        connectors.set_status(
+            "claude.ai Slack",
+            ConnectorState::NeedsAuth,
+            RanOn::Home(None),
+        );
+        connectors.set_status(
+            "claude.ai Slack",
+            ConnectorState::Connected,
+            RanOn::Home(None),
+        );
         assert_eq!(told.lock().unwrap().len(), 3);
         assert_eq!(told.lock().unwrap()[2], both);
     }
@@ -1649,7 +1761,7 @@ mod tests {
             "the top level is the plain account's"
         );
         assert_eq!(
-            connectors.read_only_hint("claude.ai Slack", "x", None),
+            connectors.read_only_hint("claude.ai Slack", "x", RanOn::Home(None)),
             None
         );
     }
@@ -1660,6 +1772,81 @@ mod tests {
             .find(|a| a.account == slot)
             .unwrap()
             .clone()
+    }
+
+    #[test]
+    fn an_identity_is_read_only_of_a_connected_connector_with_the_tables_tool_read_only() {
+        let dir = Dir::new();
+        let connectors = dir.connectors();
+        let whoami = "mcp__claude_ai_Fixture__whoami".to_owned();
+        let read_only = HashMap::from([(whoami.clone(), true)]);
+        let sources = HashMap::new();
+        let read = |status: &str, tools: &[String], hints: &HashMap<String, bool>| {
+            let servers = [McpServer::new("claude.ai Fixture", status)];
+            connectors.observe(
+                Observed {
+                    servers: &servers,
+                    sources: &sources,
+                    tools,
+                    hints,
+                },
+                None,
+            );
+            connectors
+                .identity_sources(DEFAULT_ACCOUNT)
+                .iter()
+                .map(|source| source.tool)
+                .collect::<Vec<_>>()
+        };
+        let tools = [whoami.clone()];
+        assert_eq!(read("connected", &tools, &read_only), [whoami.as_str()]);
+        // Its tool still mounted, but signed out: no call.
+        assert!(read("needs-auth", &tools, &read_only).is_empty());
+        // Connected, its tool not read-only, or not the table's: no call.
+        assert!(read("connected", &tools, &HashMap::new()).is_empty());
+        let other = ["mcp__claude_ai_Fixture__whois".to_owned()];
+        let other_read_only = HashMap::from([(other[0].clone(), true)]);
+        assert!(read("connected", &other, &other_read_only).is_empty());
+    }
+
+    #[test]
+    fn an_identity_whose_call_spans_a_new_sign_in_is_dropped() {
+        let dir = Dir::new();
+        let connectors = dir.connectors();
+        let whoami = "mcp__claude_ai_Fixture__whoami".to_owned();
+        let hints = HashMap::from([(whoami.clone(), true)]);
+        let sources = HashMap::new();
+        let servers = [McpServer::new("claude.ai Fixture", "connected")];
+        let tools = [whoami];
+        let fixture = Observed {
+            servers: &servers,
+            sources: &sources,
+            tools: &tools,
+            hints: &hints,
+        };
+        connectors.set_accounts(vec![managed(2, "b")]);
+        connectors.observe_on(&managed(2, "b"), fixture, Read::Listing);
+        let said = |user: &str| {
+            let mut identity = ConnectorIdentity::default();
+            identity.user = Some(user.to_owned());
+            identity
+        };
+        // A call under b that lands under b: stored.
+        assert!(connectors.set_identity(2, Some("b"), "claude.ai Fixture", said("ada-b")));
+        // A call started under b (its mark taken then); rlxd hears c before it lands.
+        let asked_under = connectors.account(2).unwrap().login;
+        connectors.set_accounts(vec![managed(2, "c")]);
+        assert!(!connectors.set_identity(
+            2,
+            asked_under.as_deref(),
+            "claude.ai Fixture",
+            said("old-b")
+        ));
+        let list = connectors.list(0, Some(2));
+        assert_eq!(
+            list.accounts[0].connectors[0].identity, None,
+            "forgotten, not restored"
+        );
     }
 
     #[test]

@@ -53,8 +53,8 @@ rlxd/tests/probes/connector_map.sh
 ```
 
 It prints slots, connector names, kinds and statuses only: never an email, an account
-id, a login mark or a home's path. Its folder keeps only that (`summary.tsv` and
-`map.txt`); what it reads to get there (the brain's reply, the temp rlxd home, `claude mcp
+id, a login mark or a home's path. Its folder keeps only that (`summary.tsv`,
+`map.txt` and `identity-tools.txt`); what it reads to get there (the brain's reply, the temp rlxd home, `claude mcp
 list`'s output) is in a private temp folder it deletes when it ends. Each read starts Claude Code in an empty folder of the
 probe's rlxd home with no session (`--no-session-persistence`) and project settings only,
 on that account's home, which Claude Code may update as any start of it does. M3 runs
@@ -65,3 +65,4 @@ on that account's home, which Claude Code may update as any start of it does. M3
 | M1 | The brain's `accounts` (this checkout's), read-only: the slots, and whether each has a login mark | The accounts the map holds |
 | M2 | `connectors.list {refresh: true}` through a test build of rlxd in a temp home, with `connectors.no_turn` on: `model_turns` 0, valid against `connectors.json`, and each account's connectors (name, kind, status, tool count) | The map; a release build announces `connectors.no_turn` once this matches the brief's measured table |
 | M3 | Whether user-scope local MCP servers (kind `mcp`) show up under rlxd's `--setting-sources project`, against `claude mcp list` in each account's home | Whether the map's local servers are complete |
+| M4 | Per account, the read-only tool names of Slack, Gmail and Calendar, from M2's listing (names and `read_only_hint` only: no content, no call) | The identity table (task #14, step 2), which holds no release entry until the owner names each connector's tool and a sample of its answer |

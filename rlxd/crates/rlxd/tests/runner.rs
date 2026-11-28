@@ -2037,6 +2037,209 @@ fn a_needs_you_raised_before_a_restart_is_cleared_after_it() {
     assert_eq!(cleared[0]["data"]["id"], id);
 }
 
+/// #42: a resume's `needs_you.cleared` comes only once the run's record holds the
+/// needs-you no more, so the next rlxd after a crash between the two never finds it out
+/// again. Test builds hold the record's write in "slowdisk" 2 s: published first, the
+/// cleared would arrive while the record still said needs_you.
+#[test]
+fn a_resume_clears_its_needs_you_only_once_its_record_says_so() {
+    let home = home_with("asks", &[("RLXD_TEST_SLOW_RECORD", "slowdisk:2000")]);
+    let (r, _, events) = gated_start(&home, &asks_in_slowdisk()).wait();
+    assert_eq!(
+        of(&events, &r, None).last().unwrap()["type"],
+        "run.needs_you"
+    );
+    assert_eq!(record_now(&home, &r)["state"], "needs_you");
+
+    let capture = needs_you_until(&home, seq(&home), "needs_you.cleared");
+    thread::scope(|scope| {
+        let resume = scope.spawn(|| call(&home, "run.resume", &json!({"run_id": r})));
+        let cleared = finish(capture);
+        assert_eq!(cleared.code(), Some(0), "the capture: {cleared:?}");
+        // Read the moment the cleared is heard: within the hold, were it published first.
+        let now = record_now(&home, &r);
+        assert_ne!(
+            now["state"], "needs_you",
+            "needs_you.cleared came while the record still held it: {now:#}"
+        );
+        assert_eq!(now["attempt"], 2, "{now:#}");
+        assert_eq!(resume.join().unwrap()["attempt"], 2);
+    });
+}
+
+/// The run's record as it is on disk now.
+fn record_now(home: &TestHome, r: &str) -> Value {
+    serde_json::from_str(&std::fs::read_to_string(record_path(home, r)).unwrap()).unwrap()
+}
+
+/// The params of a task in "slowdisk" that ends needing the user ("asks").
+fn asks_in_slowdisk() -> Value {
+    let mut params = task("post the standup");
+    params["space"] = json!("slowdisk");
+    params["needs_you_when"] =
+        json!({"pointer": "/status", "equals": "needs_you", "question_pointer": "/question"});
+    params
+}
+
+/// `rlxd events --topics needs_you` from `since`, until `until`: started, not waited on.
+fn needs_you_until(home: &TestHome, since: u64, until: &str) -> Child {
+    home.spawn(&[
+        "events",
+        "--topics",
+        "needs_you",
+        "--since",
+        &since.to_string(),
+        "--follow",
+        "--until",
+        until,
+        "--timeout",
+        "60",
+    ])
+}
+
+/// #42: a cancelled needs-you run's `needs_you.cleared` comes only once its end is
+/// durable. Test builds hold its state events in "slowdisk" 2 s before they are made
+/// durable: published first, the cleared would arrive while the record still said
+/// needs_you.
+#[test]
+fn a_cancel_clears_a_needs_you_only_once_the_end_is_on_disk() {
+    let home = home_with("asks", &[("RLXD_TEST_SLOW_PERSIST", "slowdisk:2000")]);
+    let (r, _, events) = gated_start(&home, &asks_in_slowdisk()).wait();
+    assert_eq!(
+        of(&events, &r, None).last().unwrap()["type"],
+        "run.needs_you"
+    );
+    let capture = needs_you_until(&home, seq(&home), "needs_you.cleared");
+    thread::scope(|scope| {
+        let cancel = scope.spawn(|| call(&home, "run.cancel", &json!({"run_id": r})));
+        let cleared = finish(capture);
+        assert_eq!(cleared.code(), Some(0), "the capture: {cleared:?}");
+        let now = record_now(&home, &r);
+        assert_eq!(
+            now["state"], "failed",
+            "needs_you.cleared came before the end was on disk: {now:#}"
+        );
+        assert_eq!(cancel.join().unwrap()["cancelled"], true);
+    });
+}
+
+/// #42: `needs_you.raised` comes only once the run's end is durable, and still before
+/// the run's own `run.needs_you` (7.3). Test builds hold the end in "slowdisk" 2 s before
+/// it is made durable: raised first, it would arrive while the record said running.
+#[test]
+fn a_needs_you_is_raised_only_once_the_end_is_on_disk_and_before_run_needs_you() {
+    let home = home_with("asks", &[("RLXD_TEST_SLOW_PERSIST", "slowdisk:2000")]);
+    let since = seq(&home);
+    let capture = needs_you_until(&home, since, "needs_you.raised");
+    let r = run_id();
+    start(&home, &asks_in_slowdisk(), &r);
+    let raised = finish(capture);
+    assert_eq!(raised.code(), Some(0), "the capture: {raised:?}");
+    let now = record_now(&home, &r);
+    assert_eq!(
+        now["state"], "needs_you",
+        "needs_you.raised came before the end was on disk: {now:#}"
+    );
+    let events = wait_until(&home, since, 30, "run.needs_you", |e| {
+        !of(e, &r, Some("run.needs_you")).is_empty()
+    });
+    let raised_at = events
+        .iter()
+        .position(|e| e["type"] == "needs_you.raised")
+        .unwrap();
+    let ended_at = events
+        .iter()
+        .position(|e| e["type"] == "run.needs_you")
+        .unwrap();
+    assert!(raised_at < ended_at, "7.3: raised first: {events:#?}");
+}
+
+/// #42: rlxd killed once a needs-you run's end is on disk, and before its
+/// `needs_you.raised`, has it back when it starts again: the record says needs_you, so
+/// the run does, and a resume clears the needs-you it rebuilt. Test builds hold the raise
+/// in "slowdisk" 60 s, so the kill lands in between.
+#[test]
+fn a_needs_you_whose_raise_a_crash_cut_off_is_held_again_after_the_restart() {
+    let home = home_with("asks", &[("RLXD_TEST_SLOW_RAISE", "slowdisk:60000")]);
+    let since = seq(&home);
+    let r = run_id();
+    start(&home, &asks_in_slowdisk(), &r);
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while record_now(&home, &r)["state"] != "needs_you" {
+        assert!(
+            Instant::now() < deadline,
+            "the end never reached the record"
+        );
+        thread::sleep(Duration::from_millis(50));
+    }
+    // On disk, and heard of by no one yet: neither the raise nor the run's end.
+    let heard = replay(&home, since);
+    assert!(
+        heard
+            .iter()
+            .all(|e| e["type"] != "needs_you.raised" && e["type"] != "run.needs_you"),
+        "{heard:#?}"
+    );
+    common::kill_hard(home.status()["pid"].as_u64().unwrap());
+    // The kill takes a moment to land: started before it has, the next rlxd found the
+    // killed one still holding the home (already_running) under load.
+    common::eventually("the killed rlxd is not running", || {
+        home.rlxd(&["status", "--json"]).code() == Some(3)
+    });
+    home.start_dev();
+    assert_eq!(
+        call(&home, "run.get", &json!({"run_id": r}))["state"],
+        "needs_you"
+    );
+    let s = seq(&home);
+    let capture = needs_you_until(&home, s, "needs_you.cleared");
+    call(&home, "run.resume", &json!({"run_id": r, "reply": "#dev"}));
+    let cleared = finish(capture);
+    assert_eq!(cleared.code(), Some(0), "the capture: {cleared:?}");
+    let cleared = cleared.lines();
+    assert_eq!(
+        cleared.last().unwrap()["data"]["id"],
+        format!("run:{r}:1"),
+        "{cleared:#?}"
+    );
+}
+
+/// #42: `run.list` never says running of a run whose record does not. Test builds hold
+/// the launch's record write in "slowdisk" 2 s: shown first, the run would be listed
+/// running while its record said queued.
+#[test]
+fn a_launch_lists_the_run_running_only_once_its_record_says_so() {
+    let home = home_with("slow", &[("RLXD_TEST_SLOW_RECORD", "slowdisk:2000")]);
+    let mut params = task("take your time");
+    params["space"] = json!("slowdisk");
+    let r = run_id();
+    // run.start answers once the launch is done: listed from another thread meanwhile.
+    thread::scope(|scope| {
+        let started = scope.spawn(|| start(&home, &params, &r));
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            let listed = call(&home, "run.list", &json!({}));
+            let state = listed["runs"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|run| run["run_id"] == r.as_str())
+                .map(|run| run["state"].clone());
+            if state == Some(json!("running")) {
+                let now = record_now(&home, &r);
+                assert_eq!(
+                    now["state"], "running",
+                    "listed running while its record said otherwise: {now:#}"
+                );
+                break;
+            }
+            assert!(Instant::now() < deadline, "never listed running");
+        }
+        started.join().unwrap();
+    });
+    call(&home, "run.cancel", &json!({"run_id": r}));
+}
+
 #[test]
 fn a_run_that_never_started_has_no_session_to_resume() {
     let home = home("slow");

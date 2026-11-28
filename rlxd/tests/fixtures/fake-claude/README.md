@@ -111,9 +111,12 @@ text, as a tool would. Then it tries the identical call again, which rlxd denies
 account's connectors (task #14): `initialize` as `mcp-direct`'s, then `mcp_status` lists no
 server for its first 300 ms, then the rows `<config dir>/fake-connectors.json` holds,
 read at each ask (`CLAUDE_CONFIG_DIR`, else `~/.claude`), so each account home answers its
-own and a test changes a status by writing the file. Anything else (`mcp_call` included)
-is refused; the log keeps each request under `control_requests`. `mcp-accounts-old`
-refuses `mcp_status` too, as a Claude Code without it would.
+own and a test changes a status by writing the file. An `mcp_call` (an identity read) of
+a tool a row lists is logged under `mcp_calls`; with `check_permissions: true` it asks rlxd
+one `can_use_tool` first and runs the tool only on an allow, answering with the row tool's
+`result` (a content list), each run logged under `tool_runs_of`. Anything else is
+refused; the log keeps each request under `control_requests`. `mcp-accounts-old` refuses
+`mcp_status` and `mcp_call` too, as a Claude Code without them would.
 
 **`mcp-direct`** plays Claude Code on a `connectors.call` run's control channel (5.3), as
 spike #5 found 2.1.332: no user message, no `system/init`, only answers to rlxd's
