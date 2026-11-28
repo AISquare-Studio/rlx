@@ -1167,7 +1167,11 @@ def test_slot_ones_claude_home_and_files_beside_the_session_layout_are_never_loo
     made = planned(tmp_path)
 
     assert made.items == [] and (beside / "target").is_dir()
-    assert made.roots.temp == {claude_accounts.tmp_root().resolve()}
+    # rlx's two temp roots: the accounts' and the agents' own (#57's rule), nothing of slot 1.
+    assert made.roots.temp == {
+        claude_accounts.tmp_root().resolve(),
+        paths.agent_tmp_root().resolve(),
+    }
 
 
 def test_a_process_list_that_cannot_be_read_ends_no_session(

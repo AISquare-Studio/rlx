@@ -2383,6 +2383,14 @@ def start_for_launch(
     # The reports its `asq exec` saves: writable to every seat, as its inbox is, since a
     # reviewer's checks are reports too. The seals beside them are not.
     writable = (*writable, directory / REPORTS)
+    # The agent's own TMPDIR (#57), under the home its sandbox holds read-only: writable to
+    # every seat, as its reports are, or every temporary file its tools make fails. Its
+    # owner record beside it, the one file there rlx reads, stays read-only.
+    from aisquare.services import agent_tmp
+
+    own_tmp = agent_tmp.own_dir(env)
+    if own_tmp is not None:
+        writable = (*writable, own_tmp)
     access = adapter.broker_access(
         argv, store, directory / INBOX, protect=protect, writable=writable
     )

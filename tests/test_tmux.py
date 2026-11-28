@@ -2380,6 +2380,7 @@ def test_the_seam_strips_the_team_variables_a_server_must_never_hold(
         "AISQUARE_ROLE",
         "AISQUARE_PERSONA",
         "AISQUARE_BOARD_CONTEXT",
+        "AISQUARE_TMP_KEY",
     }
     for name in spawn.TEAM_ENV_VARS:
         monkeypatch.setenv(name, f"parent-{name}")

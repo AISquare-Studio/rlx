@@ -561,6 +561,18 @@ def cache_dir() -> Path:
     return aisquare_home() / "cache"
 
 
+def agent_tmp_root() -> Path:
+    """Where each agent's own temporary directory is made (``services.agent_tmp``, #57), the
+    same name in both layouts. Short on purpose: a socket an agent's test binds under it must
+    fit ``sun_path`` (104 bytes on macOS)."""
+    return aisquare_home() / "tmp"
+
+
+def agent_tmp_dir(key: str) -> Path:
+    """One agent's own temporary directory: its ``TMPDIR`` (``TEMP`` and ``TMP`` on Windows)."""
+    return agent_tmp_root() / key
+
+
 def ci_cache_dir() -> Path:
     """Directory for the CI test bed's cached delivery descriptors.
 

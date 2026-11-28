@@ -2123,6 +2123,12 @@ class LaunchSpec(BaseModel):
     """What of the board the agent reads (``all``, ``relevant``, ``none``; P1 WS-2, #279),
     as its spawn resolved it, so a restart or switch keeps it. ``None`` on a spec recorded
     before it: the role's setting applies."""
+    tmp_key: str | None = None
+    """The agent's own temporary directory, ``<home>/tmp/<tmp_key>`` (``services.agent_tmp``,
+    #57): minted at its first spawn and replayed by every replacement (a restart, a switch,
+    a hand-over, a resume), so the agent keeps its ``TMPDIR`` and the files in it until it
+    really ends. A fork mints its own. ``None`` on a spec recorded before it: the next
+    spawn mints one."""
 
 
 class FleetAgent(BaseModel):
