@@ -50,6 +50,7 @@ def plan_json(plan: tidy_service.Plan) -> dict[str, Any]:
         "counts": plan.counts(),
         "branches": [{"repo": str(repo), "branch": branch} for repo, branch in plan.branches],
         "ignored_tags": [str(path) for path in plan.ignored],
+        "deletes": tidy_service.DELETES,
     }
 
 
@@ -118,6 +119,8 @@ def tidy(
     else is ever removed."""
     plan = tidy_service.plan()
     console = stdout_console()
+    if not tidy_service.DELETES and not get_state().json_output:
+        console.print(tidy_service.REPORTS_ONLY, markup=False)
     if dry_run:
         if get_state().json_output:
             typer.echo(json.dumps(plan_json(plan)))

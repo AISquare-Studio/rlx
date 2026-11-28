@@ -18,6 +18,7 @@ import tempfile
 import time
 import uuid
 from collections.abc import Iterator
+from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -25,16 +26,25 @@ import pytest
 from typer.testing import CliRunner
 
 from aisquare.cli.app import app
-from aisquare.core import cachedir, claude_accounts, paths, process_table
+from aisquare.core import cachedir, claude_accounts, locking, paths, process_table
 from aisquare.core.config import TidySettings
 from aisquare.core.locking import holding
 from aisquare.core.store import FLEET_HELD, store_session
-from aisquare.models import FleetAgent, ProjectInfo, TeamSession
+from aisquare.models import EndedBy, FleetAgent, ProjectInfo, TeamSession
 from aisquare.services import fleet as fleet_service
 from aisquare.services import tidy
 from tests import test_fleet_service as fleet_suite
 from tests.test_fleet_pause_resume import _claim
 from tests.test_fleet_service import _add_task, _git, _stale_board_session
+
+pytestmark = pytest.mark.skipif(
+    sys.platform == "win32",
+    reason=(
+        "POSIX file semantics (os.utime on links, symlinks, unlinking a held lock, sandbox paths "
+        "past MAX_PATH), and rlx tidy deletes nothing on native Windows in 0.10.2 (manager "
+        "#3647): tests/test_tidy_on_every_platform.py runs there"
+    ),
+)
 
 tmux = fleet_suite.tmux
 claude_on_path = fleet_suite.claude_on_path
@@ -103,12 +113,19 @@ def aged(path: Path, ago: timedelta) -> None:
 
 
 def session_dir(
-    slot: int = 2, session: str | None = None, *, ended: timedelta | None = 3 * HOUR
+    slot: int = 2,
+    session: str | None = None,
+    *,
+    ended: timedelta | None = 3 * HOUR,
+    fleet_row: bool = True,
+    ended_by: EndedBy | None = "stopped",
 ) -> Path:
     """A Claude session's temp under the accounts' temp root, as Claude Code lays it out under
     the ``CLAUDE_CODE_TMPDIR`` rlx gives a managed slot. ``ended``: how long ago its board row
     says it ended, its last hook then too (the current positive evidence tidy needs, review of
-    #58 M1 and M-a); ``None``: no row and no word that it ended."""
+    #58 M1 and M-a); ``None``: no row and no word that it ended. ``fleet_row``: the fleet row
+    that ran it, ended then ``ended_by`` (no row, or no cause: ``team prune``'s idleness end
+    alone, which is no evidence, M2)."""
     name = session or str(uuid.uuid4())
     found = claude_accounts.tmp_root() / str(slot) / "claude-501" / "-Users-someone-code-repo"
     found = found / name
@@ -127,6 +144,23 @@ def session_dir(
                     ended_at=when,
                 )
             )
+            # The explicit end tidy needs beside the board's (review of #58, M2): the fleet
+            # row that ran it, stopped on rlx's word.
+            if fleet_row:
+                store.upsert_fleet_agent(
+                    FleetAgent(
+                        id=f"agt_{uuid.uuid4().hex[:26]}",
+                        project_id=BOARD,
+                        label="reviewer-ended",
+                        role="reviewer",
+                        pane_id="%8",
+                        session_id=name,
+                        cwd=found,
+                        created_at=when - HOUR,
+                        ended_at=when,
+                        ended_by=ended_by,
+                    )
+                )
         assert stored_ended(name), "inserted ended: end_session would stamp now"
     return found
 
@@ -1151,3 +1185,261 @@ def test_every_root_these_tests_plan_under_is_the_sandboxs(tmp_path: Path) -> No
     """A guard on the guards: the home every test here plans in is the sandbox's."""
     assert paths.aisquare_home().resolve().is_relative_to(tmp_path.resolve())
     assert claude_accounts.tmp_root().resolve().is_relative_to(tmp_path.resolve())
+
+
+# --- round 4 (review #3646, manager #3647) --------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "how", ["team prune's idleness end, no fleet row", "a fleet row ended with no cause"]
+)
+def test_a_board_end_with_no_explicit_end_beside_it_is_no_evidence(
+    tmp_path: Path, how: str
+) -> None:
+    """M2: ``team prune`` ends an idle board session and records no cause; only an explicit end
+    (a stop, a death, on rlx's word) beside the board's counts. A week on, nothing goes."""
+    week = 8 * timedelta(days=1)
+    if how.startswith("team prune"):
+        session = session_dir(ended=week, fleet_row=False)
+    else:
+        session = session_dir(ended=week, ended_by=None)
+    cache = tag(session / "scratchpad" / "target")
+    aged(session, week)
+
+    made = planned(tmp_path)
+
+    assert made.items == []
+    tidy.apply(made)
+    assert cache.is_dir() and (session / "scratchpad" / "notes.md").is_file()
+
+
+def test_the_whole_directory_waits_a_week_from_its_newest_file_anywhere(tmp_path: Path) -> None:
+    """M2: the session ended a week ago, but a file deep inside moved two days ago: the whole
+    directory waits (and its notes stay); its caches may still go."""
+    week = 8 * timedelta(days=1)
+    session = session_dir(ended=week)
+    deep = session / "scratchpad" / "a" / "b" / "c"
+    deep.mkdir(parents=True)
+    (deep / "late.log").write_text("written later\n", encoding="utf-8")
+    aged(session, week)
+    aged(deep / "late.log", 2 * timedelta(days=1))
+
+    made = planned(tmp_path)
+
+    assert session not in rules(made)
+    tidy.apply(made)
+    assert (deep / "late.log").is_file() and (session / "scratchpad" / "notes.md").is_file()
+
+
+def test_the_whole_directory_is_dated_again_just_before_it_goes(tmp_path: Path) -> None:
+    week = 8 * timedelta(days=1)
+    session = session_dir(ended=week)
+    aged(session, week)
+    made = planned(tmp_path)
+    assert rules(made) == {session: tidy.SESSION_DIR}
+    (session / "scratchpad" / "deeper").mkdir()
+    (session / "scratchpad" / "deeper" / "now.txt").write_text("now\n", encoding="utf-8")
+    os.utime(session / "scratchpad", (time.time() - week.total_seconds(),) * 2)
+
+    report = tidy.apply(made)
+
+    assert report.freed == [] and session.is_dir()
+    assert report.not_freed[0][1] == "skipped: something in it moved this week"
+
+
+def _mounted_at(monkeypatch: pytest.MonkeyPatch, *mounts: Path) -> None:
+    """Each of ``mounts``, and all under it, read as on another filesystem (``cachedir._device``,
+    the one seam every walk and every delete asks)."""
+    real = cachedir._device
+
+    def device(path: Path | str) -> int | None:
+        found = real(path)
+        inside = any(Path(path) == m or Path(path).is_relative_to(m) for m in mounts)
+        return None if found is None else found + (7 if inside else 0)
+
+    monkeypatch.setattr(cachedir, "_device", device)
+
+
+def test_no_session_rule_crosses_a_mount(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """M3: a mount in an ended session is not walked, nor freed, whether it is tagged itself or
+    holds a cache; and the whole directory holding one, a week on, stays."""
+    recent = session_dir()
+    mounted = tag(recent / "scratchpad" / "mnt")
+    under = tag(recent / "scratchpad" / "other-mnt" / "target")
+    ours = tag(recent / "scratchpad" / "target")
+    aged(recent, 3 * HOUR)
+    week = 8 * timedelta(days=1)
+    old = session_dir(ended=week)
+    (old / "scratchpad" / "mnt").mkdir()
+    aged(old, week)
+    _mounted_at(monkeypatch, mounted, under.parent, old / "scratchpad" / "mnt")
+
+    made = planned(tmp_path)
+
+    assert rules(made) == {ours: tidy.SESSION_CACHE}
+    tidy.apply(made)
+    assert (mounted / cachedir.TAG).is_file() and (under / cachedir.TAG).is_file()
+    assert old.is_dir()
+
+
+def test_reap_neither_frees_nor_removes_across_a_mount(
+    tmp_path: Path,
+    tmux: object,
+    claude_on_path: Path,
+    project: ProjectInfo,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """M3, reap's paths: a tagged mount in a tree, untracked, is not build output: it is the
+    tree's untracked content, which keeps the tree."""
+    agent = _ended_coder(project, "coder-mount")
+    mounted = tag(agent.cwd / "mnt")
+    _mounted_at(monkeypatch, mounted)
+
+    assert fleet_service._untracked_caches(agent.cwd)[1] == []
+    assert fleet_service._remove_untracked_caches(agent.cwd) == []
+    with pytest.raises(ValueError):
+        cachedir.remove_within(mounted, agent.cwd)
+    report = fleet_service.reap(project)
+
+    assert (agent.cwd, "uncommitted changes") in report.worktrees_kept
+    assert (mounted / cachedir.TAG).is_file()
+
+
+def test_an_ended_tree_whose_recorded_path_is_now_a_link_is_kept_by_tidy_and_reap(
+    tmp_path: Path, tmux: object, claude_on_path: Path, project: ProjectInfo
+) -> None:
+    """The symlinked recorded tree: the tree moved and a link left at its path. ``git worktree
+    remove`` given the link would act on wherever it points; nothing goes through it."""
+    agent = _ended_coder(project, "coder-linked")
+    moved = agent.cwd.parent / "coder-linked-moved"
+    agent.cwd.rename(moved)
+    agent.cwd.symlink_to(moved, target_is_directory=True)
+    cache = tag(moved / "target")
+
+    made = planned(tmp_path)
+
+    assert agent.cwd not in rules(made) and cache not in rules(made)
+    assert _kept_why(made, agent.cwd) == fleet_service.LINKED_TREE
+    tidy.apply(made)
+    report = fleet_service.reap(project)
+    assert (agent.cwd, fleet_service.LINKED_TREE) in report.worktrees_kept
+    assert (cache / cachedir.TAG).is_file() and (moved / ".git").is_file()
+
+
+def test_a_tree_whose_status_cannot_be_read_is_kept_and_said(
+    tmp_path: Path,
+    tmux: object,
+    claude_on_path: Path,
+    project: ProjectInfo,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``_untracked_caches`` inside the try: git failing there keeps the tree, never a
+    traceback."""
+    agent = _ended_coder(project, "coder-unread")
+
+    def broken(tree: Path) -> list[Path]:
+        raise fleet_service.FleetError("git is not there")
+
+    monkeypatch.setattr(tidy, "_untracked_caches", broken)
+
+    made = planned(tmp_path)
+
+    assert made.items == []
+    assert _kept_why(made, agent.cwd) == "git could not be asked (git is not there)"
+
+
+def test_a_fleet_held_row_that_cannot_be_read_holds_its_session(tmp_path: Path) -> None:
+    session = session_dir()
+    with store_session() as store:
+        store.set_meta(f"{FLEET_HELD}{session.name}", f"agt_{'0' * 26}")
+    tag(session / "scratchpad" / "target")
+    aged(session, 3 * HOUR)
+
+    assert planned(tmp_path).items == []
+
+
+def test_a_live_row_no_project_lists_still_holds_its_session(tmp_path: Path) -> None:
+    """A purged project's live row is listed by no project: it is read by the session's id."""
+    session = session_dir()
+    orphan = FleetAgent(
+        id=f"agt_{uuid.uuid4().hex[:26]}",
+        project_id="prj_purgedproject01",
+        label="coder-orphan",
+        role="coder",
+        pane_id="%5",
+        session_id=session.name,
+        cwd=tmp_path,
+        created_at=datetime.now(UTC) - 5 * HOUR,
+    )
+    with store_session() as store:
+        store.upsert_fleet_agent(orphan)
+        assert all(r.id != orphan.id for r in tidy._every_row(store))
+    tag(session / "scratchpad" / "target")
+    aged(session, 3 * HOUR)
+
+    assert planned(tmp_path).items == []
+
+
+def test_a_lock_made_anew_while_tidy_took_it_is_not_unlinked(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The lock inode race: the file tidy locked is the one it unlinks; one made anew at the name
+    meanwhile is another mover's."""
+    lock = tmp_path / "system-temp" / f"rlx-home-migration-{'d' * 16}.lock"
+    lock.write_bytes(b"")
+    aged(lock, 25 * HOUR)
+    made = planned(tmp_path)
+    assert rules(made) == {lock: tidy.MIGRATION_LOCK}
+    real_held = locking.held
+    fresh = tmp_path / "fresh.lock"
+    fresh.write_bytes(b"another mover's\n")
+
+    @contextmanager
+    def swapping(fd: int, *, wait_s: float) -> Iterator[None]:
+        with real_held(fd, wait_s=wait_s):
+            os.replace(fresh, lock)
+            yield
+
+    monkeypatch.setattr(locking, "held", swapping)
+
+    report = tidy.apply(made)
+
+    assert report.freed == []
+    assert report.not_freed == [(made.items[0], "skipped: the lock was made anew")]
+    assert lock.read_bytes() == b"another mover's\n"
+
+
+def test_a_folder_swapped_for_a_link_after_the_check_deletes_nothing_elsewhere(
+    tmp_path: Path,
+) -> None:
+    """The parent swap race: the folder is pinned once checked, and what it holds then is
+    compared with what was checked."""
+    temp = tmp_path / "temp"
+    target = tag(temp / "sub" / "target")
+    elsewhere = tag(tmp_path / "elsewhere" / "sub" / "target")
+
+    class Swapping(tidy.Roots):
+        def allows(self, path: Path) -> bool:
+            allowed = super().allows(path)
+            os.rename(temp / "sub", temp / "sub.checked")
+            (temp / "sub").symlink_to(tmp_path / "elsewhere" / "sub", target_is_directory=True)
+            return allowed
+
+    roots = Swapping(temp=frozenset({temp.resolve()}))
+
+    with pytest.raises(tidy.Refused):
+        tidy._remove(target, roots)
+
+    assert (elsewhere / cachedir.TAG).is_file()
+    assert (temp / "sub.checked" / "target" / cachedir.TAG).is_file()
+
+
+def test_a_cache_inside_a_tree_reap_judges_honours_the_callers_roots(tmp_path: Path) -> None:
+    """Reap's delete, run for tidy, asks tidy's roots too."""
+    tree = tmp_path / "tree"
+    _git("init", "-q", str(tree), cwd=tmp_path)
+    target = tag(tree / "target")
+
+    assert fleet_service._remove_untracked_caches(tree, allows=lambda path: False) == []
+    assert target.is_dir()
+    assert fleet_service._remove_untracked_caches(tree, allows=lambda path: True) == [target]

@@ -11,9 +11,11 @@ from __future__ import annotations
 
 import json
 import os
+import sys
 import time
 from pathlib import Path
 
+import pytest
 from typer.testing import CliRunner
 
 from aisquare.cli.app import app
@@ -25,6 +27,13 @@ def test_tidy_reads_no_temp_dir_and_no_process_of_the_machines(tmp_path: Path) -
     assert tidy._command_lines() == []
 
 
+@pytest.mark.skipif(
+    sys.platform == "win32",
+    reason=(
+        "rlx tidy deletes nothing on native Windows in 0.10.2 (manager #3647), and Windows "
+        "refuses to unlink a held lock"
+    ),
+)
 def test_a_real_rlx_tidy_under_the_suite_frees_a_stale_lock_in_the_sandbox_alone(
     tmp_path: Path,
 ) -> None:

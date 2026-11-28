@@ -3220,14 +3220,20 @@ def _untracked_caches(tree: Path) -> tuple[str | None, list[Path], bool]:
         code, name = entry[:2], entry[3:]
         if "R" in code or "C" in code:
             next(fields, None)  # a rename's or copy's other path
-        if code == "??" and cachedir.only_caches(tree / name.rstrip("/")):
-            caches.append(tree / name.rstrip("/"))
+        path = tree / name.rstrip("/")
+        # A mount is never build output, whatever it holds (review of #58, M3).
+        if code == "??" and cachedir.same_filesystem(path, tree) and cachedir.only_caches(path):
+            caches.append(path)
         else:
             other = True
     return None, caches, other
 
 
-def _remove_untracked_caches(tree: Path, only: Collection[Path] | None = None) -> list[Path]:
+def _remove_untracked_caches(
+    tree: Path,
+    only: Collection[Path] | None = None,
+    allows: Callable[[Path], bool] | None = None,
+) -> list[Path]:
     """Delete the ``CACHEDIR.TAG`` directories in ``tree``'s untracked entries that hold
     nothing else (:func:`_untracked_caches`); the ones deleted. One that will not go is left
     for ``git worktree remove`` to refuse, which says so."""
@@ -3240,7 +3246,7 @@ def _remove_untracked_caches(tree: Path, only: Collection[Path] | None = None) -
             if only is not None and tagged not in only:
                 continue  # found after the plan: ``rlx tidy`` frees what it listed alone
             try:
-                cachedir.remove_within(tagged, tree)
+                cachedir.remove_within(tagged, tree, allows=allows)
             except (OSError, ValueError):
                 continue  # left in the tree: git's own refusal names it
             removed.append(tagged)
@@ -3252,6 +3258,9 @@ NESTED_REPOSITORY = (
     "remove it by hand if you don't need it"
 )
 """Why a tree that holds a repository besides its own is kept (#58, C-a)."""
+LINKED_TREE = "it is a link: nothing goes through it"
+"""Why a tree recorded at a path that is now a link is kept: ``git worktree remove`` given a
+link would act on wherever it points (review of #58)."""
 
 
 def _why_kept(root: Path, tree: Path, default: str) -> str | None:
@@ -3261,6 +3270,8 @@ def _why_kept(root: Path, tree: Path, default: str) -> str | None:
     branch with no ``.gitignore`` for it) is no work: it does not keep the tree, and
     :func:`_reap_tree` deletes it before the tree goes (the owner's disk tidy, #58). Anything
     else changed or untracked does."""
+    if os.path.islink(tree):
+        return LINKED_TREE
     failed, _caches, other = _untracked_caches(tree)
     if failed is not None:
         return failed
@@ -3506,6 +3517,7 @@ def _reap_tree(
     *,
     remove: bool = True,
     caches: Collection[Path] | None = None,
+    allows: Callable[[Path], bool] | None = None,
 ) -> tuple[bool, str | None]:
     """Reap ``agent``'s tree: ``agent`` ended, and was the newest row at the tree's path when
     :func:`reap` read the rows at ``read_at``. Record on its row the branch the tree is on
@@ -3554,11 +3566,16 @@ def _reap_tree(
             _record_the_branch(store, agent)
             # Its build output first, whether or not the tree stays: regenerable by its own tag,
             # and deleted only here, under the lock, once no other agent is at the tree (#58).
-            _remove_untracked_caches(tree, caches)
+            _remove_untracked_caches(tree, caches, allows)
             if kept is not None:
                 return False, kept
             if not remove:  # ``rlx tidy`` planned it kept: it never decides again (#58)
                 return False, "kept, as planned"
+            # Asked again under the lock, for a tree about to go alone: what it holds may have
+            # changed since it was first asked, unlocked (review of #58, the race).
+            again = _why_kept(project.root, tree, default)
+            if again is not None:
+                return False, again
             removal = _git(project.root, "worktree", "remove", str(tree))
     except FleetError as exc:
         held = f"; when asked just before, it held: {kept}" if kept is not None else ""

@@ -25,6 +25,7 @@ import stat
 import sys
 from collections.abc import Callable, Iterator
 from pathlib import Path
+from typing import Any
 
 TAG = "CACHEDIR.TAG"
 SIGNATURE = b"Signature: 8a477f597d28d172789f06886806bc55"
@@ -65,8 +66,35 @@ def is_environment(path: Path) -> bool:
 
 
 def _is_bare_repository(path: Path) -> bool:
-    """A bare repository's own shape: ``HEAD``, ``objects`` and ``refs`` at its root."""
-    return _is_file(path / "HEAD") and _is_dir(path / "objects") and _is_dir(path / "refs")
+    """A bare repository's own shape: ``HEAD``, ``objects`` and ``refs`` at its root, any of them
+    a link too (a ``HEAD`` linked elsewhere is still a repository's, review of #58)."""
+    return (
+        os.path.lexists(path / "HEAD")
+        and os.path.lexists(path / "objects")
+        and os.path.lexists(path / "refs")
+    )
+
+
+def _device(path: Path | str) -> int | None:
+    """The filesystem ``path`` itself is on (``os.lstat``, never following a link), or ``None``
+    when it cannot be read. Not ``DirEntry.stat``, whose ``st_dev`` is 0 on Windows (review of
+    #58, M1: every folder read as a mount, and reap kept every tree)."""
+    try:
+        return os.lstat(path).st_dev
+    except OSError:
+        return None
+
+
+def same_filesystem(path: Path, root: Path) -> bool:
+    """Whether ``path`` is on ``root``'s filesystem, both readable: no rule crosses a mount
+    (review of #58, M3), whether the mount is ``path`` itself or a folder between them."""
+    device = _device(path)
+    return device is not None and device == _device(root)
+
+
+def _is_git(name: str) -> bool:
+    """``.git`` as git finds it, whatever its case on a case-insensitive disk (``.GIT``)."""
+    return name.lower() == ".git"
 
 
 def _is_file(path: Path) -> bool:
@@ -78,13 +106,13 @@ def _is_file(path: Path) -> bool:
 
 def holds_repository(path: Path, *, below_only: bool = False) -> bool:
     """Whether a git repository of any kind is at or anywhere under ``path``: a ``.git`` (a
-    clone's directory, a worktree's or a submodule's file) or a bare repository, ignored by git
-    or not, links not followed (review of #58, C-a). ``below_only``: ``path``'s own ``.git`` (a
-    checkout's) does not count, a repository inside it does. A folder that cannot be read, or on
-    another filesystem (a mount), is taken to hold one: kept."""
-    try:
-        device = os.lstat(path).st_dev
-    except OSError:
+    clone's directory, a worktree's or a submodule's file, ``.GIT`` on a case-insensitive disk)
+    or a bare repository, ignored by git or not, links not followed (review of #58, C-a).
+    ``below_only``: ``path``'s own ``.git`` (a checkout's) is neither counted nor walked into, a
+    repository inside it counts. A folder that cannot be read, or on another filesystem (a
+    mount: no rule crosses one, M3), is taken to hold one: kept."""
+    device = _device(path)
+    if device is None:
         return True
     if not below_only and _is_bare_repository(path):
         return True
@@ -97,22 +125,53 @@ def holds_repository(path: Path, *, below_only: bool = False) -> bool:
         except OSError:
             return True
         for entry in entries:
-            if entry.name == ".git":
+            if _is_git(entry.name):
                 if top and below_only:
                     continue  # the checkout's own repository: never walked into, nor counted
                 return True
             if not entry.is_dir(follow_symlinks=False):
                 continue
             inner = Path(entry.path)
-            try:
-                if entry.stat(follow_symlinks=False).st_dev != device:
-                    return True  # a mount: not ours to walk, so taken to hold one
-            except OSError:
-                return True
+            if _device(inner) != device:
+                return True  # a mount, or unreadable: not ours to walk, so taken to hold one
             if _is_bare_repository(inner):
                 return True
             pending.append((inner, False))
     return False
+
+
+def newest_mtime(path: Path, *, limit: int = 200_000) -> float | None:
+    """The newest modification time of ``path`` and everything under it, links not followed;
+    ``None`` past ``limit`` entries, at a mount (never crossed, M3), or where something cannot
+    be read: a caller then takes it to be recent."""
+    device = _device(path)
+    try:
+        newest = os.lstat(path).st_mtime
+    except OSError:
+        return None
+    pending = [path]
+    seen = 0
+    while pending:
+        here = pending.pop()
+        try:
+            with os.scandir(here) as listing:
+                entries = list(listing)
+        except OSError:
+            return None
+        for entry in entries:
+            seen += 1
+            if seen > limit:
+                return None
+            try:
+                info = os.lstat(entry.path)
+            except OSError:
+                return None
+            newest = max(newest, info.st_mtime)
+            if stat.S_ISDIR(info.st_mode):
+                if _device(entry.path) != device:
+                    return None  # a mount: what is on it is not ours to date (M3)
+                pending.append(Path(entry.path))
+    return newest
 
 
 def holds_environment(path: Path) -> bool:
@@ -145,10 +204,13 @@ def cache_dirs(root: Path, *, skip: Callable[[Path], bool] | None = None) -> lis
     """Every cache STRICTLY under ``root`` (:func:`is_cache`; never ``root`` itself, whose tag
     authorises nothing), outermost only, links not followed, never inside a nested checkout (a
     directory holding a ``.git``) nor inside a directory ``skip`` says to pass over."""
+    device = _device(root)
     found: list[Path] = []
     pending = [entry for entry in _subdirectories(root)]
     while pending:
         here = pending.pop()
+        if device is None or _device(here) != device:
+            continue  # a mount: no rule crosses one (review of #58, M3)
         if skip is not None and skip(here):
             continue
         if is_cache_dir(here):
@@ -187,51 +249,79 @@ def only_caches(root: Path) -> bool:
             entries = list(listing)
     except OSError:
         return False
+    device = _device(root)
     return all(
-        entry.is_dir(follow_symlinks=False) and only_caches(Path(entry.path)) for entry in entries
+        entry.is_dir(follow_symlinks=False)
+        and _device(entry.path) == device  # a mount holds what tidy will not judge (M3)
+        and only_caches(Path(entry.path))
+        for entry in entries
     )
 
 
-def remove_dir(path: Path) -> None:
+def remove_dir(path: Path | str, *, dir_fd: int | None = None) -> None:
     """Delete the directory ``path`` and all it holds, following no link (``shutil.rmtree``
-    unlinks a link it meets, and refuses one given as ``path``); a read-only entry, as git and
-    some builds leave, is made writable and tried again. Raises what the delete raised."""
-
-    top = os.path.realpath(path)
+    unlinks a link it meets, and refuses one given as ``path``). With ``dir_fd``, ``path`` is a
+    name in that folder, opened and checked by the caller (``rlx tidy``'s pinned delete). What
+    refuses (a read-only folder) is made writable, inside ``path`` alone and never through a
+    link, and a second pass removes it; what still refuses is raised then."""
+    top = None if dir_fd is not None else os.path.realpath(path)
 
     def loosen(_function: Callable[..., object], name: str, _exc: BaseException | object) -> None:
-        """Make what refused writable, and its folder, inside ``path`` alone, never through a
-        link; the second pass removes it. The failed call is never made again: rmtree's
-        ``os.open`` takes flags this hook does not have (review of #58, a TypeError)."""
+        """Never makes the failed call again: rmtree's ``os.open`` takes flags this hook does
+        not have (review of #58, a TypeError that aborted tidy and reap)."""
         for target in (name, os.path.dirname(name)):
+            if not target:
+                continue
             try:
-                real = os.path.realpath(target)
-                if os.path.islink(target) or os.path.commonpath([real, top]) != top:
+                if dir_fd is not None:
+                    info = os.lstat(target, dir_fd=dir_fd)
+                    if stat.S_ISLNK(info.st_mode):
+                        continue
+                    os.chmod(target, _writable(info), dir_fd=dir_fd)
                     continue
-                mode = stat.S_IRWXU if os.path.isdir(target) else stat.S_IRUSR | stat.S_IWUSR
-                os.chmod(target, mode)
-            except OSError:
+                real = os.path.realpath(target)
+                if os.path.islink(target) or os.path.commonpath([real, str(top)]) != top:
+                    continue
+                os.chmod(target, _writable(os.lstat(target)))
+            except (OSError, NotImplementedError):
                 continue
 
+    def gone() -> bool:
+        try:
+            os.lstat(path, dir_fd=dir_fd) if dir_fd is not None else os.lstat(path)
+        except OSError:
+            return True
+        return False
+
+    kwargs: dict[str, Any] = {} if dir_fd is None else {"dir_fd": dir_fd}
     if sys.version_info >= (3, 12):
-        shutil.rmtree(path, onexc=loosen)
+        shutil.rmtree(path, onexc=loosen, **kwargs)
     else:  # pragma: no cover - 3.11 names the hook onerror
-        shutil.rmtree(path, onerror=loosen)
-    if os.path.lexists(path):
-        shutil.rmtree(path)  # what still refuses is raised now
+        shutil.rmtree(path, onerror=loosen, **kwargs)
+    if not gone():
+        shutil.rmtree(path, **kwargs)  # what still refuses is raised now
 
 
-def remove_within(path: Path, root: Path) -> None:
+def _writable(info: os.stat_result) -> int:
+    return stat.S_IRWXU if stat.S_ISDIR(info.st_mode) else stat.S_IRUSR | stat.S_IWUSR
+
+
+def remove_within(path: Path, root: Path, *, allows: Callable[[Path], bool] | None = None) -> None:
     """Delete the cache ``path``, refusing (``ValueError``) a link, ``root`` itself, a path that
-    holds a ``.git``, and one whose real place is not strictly inside ``root``'s: a tree reached
-    through a link deletes nothing outside it (review of #58)."""
+    holds a repository or crosses a mount, one whose real place is not strictly inside
+    ``root``'s (a tree reached through a link deletes nothing outside it), and one ``allows``
+    (a caller's own roots: ``rlx tidy``'s) refuses (review of #58)."""
     info = os.lstat(path)
     if stat.S_ISLNK(info.st_mode):
         raise ValueError(f"{path} is a link")
+    if allows is not None and not allows(path):
+        raise ValueError(f"{path} is outside the folders the caller may delete in")
     parent, top = os.path.realpath(path.parent), os.path.realpath(root)
     here = os.path.join(parent, path.name)
     if here == top or os.path.commonpath([here, top]) != top:
         raise ValueError(f"{path} is not inside {root}")
+    if not same_filesystem(path, root):
+        raise ValueError(f"{path} is on another filesystem than {root}")
     if holds_repository(path):
         raise ValueError(f"{path} holds a repository, or crosses a mount")
     remove_dir(path)

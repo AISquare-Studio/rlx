@@ -56,6 +56,7 @@ from __future__ import annotations
 
 import os
 import re
+import shutil
 import stat
 import sys
 import uuid
@@ -64,9 +65,8 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
-from aisquare.core import cachedir, claude_accounts, process_table
+from aisquare.core import cachedir, claude_accounts, locking, process_table
 from aisquare.core.config import TidySettings, load_config
-from aisquare.core.locking import holding
 from aisquare.core.store import FLEET_HELD, ContextStore, store_session
 from aisquare.models import FleetAgent, ProjectInfo
 from aisquare.services import fleet as fleet_service
@@ -89,6 +89,9 @@ RULES = (
 )
 """Every rule, in the order a plan lists them."""
 
+EXPLICIT_ENDS = ("stopped", "died")
+"""How a fleet row ends on rlx's own word (``FleetAgent.ended_by``): the only ends tidy takes for
+a session's end (review of #58, M2)."""
 ENDED_IDLE = timedelta(hours=2)
 """How long nothing of a session or an agent's temp may have moved before it is ended."""
 EVIDENCE_TTL = timedelta(days=7)
@@ -123,6 +126,13 @@ ROOT_TAG = (
 NEVER_A_REPOSITORY = "rlx won't delete a repository: remove it by hand if you don't need it"
 """Why every repository in a session's temp is kept (manager #3585: ``rlx tidy`` never deletes
 a git repository in 0.10.2)."""
+DELETES = sys.platform != "win32"
+"""Whether tidy deletes here. Not on native Windows in 0.10.2 (manager #3647): it reports and
+lists, and removes nothing; the fleet there runs in WSL, where tidy deletes."""
+REPORTS_ONLY = (
+    "rlx tidy deletes nothing on native Windows in 0.10.2: the fleet runs in WSL, run it there"
+)
+"""What a report on native Windows says of each item it would free (:data:`DELETES`)."""
 
 
 # --- what may be deleted -------------------------------------------------------------------
@@ -184,10 +194,30 @@ def _remove(path: Path, roots: Roots) -> None:
         raise Refused(f"{path} is a link: tidy deletes no link's target, nor the link")
     if not roots.allows(path):
         raise Refused(f"{path} is outside rlx's own folders")
-    if stat.S_ISDIR(info.st_mode):
-        cachedir.remove_dir(path)
-    else:
-        os.unlink(path)
+    parent = _real(path.parent)
+    if parent is None:
+        raise Refused(f"{path}'s folder cannot be read")
+    if not shutil.rmtree.avoids_symlink_attacks:  # pragma: no cover - not on POSIX
+        if stat.S_ISDIR(info.st_mode):
+            cachedir.remove_dir(path)
+        else:
+            os.unlink(path)
+        return
+    # The folder checked, pinned: opened without following a link and compared, so a parent
+    # swapped for a link after the check deletes nothing elsewhere (review of #58, the race).
+    fd = os.open(parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0))
+    try:
+        if os.fstat(fd).st_ino != os.lstat(parent).st_ino:
+            raise Refused(f"{path}'s folder changed while tidy looked")
+        here = os.lstat(path.name, dir_fd=fd)
+        if (here.st_dev, here.st_ino) != (info.st_dev, info.st_ino) or stat.S_ISLNK(here.st_mode):
+            raise Refused(f"{path} changed while tidy looked")
+        if stat.S_ISDIR(here.st_mode):
+            cachedir.remove_dir(path.name, dir_fd=fd)
+        else:
+            os.unlink(path.name, dir_fd=fd)
+    finally:
+        os.close(fd)
 
 
 def _there(path: Path) -> bool:
@@ -310,6 +340,9 @@ def apply(made: Plan) -> Report:
     first and never frees more than planned (a tree planned kept loses its caches alone), and an
     item still there afterwards is reported with why. Then the planned branches, those alone."""
     report = Report(kept=list(made.kept))
+    if not DELETES:
+        report.not_freed = [(item, REPORTS_ONLY) for item in made.items]
+        return report
     for action in made.actions:
         try:
             why = action.run()
@@ -377,6 +410,9 @@ def _ended_worktrees(store: ContextStore, project: ProjectInfo, result: Plan) ->
                 Kept(ENDED_WORKTREE, tree, f"not under {WORKTREES_DIR}: reap judges it")
             )
             continue
+        if os.path.islink(tree):
+            result.kept.append(Kept(ENDED_WORKTREE, tree, fleet_service.LINKED_TREE))
+            continue
         if not _there(tree / ".git"):
             # Asked there, git would answer for the repository above it (review of #58).
             result.kept.append(Kept(ENDED_WORKTREE, tree, "it has no .git of its own: kept"))
@@ -385,17 +421,20 @@ def _ended_worktrees(store: ContextStore, project: ProjectInfo, result: Plan) ->
             result.ignored.append(tree)
         try:
             why = fleet_service._why_kept(trees.root, tree, trees.default)
+            caches = _untracked_caches(tree)
         except fleet_service.FleetError as exc:
             result.kept.append(Kept(ENDED_WORKTREE, tree, f"git could not be asked ({exc})"))
             continue
-        caches = _untracked_caches(tree)
         if why is None:
             going.append(tree)
             items = [Item(ENDED_WORKTREE, tree, cachedir.allocated_bytes(tree))]
         else:
             result.kept.append(Kept(ENDED_WORKTREE, tree, why))
             items = [Item(ENDED_WORKTREE_CACHE, c, cachedir.allocated_bytes(c)) for c in caches]
-        result.add(items, _reap_one(project, agent, trees, remove=why is None, caches=caches))
+        result.add(
+            items,
+            _reap_one(project, agent, trees, remove=why is None, caches=caches, roots=result.roots),
+        )
     unplaced = fleet_service._unplaced_trees_kept(trees.placed, trees.owners, trees.in_use)
     result.kept.extend(Kept(ENDED_WORKTREE, tree, why) for tree, why in unplaced)
     root, common, default = trees.root, trees.common, trees.default
@@ -421,6 +460,7 @@ def _reap_one(
     *,
     remove: bool,
     caches: list[Path],
+    roots: Roots,
 ) -> Callable[[], str | None]:
     def run() -> str | None:
         with store_session() as store:
@@ -436,6 +476,7 @@ def _reap_one(
                 trees.read_at,
                 remove=remove,
                 caches=caches,
+                allows=roots.allows,
             )
         if removed or not remove:
             return None if removed else kept
@@ -545,12 +586,24 @@ def _naming(store: ContextStore, session_id: str, every: list[FleetAgent]) -> li
     """The rows naming ``session_id``: its own, and the row it was before a ``/clear`` or a
     hand-over moved that row to another session (``store.FLEET_HELD``)."""
     rows = [row for row in every if row.session_id == session_id]
+    known = {row.id for row in rows}
+    # Read by its id too, whatever project lists it: a purged project's rows are listed by none.
+    found = store.fleet_agent_for_session(session_id)
+    if found is not None and found.id not in known:
+        rows.append(found)
+        known.add(found.id)
     holder = store.get_meta(f"{FLEET_HELD}{session_id}")
     if holder:
         row = store.get_fleet_agent(holder)
-        if row is not None and all(row.id != known.id for known in rows):
+        if row is None:
+            raise _HeldUnread(holder)
+        if row.id not in known:
             rows.append(row)
     return rows
+
+
+class _HeldUnread(Exception):
+    """A ``fleet-held:`` row that cannot be read: it HOLDS its session (review of #58)."""
 
 
 def _liveness(
@@ -560,7 +613,10 @@ def _liveness(
     every: list[FleetAgent],
     commands: list[str] | None,
 ) -> _Liveness:
-    rows = _naming(store, session_id, every)
+    try:
+        rows = _naming(store, session_id, every)
+    except _HeldUnread:
+        return _Liveness(held=True, ended_at=None, running=None, wrote=None)
     inside = _real(directory)
     working_there = inside is not None and any(
         (cwd := _real(row.cwd)) is not None and cwd.is_relative_to(inside)
@@ -574,8 +630,16 @@ def _liveness(
         transcript = _mtime(Path(session.transcript_path)) if session.transcript_path else None
         wrote = [session.last_seen_at, transcript]
         end = session.ended_at
-        if end is not None and all(
-            row.ended_at is not None and row.created_at <= end for row in rows
+        # An explicit end alone (review of #58, M2): every row naming it ended by rlx's word
+        # (ended_by: a stop, the agent's exit, reap), none made after the board's end. A board
+        # end with no such row (``team prune``'s idleness end, which records no cause) is none.
+        if (
+            end is not None
+            and rows
+            and all(
+                row.ended_at is not None and row.ended_by in EXPLICIT_ENDS and row.created_at <= end
+                for row in rows
+            )
         ):
             ended_at = end
     known = [moment for moment in wrote if moment is not None]
@@ -659,7 +723,7 @@ def _session_cache(tagged: Path, directory: Path) -> bool:
     the checkout it lies in."""
     if tagged == directory or tagged.parent == directory or _there(tagged / ".git"):
         return False
-    if not cachedir.is_cache(tagged):
+    if not cachedir.is_cache(tagged) or not cachedir.same_filesystem(tagged, directory):
         return False
     checkout = _enclosing_checkout(tagged.parent, directory)
     return checkout is None or not _tracked_inside(checkout, tagged)
@@ -671,9 +735,8 @@ def _session_caches(directory: Path, result: Plan) -> list[Path]:
     untracked build output is most of the space (the brief). Ignored roots are said."""
     found: list[Path] = []
     pending = [directory]
-    try:
-        device = os.lstat(directory).st_dev
-    except OSError:
+    device = cachedir._device(directory)
+    if device is None:
         return []
     while pending:
         here = pending.pop()
@@ -686,11 +749,8 @@ def _session_caches(directory: Path, result: Plan) -> list[Path]:
         if cachedir._is_bare_repository(here):
             continue
         for inner in _subdirs(here):
-            try:
-                if os.lstat(inner).st_dev != device:
-                    continue  # a mount: not walked, not freed
-            except OSError:
-                continue
+            if cachedir._device(inner) != device:
+                continue  # a mount (or unreadable): not walked, not freed (review of #58, M3)
             pending.append(inner)
     return sorted(found)
 
@@ -713,12 +773,19 @@ def _one_session(
             )
         )
     roots = result.roots
-    if not repositories and at - ended_at >= EVIDENCE_TTL:
+    if (
+        not repositories
+        and at - ended_at >= EVIDENCE_TTL
+        and _settled_a_week(directory, at)
+        and not cachedir.holds_repository(directory)  # nor a mount, which no rule crosses (M3)
+    ):
         whole = Item(SESSION_DIR, directory, cachedir.allocated_bytes(directory))
 
         def drop() -> str | None:
             if cachedir.holds_repository(directory):
                 return "skipped: a repository is there now"
+            if not _settled_a_week(directory, _now()):
+                return "skipped: something in it moved this week"
             _remove(directory, roots)
             return None
 
@@ -734,6 +801,14 @@ def _one_session(
             return None
 
         result.add([item], _guarded(session_id, directory, free))
+
+
+def _settled_a_week(directory: Path, at: datetime) -> bool:
+    """Whether nothing anywhere under ``directory`` moved for :data:`EVIDENCE_TTL` (a bounded,
+    link-free walk, ``cachedir.newest_mtime``; one it cannot finish is taken to have moved:
+    review of #58, M2), asked at the plan and again just before the directory goes."""
+    newest = cachedir.newest_mtime(directory)
+    return newest is not None and at - datetime.fromtimestamp(newest, UTC) >= EVIDENCE_TTL
 
 
 def _guarded(
@@ -827,6 +902,7 @@ def _idle_output(tree: Path, tagged: Path) -> bool:
     return (
         tagged != tree
         and cachedir.is_cache(tagged)
+        and cachedir.same_filesystem(tagged, tree)
         and not cachedir.holds_environment(tagged)
         and not _tracked_inside(tree, tagged)
     )
@@ -899,10 +975,20 @@ def _free_lock(path: Path, roots: Roots) -> Callable[[], str | None]:
         if not _stale_lock(path, _now()):
             return "skipped: the lock changed"
         try:
-            with holding(path, wait_s=0, mode=0o600):
+            fd = locking.open_lock_file(path, mode=0o600, create=False)
+        except OSError:
+            return "skipped: the lock is gone"
+        try:
+            with locking.held(fd, wait_s=0):
+                # The file locked is the one unlinked: a lock made anew at the name meanwhile
+                # is another mover's (review of #58, the lock inode race).
+                if os.fstat(fd).st_ino != os.lstat(path).st_ino:
+                    return "skipped: the lock was made anew"
                 _remove(path, roots)
         except TimeoutError:
             return "skipped: a move holds it"
+        finally:
+            os.close(fd)
         return None
 
     return run
