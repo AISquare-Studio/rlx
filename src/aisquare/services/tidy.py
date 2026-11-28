@@ -130,7 +130,7 @@ DELETES = sys.platform != "win32"
 """Whether tidy deletes here. Not on native Windows in 0.10.2 (manager #3647): it reports and
 lists, and removes nothing; the fleet there runs in WSL, where tidy deletes."""
 REPORTS_ONLY = (
-    "rlx tidy deletes nothing on native Windows in 0.10.2: the fleet runs in WSL, run it there"
+    "tidy only reports on native Windows in 0.10.2: the fleet runs in WSL, so run it there"
 )
 """What a report on native Windows says of each item it would free (:data:`DELETES`)."""
 
