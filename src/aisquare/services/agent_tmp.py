@@ -34,7 +34,7 @@ same list. A directory is ended when the process it was made for no longer runs,
 Liveness decides, never age alone; a paused agent's directory is never touched. Nothing
 outside ``<home>/tmp`` is removed, and a link is never followed. No git repository is ever
 removed (manager #3585, and on #57): an ended directory that holds one, or a folder that cannot
-be looked through, stays, and ``rlx tidy`` names it with its size.
+be looked through, stays, and ``rlx tidy`` names it (a repository with its size).
 """
 
 from __future__ import annotations
@@ -285,7 +285,7 @@ def sweep_ended(store: ContextStore | None = None, *, now: datetime | None = Non
     directory that cannot be removed is left for the next sweep. One that holds a git
     repository (a scratch clone with commits no ref has) or a folder that cannot be looked
     through stays, by ``rlx tidy``'s own test (``cachedir.holds_repository``): nothing of rlx's
-    deletes a repository, and tidy names it with its size."""
+    deletes a repository, and tidy names it (a repository with its size)."""
     removed: list[Path] = []
     for directory in ended_dirs(store, now=now):
         if cachedir.holds_repository(directory):
