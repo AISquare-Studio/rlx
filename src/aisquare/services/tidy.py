@@ -1529,6 +1529,14 @@ class DiskUse:
     def total(self) -> int:
         return self.worktrees + self.session_temp
 
+    @property
+    def as_of_clock(self) -> str | None:
+        """:attr:`as_of` on this machine's clock, ``HH:MM``: when the last pass began. A time
+        past, said here, by tidy, whose pass it was. A reset time to come is
+        ``format_reset``'s alone, as a distance and a clock (#152); the Doctor's rows spell no
+        clock of their own (``test_reset_formatter``)."""
+        return None if self.as_of is None else self.as_of.astimezone().strftime("%H:%M")
+
 
 @dataclass(frozen=True)
 class _Fresh:
