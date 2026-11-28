@@ -426,6 +426,13 @@ fn kill_tree(tree: &Tree) {
 ///   started at or after `started` is killed, one whose environment the OS hides
 ///   included (macOS hides an Apple binary's). Otherwise nothing is.
 ///
+/// Linux counts start times in clock ticks (10 ms at USER_HZ 100), so what the guard
+/// started may share its tick: "at or after" counts that tick in, or Claude Code started
+/// in it would be left behind. It takes in nothing older: session `pid` holds only what
+/// the guard started, none of which started before it. Membership is what decides; the
+/// start time keeps out only a later group that took the id, which the run's id tells
+/// apart when their ticks tie.
+///
 /// Only for a run of this boot ([`boot_id`]): across a reboot a pid, a group id and (on
 /// Linux) a start time may be anyone's. Whether it killed anything.
 #[cfg(unix)]
@@ -1161,6 +1168,24 @@ mod tests {
         !stat.trim().is_empty() && !stat.trim().starts_with('Z')
     }
 
+    /// A [`start_time`] one step of its clock after `started`: a clock tick on Linux, a
+    /// microsecond on macOS.
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    fn one_tick_after(started: &str) -> String {
+        match started.split_once('.') {
+            Some((sec, usec)) => {
+                let (sec, usec): (u64, u64) = (sec.parse().unwrap(), usec.parse().unwrap());
+                let (sec, usec) = if usec == 999_999 {
+                    (sec + 1, 0)
+                } else {
+                    (sec, usec + 1)
+                };
+                format!("{sec}.{usec:06}")
+            }
+            None => (started.parse::<u64>().unwrap() + 1).to_string(),
+        }
+    }
+
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     #[allow(unsafe_code)]
     #[test]
@@ -1196,20 +1221,14 @@ mod tests {
         // hides.
         let (group, both) = leaderless_group(true, Some("r1"));
         started.0.extend(both);
-        // Recorded as started after them, it is not the run's: nothing is killed.
-        // (A cat that waits on its stdin, so its start time can be read before it exits.)
-        let mut later = std::process::Command::new("cat")
-            .stdin(Stdio::piped())
-            .stdout(Stdio::null())
-            .spawn()
-            .unwrap();
-        let after = start_time(later.id()).unwrap();
-        drop(later.stdin.take());
-        later.wait().unwrap();
-        assert!(
-            start_key(&after) > start_key(&before),
-            "{after} after {before}"
-        );
+        let mut starts: Vec<String> = both.iter().map(|pid| start_time(*pid).unwrap()).collect();
+        starts.sort_by_key(|started| start_key(started));
+        // Recorded as started one tick after the newest of them, it is not the run's:
+        // nothing is killed. One tick past their own start time, so later at any clock's
+        // resolution; a process started after them could share their tick on Linux (10 ms
+        // at USER_HZ 100), as a cat did (run 46144197121).
+        let after = one_tick_after(&starts[1]);
+        assert!(start_key(&after) > start_key(&starts[1]), "{after}");
         assert!(
             !sweep(group, &after, "r1"),
             "processes started before the run are not the run's"
@@ -1217,8 +1236,10 @@ mod tests {
         for pid in both {
             assert!(runs(pid), "started before the run: runs on");
         }
+        // Recorded as started in the same tick as the older of them, they are the run's:
+        // a process that shares the run's tick is the run's, and is not left behind.
         assert!(
-            sweep(group, &before, "r1"),
+            sweep(group, &starts[0], "r1"),
             "the guard's group and session, with the run's id, are swept"
         );
         let gone = std::time::Instant::now() + std::time::Duration::from_secs(10);
