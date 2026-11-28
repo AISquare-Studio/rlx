@@ -22,14 +22,16 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - **`rlx tidy` frees the disk rlx's ended agents and sessions left** (their worktrees, temp
   files and build output, by the CACHEDIR.TAG standard), keeping any worktree with work
   found nowhere else and every git repository; `--dry-run` lists every path with its size
-  and why. On native Windows it only reports in 0.10.2; the fleet runs in WSL, where it
-  frees.
+  and why. Every run also deletes the build output in a live coder's worktree once that
+  coder has waited 24 hours with no task in progress (`[tidy] idle_build_hours = 24`; 0
+  turns it off); its next build is slower, not wrong. On native Windows it only reports in
+  0.10.2; the fleet runs in WSL, where it frees.
 - **The watcher runs `rlx tidy`'s rules on its own every hour** (`[tidy] every_minutes`),
-  one pass at a time and never during a home move, and says so on a board only when it frees
-  1 GB or more. On native Windows, where tidy only reports in 0.10.2, the watcher runs no
-  pass; the fleet runs in WSL, where it does.
+  idle coders' build output included, one pass at a time and never during a home move, and
+  says so on a board only when it frees 1 GB or more. On native Windows, where tidy only
+  reports in 0.10.2, the watcher runs no pass; the fleet runs in WSL, where it does.
 - **`rlx doctor` gains a disk row:** what rlx's worktrees, build caches and temp take, and
-  what `rlx tidy` would free, warning at 1 GB or more.
+  what `rlx tidy` would free, warning when that is 1 GB or more.
 - **Settings has a tmux page:** every window on rlx's tmux server and whose it is, with
   Open, Stop for windows no agent owns, and Adopt for a Claude Code or Codex left running
   outside the fleet; other tmux servers are listed read-only.
@@ -37,8 +39,9 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   something that needs you: how many, then the first with its project. F6 or a click opens
   that project's board on it; with nothing to show, it takes no space.
 - **A fleet's manager can be woken on a schedule** (`rlx fleet manager-policy manager_wake
-  schedule`): urgent news at once, routine news at most every 15 minutes (or N), read in one
-  turn; `team standby` now holds while tasks are in flight. Thanks to Arbind (arbind-ais).
+  schedule`): urgent news at once, routine news at most every `manager_pass_minutes` (15 by
+  default), read in one turn; `rlx team standby` now holds while tasks are in flight. Thanks
+  to Arbind (arbind-ais).
 - **Sidebar groups can now be renamed, deleted, pinned, collapsed and moved from their own
   menu** (⋯, right-click or `.`), and an empty group says so.
 - **Below 70 columns (SSH, phones) rlx shows the sidebar or the open view, one at a time;**
@@ -155,7 +158,7 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - **On Windows, answering yes to quit another rlx no longer fails with "has not quit within
   15 s"** when that rlx's registry record could not be deleted as it quit.
 - **A notification redrawn just as it was being dismissed no longer crashes rlx.**
-- **When attaching a persona can't be confirmed, rlx's message no longer tells you to run
+- **When attaching a persona can't be confirmed, the rlx app no longer tells you to run
   `aisquare log`.**
 - **A Codex agent spawned with Claude Code flags now starts.** `--effort` reaches Codex as
   its reasoning effort, `--model` and `--add-dir` pass as they are, and any flag Codex has
