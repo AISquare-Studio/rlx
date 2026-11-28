@@ -35,6 +35,7 @@ from aisquare.services import ci_client
 from aisquare.services import hooks as hooks_service
 from aisquare.services import project as project_service
 from tests import private_fleets, shards
+from tests.keychain_guard import rlx_keychain_guard
 from tests.usage_stats_support import Machine, pin_hook_clock
 
 SRC = Path(__file__).resolve().parents[1] / "src"
@@ -431,6 +432,10 @@ AMBIENT_ENV_VARS = (
 #: ``cli.launch.ROLES``' eight roles; tester, reviewer, manager and ui-tester
 #: were read and not cleared.
 AMBIENT_ENV_PREFIXES = ("AISQUARE_BIN_", "AISQUARE_MODEL_", "AISQUARE_EFFORT_")
+
+#: The Keychain guard's directory (``tests/keychain_guard``): first on every child's
+#: ``PYTHONPATH``, so its ``sitecustomize`` installs the guard there (:func:`keychain_guard`).
+KEYCHAIN_GUARD_DIR = str(Path(__file__).resolve().parent / "keychain_guard")
 
 #: The home the shell named, if it named one; ``None`` leaves the run to name its own
 #: for wherever no test's own home is in force (:func:`home_outside_a_test`).
@@ -1242,21 +1247,73 @@ def no_detached_root_worker(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(explainability, "_start_root_worker", refuse)
 
 
+@pytest.fixture(scope="session", autouse=True)
+def keychain_guard(tmp_path_factory: pytest.TempPathFactory) -> Iterator[Path]:
+    """No process of the run, the tests' own or a child they start, can run the real macOS
+    Keychain tool (#52; ``tests/keychain_guard/rlx_keychain_guard.py``).
+
+    A scratch home doesn't scope the Keychain. ``test_persona_import``'s Ctrl-C test ran the
+    real ``security find-generic-password -s "Claude Code-credentials"`` in the ``aisquare``
+    child it starts, which :func:`no_real_keychain` (this process only) never reached. So
+    the guard's audit hook goes into this process, and its directory goes first on
+    ``PYTHONPATH``: every Python child that inherits the run's environment loads its
+    ``sitecustomize``, and the hook with it. Each refusal is a line in the returned log,
+    which :func:`no_real_keychain` reads after each test.
+    """
+    log = tmp_path_factory.mktemp("keychain-guard", numbered=False) / "refusals.jsonl"
+    log.touch()
+    rlx_keychain_guard.install()
+    before = {name: os.environ.get(name) for name in ("PYTHONPATH", rlx_keychain_guard.LOG_VAR)}
+    paths = [KEYCHAIN_GUARD_DIR, *filter(None, (before["PYTHONPATH"] or "").split(os.pathsep))]
+    os.environ["PYTHONPATH"] = os.pathsep.join(paths)
+    os.environ[rlx_keychain_guard.LOG_VAR] = str(log)
+    yield log
+    for name, value in before.items():
+        if value is None:
+            os.environ.pop(name, None)
+        else:
+            os.environ[name] = value
+
+
+@pytest.fixture
+def keychain_fake_for_children(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Any:
+    """The suite's fake ``security`` (``tests/test_claude_keychain.py``'s ``FakeKeychain``,
+    no items) for every Python child this test starts with the run's environment: the
+    guard's ``sitecustomize`` points the child's ``claude_accounts.KEYCHAIN_TOOL`` at it.
+    For a test whose ``aisquare`` child picks an account, which on a Mac reads the
+    Keychain: without it the guard refuses the real tool and fails the test (#52)."""
+    from tests.test_claude_keychain import FakeKeychain
+
+    fake = FakeKeychain(tmp_path / "keychain-for-children")
+    monkeypatch.setenv(rlx_keychain_guard.FAKE_VAR, str(fake.tool))
+    return fake
+
+
 @pytest.fixture(autouse=True)
-def no_real_keychain(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
+def no_real_keychain(
+    monkeypatch: pytest.MonkeyPatch, request: pytest.FixtureRequest, keychain_guard: Path
+) -> Iterator[None]:
     """Never read the macOS Keychain of the machine the suite runs on.
 
     The credentials are read from the files the tests write, on every platform; a test of
-    the Keychain turns it on itself, with a fake ``security`` (tests/test_claude_keychain.py).
-    Run on a Mac, the plain account's item is the developer's own login.
+    the Keychain turns it on itself, with a fake ``security`` (tests/test_claude_keychain.py),
+    and a test whose child process reads it hands that child the fake through
+    ``RLX_TESTS_KEYCHAIN_TOOL``. Run on a Mac, the plain account's item is the developer's
+    own login. ``KEYCHAIN_TOOL`` points at the guard's sentinel, which the guard refuses
+    like the real tool: a test that reaches either, here or in a child, fails at teardown,
+    named, with what it ran (:func:`keychain_guard`).
     """
     from aisquare.core import claude_accounts as core
 
     monkeypatch.setattr(core, "keychain_platform", lambda: False)
-    monkeypatch.setattr(core, "KEYCHAIN_TOOL", os.devnull)
+    monkeypatch.setattr(core, "KEYCHAIN_TOOL", rlx_keychain_guard.SENTINEL)
     core.forget_keychain_reads()
+    start = keychain_guard.stat().st_size
     yield
     core.forget_keychain_reads()
+    refusals, _ = rlx_keychain_guard.read_log(keychain_guard, start)
+    if refusals:
+        pytest.fail(rlx_keychain_guard.failure(request.node.nodeid, refusals), pytrace=False)
 
 
 @pytest.fixture(autouse=True)

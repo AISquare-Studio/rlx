@@ -1346,10 +1346,17 @@ class _SetDuringTheRequest(threading.Event):
 
 
 @pytest.mark.skipif(os.name == "nt", reason="the stand-in is a POSIX shell script")
+@pytest.mark.usefixtures("keychain_fake_for_children")
 def test_ctrl_c_ends_the_import_and_its_claude_and_exits_130(tmp_path: Path) -> None:
     """#211: the CLI had no Ctrl-C handling, and the engine's ``claude -p`` (in the
     terminal's process group) was left to the signal. Now Ctrl-C ends it, and what it
-    started, writes nothing and exits 130. A real ``aisquare`` process, a real SIGINT."""
+    started, writes nothing and exits 130. A real ``aisquare`` process, a real SIGINT.
+
+    That process picks the manager's account, which on a Mac reads the Keychain: through
+    the suite's fake ``security`` (``keychain_fake_for_children``), never the real one
+    (#52). It ran the real ``security find-generic-password -s "Claude Code-credentials"``,
+    which reads a developer's own login; the suite's Keychain guard now refuses that and
+    fails the test."""
     script, pids = _stand_in_claude(tmp_path)
     notes = _notes(tmp_path)
     env = {**os.environ, "AISQUARE_BIN_MANAGER": str(script)}
