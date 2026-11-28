@@ -57,6 +57,8 @@ class Plans:
 
     items: list[tuple[str, int, str | None]] = field(default_factory=list)
     calls: list[datetime | None] = field(default_factory=list)
+    sized: list[bool] = field(default_factory=list)
+    """Each plan's ``size_kept``."""
 
 
 @pytest.fixture(autouse=True)
@@ -72,8 +74,9 @@ def the_real_job(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
 def plans(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Plans:
     made = Plans()
 
-    def plan(*, now: datetime | None = None) -> tidy.Plan:
+    def plan(*, now: datetime | None = None, size_kept: bool = True) -> tidy.Plan:
         made.calls.append(now)
+        made.sized.append(size_kept)
         result = tidy.Plan()
         for n, (rule, size, board) in enumerate(made.items):
             path = tmp_path / "freed" / f"pass-{len(made.calls)}-{n}"
@@ -169,6 +172,7 @@ def test_a_pass_runs_at_most_every_every_minutes(plans: Plans) -> None:
     assert tidy.periodic_pass(T0 + timedelta(minutes=60)) is not None
     assert plans.calls == [T0, T0 + timedelta(minutes=60)]
     assert tidy.read_stamp()["last_pass_at"] == (T0 + timedelta(minutes=60)).isoformat()
+    assert plans.sized == [False, False], "no pass walks the repositories tidy keeps"
 
 
 @posix_only
@@ -224,10 +228,10 @@ def test_two_watchers_at_once_run_one_pass(plans: Plans, monkeypatch: pytest.Mon
     faked = tidy.plan
     started, second_done = threading.Event(), threading.Event()
 
-    def slow(*, now: datetime | None = None) -> tidy.Plan:
+    def slow(*, now: datetime | None = None, size_kept: bool = True) -> tidy.Plan:
         started.set()
         assert second_done.wait(10)
-        return faked(now=now)
+        return faked(now=now, size_kept=size_kept)
 
     monkeypatch.setattr(tidy, "plan", slow)
     results: dict[str, tidy.PassReport | None] = {}
@@ -349,7 +353,7 @@ def test_a_board_that_will_not_take_the_line_costs_the_pass_nothing(
 def test_a_pass_that_raises_is_one_note_and_is_tried_again_an_interval_on(
     plans: Plans, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    def broken(*, now: datetime | None = None) -> tidy.Plan:
+    def broken(*, now: datetime | None = None, size_kept: bool = True) -> tidy.Plan:
         plans.calls.append(now)
         raise RuntimeError("the store is busy")
 

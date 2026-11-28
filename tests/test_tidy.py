@@ -1552,3 +1552,18 @@ def test_a_git_bundle_is_a_repository_tidy_never_deletes(tmp_path: Path, repo: P
     assert [k.bytes for k in made.kept if k.path == bundle] == [cachedir.allocated_bytes(bundle)]
     tidy.apply(made)
     assert bundle.is_file() and inside.is_file() and not lookalike.exists()
+
+
+def test_a_plan_without_kept_sizes_walks_no_kept_repository(tmp_path: Path, repo: Path) -> None:
+    """#59's periodic job plans without them: a repository tidy never deletes is never walked
+    again each pass. A person's dry run still shows them."""
+    session = session_dir()
+    clone = _clone(repo, session / "scratchpad" / "clone")
+    aged(session, 3 * HOUR)
+
+    sized = planned(tmp_path)
+    unsized = tidy.plan(size_kept=False)
+
+    [with_size] = [k.bytes for k in sized.kept if k.path == clone]
+    assert with_size is not None and with_size > 0
+    assert [k.bytes for k in unsized.kept if k.path == clone] == [None]

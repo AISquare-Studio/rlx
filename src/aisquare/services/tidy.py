@@ -279,6 +279,8 @@ class Plan:
     ignored: list[Path] = field(default_factory=list)
     """Roots whose CACHEDIR.TAG authorises nothing (:data:`ROOT_TAG`), said apart from what is
     kept, so a freed tree is never also named under ``kept`` (tester #3577, m1)."""
+    size_kept: bool = True
+    """Whether a kept repository is listed with its size (:func:`plan`'s ``size_kept``)."""
 
     @property
     def bytes(self) -> int:
@@ -311,9 +313,11 @@ class Report:
         return sum(item.bytes for item in self.freed)
 
 
-def plan(*, now: datetime | None = None) -> Plan:
+def plan(*, now: datetime | None = None, size_kept: bool = True) -> Plan:
     """Every path ``rlx tidy`` would free now, with its rule and size, and every path a rule
-    keeps, with why. Reads only: nothing is deleted, and no lock is taken."""
+    keeps, with why. Reads only: nothing is deleted, and no lock is taken. ``size_kept``: a
+    kept repository's size, for a person deciding what to remove by hand; the periodic job
+    (#59) asks without, or each pass would walk again every repository tidy never deletes."""
     at = now or _now()
     config = _settings()
     with store_session() as store:
@@ -321,7 +325,10 @@ def plan(*, now: datetime | None = None) -> Plan:
         # Liveness from every row there is, a forgotten project's too (review of #58, M2):
         # forgetting refuses only live rows, so a paused agent can sit in one.
         every = _every_row(store)
-        result = Plan(roots=_roots(projects, store.list_projects(all=True, include_forgotten=True)))
+        result = Plan(
+            roots=_roots(projects, store.list_projects(all=True, include_forgotten=True)),
+            size_kept=size_kept,
+        )
         commands = _command_lines()
         for project in projects:
             _ended_worktrees(store, project, result)
@@ -801,7 +808,7 @@ def _one_session(
                 SESSION_CHECKOUT,
                 repository,
                 NEVER_A_REPOSITORY,
-                cachedir.allocated_bytes(repository),
+                cachedir.allocated_bytes(repository) if result.size_kept else None,
             )
         )
     roots = result.roots
@@ -1148,7 +1155,7 @@ def periodic_pass(now: datetime | None = None) -> PassReport | None:
         if not is_due(at, every):
             return None  # one ran between the first look and the lock
         try:
-            made = plan(now=at)
+            made = plan(now=at, size_kept=False)
             done = apply(made)
         except BaseException:
             _write_stamp({"last_pass_at": at.isoformat(timespec="seconds"), "failed": True})
