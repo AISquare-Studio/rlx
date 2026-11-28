@@ -43,9 +43,23 @@ def reset_settings() -> Path | None:
 
     ``None`` when there was nothing to reset — no file, or one that holds no setting —
     and nothing moved: every setting is at its default already. See
-    ``core.config.reset_config``.
+    ``core.config.reset_config``, which keeps ``[service]``: the person's choice about the
+    rlx service's login item (the manager's decision on #33), read from the file's text when
+    it does not parse. When nothing of it could be read, the choice is recorded as the OS has
+    it for the default home, so no later init adds an item the person had turned off (review
+    of #33, round 3), as ``init --reinit --yes`` does.
     """
-    return core_config.reset_config()
+    try:
+        load_config()
+        unreadable = False
+    except Exception:  # what reset_config is the repair of
+        unreadable = True
+    backup = core_config.reset_config()
+    if backup is not None and unreadable:
+        from aisquare.services import service_login
+
+        service_login.record_from_the_item()
+    return backup
 
 
 def ui_settings() -> UiSettings:

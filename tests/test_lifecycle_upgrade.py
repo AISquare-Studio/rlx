@@ -4655,6 +4655,28 @@ def test_a_move_to_a_release_with_no_service_leaves_it_stopped_and_says_so(
     monkeypatch.setattr(service_host, "stop_service", lambda **_: True)
     monkeypatch.setattr(service_host, "start_service", lambda **kw: started.append(kw))
 
+    # Set to start at login (S2, #33): on that release, its item would run a command it does
+    # not have at every login, and the OS would start it again every few seconds (M1).
+    from aisquare.services import service_login
+
+    service_login.register_at_login()
+    item = service_login.item_path("launchd")
+    assert item.is_file()
+    forget = service_login.forget_at_login
+    install = install_route.run_installer
+    order: list[str] = []
+
+    def forget_in_order() -> service_login.Taken:
+        order.append("forget")
+        return forget()
+
+    def install_in_order(argv: Any, **kw: Any) -> int:
+        order.append("install")
+        return install(argv, **kw)
+
+    monkeypatch.setattr(service_login, "forget_at_login", forget_in_order)
+    monkeypatch.setattr(install_route, "run_installer", install_in_order)
+
     result = runner.invoke(app, ["--json", "upgrade", "--yes"])
 
     assert result.exit_code == 0, result.output
@@ -4662,3 +4684,222 @@ def test_a_move_to_a_release_with_no_service_leaves_it_stopped_and_says_so(
     notes = _one_object(result.stdout)["notes"]
     said = f"the rlx service stays stopped: {machine.new_version} has no rlx service"
     assert said in notes, notes
+    assert not item.exists(), "the login item goes with the move back"
+    assert service_login.read_choice() is None
+    assert order[:2] == ["forget", "install"], order
+    gone = f"the rlx service no longer starts at login: {machine.new_version} has no rlx service"
+    assert gone in notes, notes
+
+
+def test_a_move_forward_refreshes_the_login_item_and_keeps_it(
+    runner: CliRunner, tool: Tool, machine: Machine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Every path but an explicit install only refreshes the login item (design #1875): the
+    upgrade rewrites one that is there with the PATH it runs under, and leaves the choice."""
+    from aisquare.services import service_login
+
+    machine.latest = LatestRelease("0.10.2")
+    machine.new_version = "0.10.2"
+    monkeypatch.setenv("PATH", os.pathsep.join(("/opt/before", "/usr/bin")))
+    service_login.register_at_login()
+    item = service_login.item_path("launchd")
+    monkeypatch.setenv("PATH", os.pathsep.join(("/opt/after", "/usr/bin")))
+
+    result = runner.invoke(app, ["--json", "upgrade", "--yes"])
+
+    assert result.exit_code == 0, result.output
+    # By the install now in place, in a process of its own, as its hooks are (#2140, nit).
+    python = str(tool.facts.executable)
+    assert [python, "-P", "-m", "aisquare", "service", "refresh"] in machine.captured
+    assert service_login.read_choice() is True
+    assert item.is_file()
+
+
+def test_a_move_back_that_fails_puts_the_login_item_back(
+    runner: CliRunner, tool: Tool, machine: Machine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The item goes before the installer; an installer that fails leaves this release, with
+    its service, in place, and so its item comes back (reviewer of #33, round 2)."""
+    from aisquare.services import service_login
+
+    service_login.register_at_login()
+    item = service_login.item_path("launchd")
+    machine.installer_exit = 1
+    machine.new_version = "0.10.2"  # what the failed install left: this release
+
+    result = runner.invoke(app, ["--json", "upgrade", "--yes"])
+
+    assert result.exit_code != 0
+    assert _one_object(result.stdout)["error"] == "upgrade_failed", result.stdout
+    assert item.is_file(), "the item taken away for the move is back"
+    assert service_login.read_choice() is True
+
+
+def _a_failed_move_back(machine: Machine) -> None:
+    machine.installer_exit = 1
+    machine.new_version = "0.10.2"  # what the failed install left: this release
+
+
+def test_a_failed_move_back_keeps_an_item_removed_in_the_os_removed(
+    runner: CliRunner, tool: Tool, machine: Machine
+) -> None:
+    """(b) of #2309: on, the item removed in the OS, then a move back that fails: the choice is
+    kept, so the next init does not add back what the person removed."""
+    from aisquare.services import service_login
+
+    service_login.register_at_login()
+    service_login.item_path("launchd").unlink()
+    _a_failed_move_back(machine)
+
+    result = runner.invoke(app, ["--json", "upgrade", "--yes"])
+    again = runner.invoke(app, ["init", "--local", "--yes", "--no-onboard"])
+
+    assert result.exit_code != 0 and again.exit_code == 0, again.output
+    assert service_login.read_choice() is True
+    assert not service_login.item_path("launchd").exists()
+
+
+def test_a_failed_move_back_turns_on_no_item_the_os_had_off(
+    runner: CliRunner,
+    tool: Tool,
+    machine: Machine,
+    no_real_login_item: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """(c) of #2309, Linux: a unit disabled in the OS was enabled again and started by the
+    put-back, which was an explicit install. It is put back as it was: disabled."""
+    from aisquare.services import service_login
+
+    monkeypatch.setattr(service_login, "_platform", lambda: "linux")
+    monkeypatch.setattr(service_login, "_systemd_runs", lambda: True)
+    service_login.register_at_login()
+    no_real_login_item.reply("systemctl", "--user", "is-enabled", code=1, said="disabled")
+    no_real_login_item.calls.clear()
+    _a_failed_move_back(machine)
+
+    result = runner.invoke(app, ["--json", "upgrade", "--yes"])
+
+    assert result.exit_code != 0
+    assert service_login.item_path("systemd").is_file()
+    assert service_login.read_choice() is True
+    enables = [call for call in no_real_login_item.calls if "enable" in call]
+    assert enables == [], enables
+
+
+@pytest.mark.parametrize(
+    "ran",
+    [
+        pytest.param(False, id="stopped"),
+        # Only a start that runs reaches the OS, and service_host.start_service refuses on
+        # native Windows before it asks (as test_service_at_login's start through the OS).
+        pytest.param(
+            True,
+            id="running",
+            marks=pytest.mark.skipif(
+                sys.platform == "win32",
+                reason="service_host.start_service refuses on native Windows",
+            ),
+        ),
+    ],
+)
+def test_a_failed_move_back_starts_the_service_only_if_the_upgrade_stopped_it(
+    runner: CliRunner,
+    tool: Tool,
+    machine: Machine,
+    no_real_login_item: Any,
+    monkeypatch: pytest.MonkeyPatch,
+    ran: bool,
+) -> None:
+    """The manager's decision #2927: the put back loaded the agent again, which starts it
+    (``RunAtLoad``), whether or not the service ran before the upgrade. It starts nothing now;
+    the upgrade starts again only the service it stopped, through the OS: the agent put back is
+    loaded, once."""
+    from aisquare.services import service_host, service_login
+
+    service_login.register_at_login()
+    item = service_login.item_path("launchd")
+    target = f"gui/501/{service_login.label()}"
+    no_real_login_item.reply("launchctl", "print", target, code=113, said="Could not find")
+    monkeypatch.setattr(service_host, "stop_service", lambda **_: ran)
+    answers: list[Any] = [None, None]
+
+    def running(**_: Any) -> Any:
+        return answers.pop(0) if answers else _a_service(4242, "0.10.2")
+
+    monkeypatch.setattr(service_host, "running_service", running)
+    _a_failed_move_back(machine)
+    no_real_login_item.calls.clear()
+
+    result = runner.invoke(app, ["--json", "upgrade", "--yes"])
+
+    assert result.exit_code != 0 and item.is_file(), result.output
+    starts = [
+        call
+        for call in no_real_login_item.calls
+        if call[:2] in (("launchctl", "bootstrap"), ("launchctl", "kickstart"))
+    ]
+    assert starts == ([("launchctl", "bootstrap", "gui/501", str(item))] if ran else [])
+
+
+@pytest.mark.parametrize("pin", [(), ("--version", "0.9.1")], ids=["latest", "pinned"])
+def test_a_move_back_the_installer_did_not_make_puts_the_login_item_back(
+    runner: CliRunner, tool: Tool, machine: Machine, pin: tuple[str, ...]
+) -> None:
+    """Reviewer of #33, round 4: the installer exits 0, but the release in place has the service
+    (one other than asked for, or this one still): the items taken away for the move stayed
+    away, and the forward refresh never makes one. They are put back as they were."""
+    from aisquare.services import service_login
+
+    service_login.register_at_login()
+    item = service_login.item_path("launchd")
+    body = item.read_bytes()
+    machine.new_version = "0.10.2"  # not the 0.9.1 the move was to
+
+    result = runner.invoke(app, ["--json", "upgrade", *pin, "--yes"])
+
+    assert item.is_file() and item.read_bytes() == body, result.output
+    assert service_login.read_choice() is True
+    reported = _one_object(result.stdout)
+    if pin:  # a pin uv did not honour fails, and a failure's JSON carries no notes
+        assert reported["error"] == "upgrade_not_confirmed", result.stdout
+    else:
+        put_back = (
+            "the rlx service's login items, taken away for the move, were put back as they were"
+        )
+        assert put_back in reported["notes"], result.stdout
+
+
+@pytest.mark.skipif(not can_deny_reads(), reason="chmod(0) denies nothing here (root, or NTFS)")
+@pytest.mark.parametrize("fails", [False, True], ids=["moved", "failed"])
+def test_a_move_back_over_an_item_whose_file_cannot_be_read_ends_in_json(
+    runner: CliRunner,
+    tool: Tool,
+    machine: Machine,
+    monkeypatch: pytest.MonkeyPatch,
+    fails: bool,
+) -> None:
+    """NEW-1 of #2877: ``rlx --json upgrade`` to 0.9.1 over a ``chmod 000`` plist exited 1 on a
+    PermissionError, with no JSON. The item is taken away all the same; a move that fails cannot
+    put it back, and leaves the ON forgotten for the next init to add again."""
+    from aisquare.services import service_host, service_login
+
+    monkeypatch.setattr(service_host, "stop_service", lambda **_: False)
+    service_login.register_at_login()
+    item = service_login.item_path("launchd")
+    item.chmod(0)
+    if fails:
+        _a_failed_move_back(machine)
+
+    result = runner.invoke(app, ["--json", "upgrade", "--yes"])
+
+    assert (result.exit_code != 0) is fails, result.output
+    reported = _one_object(result.stdout)
+    assert not item.exists()
+    assert service_login.read_choice() is None
+    if fails:
+        assert reported["error"] == "upgrade_failed", result.stdout
+    else:
+        gone = (
+            f"the rlx service no longer starts at login: {machine.new_version} has no rlx service"
+        )
+        assert gone in reported["notes"], result.stdout

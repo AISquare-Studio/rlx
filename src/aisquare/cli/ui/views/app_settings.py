@@ -123,6 +123,7 @@ from aisquare.cli.ui.dont_ask import ASK_AGAIN, EVERY_ACTION_ASKS, said_not_aski
 from aisquare.cli.ui.save_model import UNDO_BINDING, UNDO_SAID, CommitInput, SavesAsYouGo
 from aisquare.cli.ui.sidebar import short_path
 from aisquare.cli.ui.views.settings_captain import ExperimentalSection
+from aisquare.cli.ui.views.start_at_login import StartAtLogin
 from aisquare.core import claude_accounts as accounts_core
 from aisquare.core import experimental, paths, personas
 from aisquare.core.agent_adapters import adapters, get_adapter
@@ -1304,6 +1305,9 @@ class AppSettingsView(SavesAsYouGo, Vertical):
                 id="preferences-from-a-shell",
                 classes="about",
             )
+        # Under Advanced, which three more lines above pushed a scroll down at 80x24: the rlx
+        # service's login item (S2, #33), the OS's, not the file's, so a widget of its own.
+        yield StartAtLogin(id="settings-start-at-login")
         from aisquare.cli.ui.views.settings_tray import TrayToggle  # its own module (#34)
 
         yield TrayToggle(id="settings-tray")
