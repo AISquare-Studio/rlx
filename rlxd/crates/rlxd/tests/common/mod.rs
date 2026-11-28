@@ -721,38 +721,70 @@ fn kill(pid: u64) -> bool {
         .is_ok_and(|status| status.success())
 }
 
-/// rlxd, built as a release is (`cargo build --release`): without the features that only
-/// rlxd's dev-dependency on itself turns on for the tests, `debug-methods` and
-/// `gate-dev-mode`. The executable cargo reports, in the workspace's own target folder,
-/// so rlxd.yml's later `cargo build --release` finds it done. Set `CARGO_BUILD_JOBS` to
-/// bound it.
+/// What `cargo build --release -p rlxd --bins` made: [`release_build`].
+pub struct ReleaseBuild {
+    /// The rlxd executable cargo reports, in the workspace's own target folder.
+    pub rlxd: PathBuf,
+    /// Every binary of the package the build made, by name.
+    pub binaries: Vec<String>,
+}
+
+/// rlxd's binaries, built as a release builds them (`cargo build --release`): without the
+/// features that only rlxd's dev-dependency on itself turns on for the tests,
+/// `debug-methods`, `gate-dev-mode` and `fake-claude`. In the workspace's own target
+/// folder, so rlxd.yml's later `cargo build --release` finds it done. Set
+/// `CARGO_BUILD_JOBS` to bound it.
+///
+/// Built ONCE per test process, the first caller building while the others wait. Each
+/// `cargo build` links `target/release/rlxd` afresh, removing it first, even when nothing
+/// changed, so a build while another test runs that rlxd pulls it from under it: its
+/// `serve --detach` could not start its own path again (ENOENT, #2568), and on Windows a
+/// running rlxd.exe cannot be removed.
+pub fn release_build() -> &'static ReleaseBuild {
+    static BUILT: std::sync::OnceLock<ReleaseBuild> = std::sync::OnceLock::new();
+    BUILT.get_or_init(|| {
+        let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
+        let output = std::process::Command::new(cargo)
+            .args([
+                "build",
+                "--release",
+                "--locked",
+                "--package",
+                "rlxd",
+                "--bins",
+                "--message-format=json-render-diagnostics",
+            ])
+            .current_dir(workspace())
+            .stdin(std::process::Stdio::null())
+            .stderr(std::process::Stdio::inherit())
+            .output()
+            .expect("cargo runs");
+        assert!(output.status.success(), "cargo build --release failed");
+        let built: Vec<(String, PathBuf)> = String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+            .filter(|message| message["reason"] == "compiler-artifact")
+            .filter_map(|message| {
+                let name = message["target"]["name"].as_str()?.to_owned();
+                let executable = message["executable"].as_str()?;
+                Some((name, PathBuf::from(executable)))
+            })
+            .collect();
+        let rlxd = built
+            .iter()
+            .find_map(|(name, executable)| (name == "rlxd").then(|| executable.clone()))
+            .expect("cargo names the rlxd executable it built");
+        ReleaseBuild {
+            rlxd,
+            binaries: built.into_iter().map(|(name, _)| name).collect(),
+        }
+    })
+}
+
+/// The rlxd of [`release_build`].
 ///
 /// Under `cargo test --release` that is the path of this test build's rlxd too, which it
 /// then replaces: a test calls this before it runs or copies `CARGO_BIN_EXE_rlxd`.
 pub fn release_rlxd() -> PathBuf {
-    let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
-    let output = std::process::Command::new(cargo)
-        .args([
-            "build",
-            "--release",
-            "--locked",
-            "--package",
-            "rlxd",
-            "--bin",
-            "rlxd",
-            "--message-format=json-render-diagnostics",
-        ])
-        .current_dir(workspace())
-        .stdin(std::process::Stdio::null())
-        .stderr(std::process::Stdio::inherit())
-        .output()
-        .expect("cargo runs");
-    assert!(output.status.success(), "cargo build --release failed");
-    String::from_utf8_lossy(&output.stdout)
-        .lines()
-        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
-        .filter(|message| message["reason"] == "compiler-artifact")
-        .filter(|message| message["target"]["name"] == "rlxd")
-        .find_map(|message| message["executable"].as_str().map(PathBuf::from))
-        .expect("cargo names the rlxd executable it built")
+    release_build().rlxd.clone()
 }

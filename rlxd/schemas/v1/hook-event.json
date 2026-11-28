@@ -9,7 +9,7 @@
       "type": "string"
     },
     "run_id": {
-      "description": "The run the hook belongs to, for a run's `pre-tool-use` (5.1).",
+      "description": "The run the hook belongs to. A run's `pre-tool-use` (5.1), the one hook that names\na run, publishes no event, so no event rlxd publishes today carries it.",
       "type": "string",
       "minLength": 1
     },

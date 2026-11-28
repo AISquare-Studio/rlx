@@ -145,9 +145,10 @@ pub enum RunNote {
     },
 }
 
+pub use gate::Ask;
 pub(crate) use gate::claude_server_name;
 #[cfg(feature = "debug-methods")]
-pub use gate::{Ask, HOOK_KEY_ENV, output as hook_output};
+pub use gate::{HOOK_KEY_ENV, output as hook_output};
 
 /// The runner of one rlxd.
 pub struct Runner {
@@ -1691,10 +1692,17 @@ impl Runner {
                 "run {}: its connectors are signed in again; its needs-you is cleared",
                 run.params.run_id
             );
-            self.clear_needs_you(&mut inner);
+            // Durable before published: the record holds the needs-you no more before
+            // anyone hears it is cleared, so a client that reads the run then, or the next
+            // rlxd after a crash between the two, never finds it still out.
+            inner.auth.clear();
+            let needs_you = inner.needs_you.take();
             let record = run.record(&inner);
             if let Err(e) = blocking(|| run.dir.write_record(&record)) {
                 warning!("run {}: its record was not written: {e}", run.params.run_id);
+            }
+            if let Some(id) = needs_you {
+                self.publish_needs_you(run_types::NEEDS_YOU_CLEARED, &NeedsYouClearedData::new(id));
             }
         }
     }

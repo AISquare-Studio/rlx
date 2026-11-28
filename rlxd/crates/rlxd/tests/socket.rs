@@ -297,6 +297,34 @@ fn a_forward_whose_host_runs_no_rlxd_says_to_start_it_there() {
     assert!(run.stderr.contains("rlxd here --start"), "{run:?}");
 }
 
+/// The same, from a host that resets the connection rather than closing it: it reads the
+/// first byte of the hello and closes with the rest unread, so the client's read is a
+/// reset on Linux (on macOS, an end of file). Either way the hint says to start rlxd there.
+/// The other ways a close shows, "not connected" on macOS among them, are cli.rs's unit
+/// test: they depend on when the close lands.
+#[cfg(unix)]
+#[test]
+fn a_forward_whose_host_resets_the_connection_says_to_start_it_there() {
+    use std::io::Read;
+
+    let client = TestHome::new();
+    let forward = client.root().join("fwd.sock");
+    let listener = std::os::unix::net::UnixListener::bind(&forward).unwrap();
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let mut stream = stream.unwrap();
+            let _ = stream.read(&mut [0_u8; 1]);
+            drop(stream);
+        }
+    });
+    let forward = forward.display().to_string();
+    let run = client.rlxd(&["call", "--socket", &forward, "--token", "t", "status"]);
+    assert_eq!(run.code(), Some(1), "{run:?}");
+    assert_eq!(run.error_code(), "disconnected", "{run:?}");
+    let hint = text(&run.json()["error"]["hint"]).to_owned();
+    assert!(hint.contains("rlxd here --start"), "{hint}");
+}
+
 #[cfg(unix)]
 #[test]
 fn a_close_after_hello_was_answered_is_no_forward_hint() {

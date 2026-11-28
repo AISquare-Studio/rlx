@@ -270,6 +270,11 @@ impl Daemon {
         &self.home
     }
 
+    /// The runner, whose gate decides each run's tool calls.
+    pub fn runner(&self) -> &Arc<Runner> {
+        &self.runner
+    }
+
     /// Ends every PTY's process, as rlxd stops: none outlives it.
     pub fn end_ptys(&self) {
         self.ptys.kill_all();
@@ -540,7 +545,7 @@ impl Daemon {
                 Err(refused) => Err(refused),
             },
             methods::HOOK => match cli_only(session, methods::HOOK) {
-                Ok(()) => crate::hooks::hook(self, request.params).await,
+                Ok(()) => crate::hooks::hook(self, Arc::clone(&session.peer), request.params).await,
                 Err(refused) => Err(refused),
             },
             methods::EVENTS_SUBSCRIBE => match self.subscribe(id, request.params) {

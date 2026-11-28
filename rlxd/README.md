@@ -306,12 +306,18 @@ rlxd runs Claude Code headless, with no tmux and no PTY (handoff 0.10.3, 2.1, 2.
   (`RLXD_CLAUDE_BIN`, from rlxd's own environment only, else `claude` on rlxd's `PATH`).
   Its environment is rlxd's own until 4.3 passes the app's.
 - **Each attempt's settings** hold one PreToolUse hook (matcher `*`) running `rlxd-hook
-  pre-tool-use --run <run_id> --attempt <n>` by the absolute path of the `rlxd-hook`
-  beside rlxd (quoted when it must be; on Windows in forward slashes, always quoted),
-  with a timeout of `deadline_ms / 1000 + 10` s. When rlxd can't name that path,
-  `run.start` refuses `hook_not_found`; it never falls back to a name on `PATH`. Its
-  requests are decided by the tool-call gate below; until rlxd-hook's pre-tool-use is
-  wired to it, `rlxd-hook` denies every call.
+  pre-tool-use --run <run_id> --attempt <n> --deadline-ms <deadline_ms>` by the absolute
+  path of the `rlxd-hook` beside rlxd (quoted when it must be; on Windows in forward
+  slashes, always quoted), with a timeout of `deadline_ms / 1000 + 10` s. When rlxd can't
+  name that path, `run.start` refuses `hook_not_found`; it never falls back to a name on
+  `PATH`. Its requests are decided by the tool-call gate below. rlxd-hook reads the
+  attempt's key from its `RLXD_HOOK_KEY` and sends it as `hook`'s `hook_key` only (never
+  with the hook's variables, never on its stdout or stderr), and rlxd binds the request to
+  the run's live attempt by that key and by the process that connected. Its own timer is
+  `deadline_ms` and 5 s, past the gate's deadline and below Claude Code's timeout for the
+  hook. It prints rlxd's reply only when it is the gate's allow or deny; anything else (no
+  run or key on its side, no rlxd, a refusal, a dropped connection, a reply it can't
+  read, its timer) is a deny.
 - **Stdin stays open**: the prompt is a stream-json user message, and stdin closes only
   after the `result`. Each stream-json line becomes `run.started`, `run.text` (and
   partial chunks under `partial`), `run.tool_result` (content up to 1 MiB, then
@@ -657,7 +663,8 @@ Every tool call of every run is decided by rlxd (handoff 0.10.3, 5.1), the
   from the connection's own process, and `debug.drop_hook_connections`, which ends every
   hook connection waiting on the gate. With `RLXD_TEST_HOOK` set, each run's settings name
   rlxd itself as the hook (the hidden `rlxd __test-hook pre-tool-use`, which asks
-  `debug.pre_tool_use`), so fake-claude's gate scenarios run a real hook command.
+  `debug.pre_tool_use`); without it, they name the real rlxd-hook beside rlxd
+  (`tests/hook_gate.rs`).
   `RLXD_TEST_FAIL_LEDGER=<space>` fails the ledger writes of that space's runs. A
   release build has none of these, nor their names.
 

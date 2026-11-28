@@ -749,7 +749,8 @@ fn each_attempt_has_its_own_settings_with_the_absolute_hook() {
     let hook = &settings["hooks"]["PreToolUse"][0];
     assert_eq!(hook["matcher"], "*");
     let command = hook["hooks"][0]["command"].as_str().unwrap();
-    let rest = format!(" pre-tool-use --run {r} --attempt 1");
+    // The run's deadline_ms too, for rlxd-hook's own timer (5.1).
+    let rest = format!(" pre-tool-use --run {r} --attempt 1 --deadline-ms 1000");
     assert!(command.ends_with(&rest), "{command}");
     let program = command.strip_suffix(&rest).unwrap().trim_matches('"');
     assert!(Path::new(program).is_absolute(), "{command}");
