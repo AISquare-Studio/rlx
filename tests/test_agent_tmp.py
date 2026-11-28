@@ -50,6 +50,7 @@ from aisquare.core.store import store_session
 from aisquare.models import FleetAgent, LaunchSpec, ProjectInfo
 from aisquare.services import agent_tmp, store_broker, tidy, usage_stats
 from aisquare.services import fleet as fleet_service
+from tests import conftest
 from tests import test_fleet_service as fleet_suite
 from tests import test_launch as launch_suite
 from tests.test_fleet_service import FakeTmux, _git
@@ -549,8 +550,10 @@ def test_a_socket_in_tmp_path_binds_under_a_real_length_agent_dir(
 ) -> None:
     """The brief's proof. The agent directory a real home gives (``~/.rlx/tmp/<key>``) is
     padded to this machine's length; a child pytest run with it as TMPDIR binds a socket in
-    ``tmp_path`` from a test whose name is at pytest's 30-character cap."""
-    real = len(os.fsencode(Path.home() / ".rlx" / "tmp" / "abc234"))
+    ``tmp_path`` from a test whose name is at pytest's 30-character cap. The length is the
+    developer's home's, as the run found it (each test's own ``HOME`` is a sandbox, #54):
+    only its length is read, nothing in it."""
+    real = len(os.fsencode(conftest._DEVELOPERS_HOME / ".rlx" / "tmp" / "abc234"))
     assert real <= agent_tmp.MAX_BYTES, f"the real path is {real} bytes"
     directory = short_home / ("d" * (real - len(os.fsencode(short_home)) - 1))
     directory.mkdir(mode=0o700)
