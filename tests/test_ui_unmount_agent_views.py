@@ -27,11 +27,10 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import pytest
-from textual.message import Message
 from textual.pilot import Pilot
 from textual.widget import Widget
 from textual.widgets import Button
-from textual.worker import Worker, active_worker
+from textual.worker import Worker, WorkerState, active_worker
 
 from aisquare.cli.ui.app import FleetApp, HelpScreen, Panes
 from aisquare.cli.ui.sidebar import AgentSelected, ProjectSelected
@@ -603,41 +602,45 @@ def test_a_view_whose_pause_still_runs_waits_and_its_answer_is_still_said(
     assert f"⏸ coder-00 paused: {KEPT}." in seen["told"]  # type: ignore[operator]
 
 
-class _Unhandled(Message):
-    """A message a view has been sent and has not handled yet."""
+def test_a_workers_answer_queued_on_a_view_as_it_goes_is_still_handled(
+    tmp_path: Path, script: Script, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A worker that has just finished has its answer queued on its view, and the view may go
+    before it is handled: a frame's removal does not wait for a quiet queue, which its
+    widgets' own layout traffic kept from coming (#644 round 3, CI 46097779329). Textual
+    handles what a widget has queued before the ``Prune`` its removal posts behind it, so the
+    answer is still handled: here a pause's, whose toast is said. A Restart's answer is the
+    shell's ``AgentRestarted``, posted as the view handles it, and bubbles the same way."""
+    live = coder(0)
+    two_projects(tmp_path, script, live)
 
+    def pause_agent(project: ProjectInfo, label: str, **_: object) -> fleet_service.StopReceipt:
+        return fleet_service.StopReceipt(ended(live.agent), [], None)
 
-def test_a_view_with_a_message_not_yet_handled_waits(tmp_path: Path, script: Script) -> None:
-    """A worker that has just finished has its answer queued on its view, and a Restart's or
-    a Move's answer is the shell's ``AgentRestarted``, which the view posts as it handles it.
-    While anything is queued on the view or in it, the view is not left."""
-    two_projects(tmp_path, script, coder(0))
+    monkeypatch.setattr(fleet_service, "pause_agent", pause_agent)
+    paused = f"⏸ coder-00 paused: {KEPT}."
 
-    async def go(pilot: Pilot[None]) -> tuple[list[str], list[str], list[str]]:
+    async def go(pilot: Pilot[None]) -> tuple[int, int, list[str]]:
         app = fleet_app(pilot)
-        view = await open_agent(app, coder(0))
-        await leave_for(app, "prj_b")
-        app.sidebar.focus()
-        # A worker of the view's held across the frame that brings the stopped row, so that
-        # frame cannot take the view (its own reads alone may end before its removal looks,
-        # or not: a race on a loaded machine). Let go, and settled, which reads no frame.
-        release = hold(view)
-        script["prj_a"] = [coder(0, "exited")]
-        await refreshed(app)
-        await refreshed(app)
-        release.set()
+        told = toast_log.record(app)
+        view = await open_agent(app, live)
+        worker = start_pause(view, live.agent)
+        await worker.wait()
         await settle(app)
-        idle = [str(v.id) for v in app._views_left()]
-        view.pane.post_message(_Unhandled())  # … and no await: still queued in the view
-        queued = [str(v.id) for v in app._views_left()]
+        once = told.count(paused)
+        await leave_for(app, "prj_b")
+        # Its answer again, queued on the view, and the view removed at once, its Prune
+        # posted behind the answer.
+        view.post_message(Worker.StateChanged(worker, WorkerState.SUCCESS))
+        await app._remove_views([view])
         del view
-        await tick(app)
-        return idle, queued, mounted(app)
+        await settle(app)
+        return once, told.count(paused), mounted(app)
 
-    idle, queued, after = drive(go)
-    assert idle == [view_of(coder(0))], "the premise: nothing queued, the view is left"
-    assert queued == [], "a message still queued in the view keeps it"
-    assert after == []
+    once, after, left = drive(go)
+    assert once == 1, "the premise: the pause said so once"
+    assert after == 2, "the answer queued as the view went was still handled"
+    assert left == []
 
 
 def test_a_worker_finishing_after_its_view_went_raises_nothing(

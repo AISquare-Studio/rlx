@@ -2599,12 +2599,17 @@ class FleetApp(SelectionHost, inherit_bindings=False):
           lost, and a quit would no longer wait for its write. The frame that brings the
           stopped row starts the labels' and the task's reads itself (``refresh_status``), so
           the view goes at the frame after it;
-        - a message still queued on it or in it: a worker that has just finished has its
-          answer waiting there, and a Restart's or a Move's answer is the shell's
-          ``AgentRestarted``, which the view posts as it handles it;
         - the keyboard in it while a dialog is up: the dialog gives the keyboard back to it
           as it closes. With no dialog up, the keyboard leaves it first
           (:meth:`_keyboard_from`).
+
+        A worker that has just finished keeps nothing: its answer is already queued on its
+        widget, and Textual handles every message a widget has queued before the ``Prune``
+        its removal posts behind them, and goes on until the close that ``Prune`` queues in
+        turn. So a pause's toast is said, and a Restart's or a Move's ``AgentRestarted``,
+        which the view posts as it handles the answer, still bubbles to the shell. Waiting
+        for a quiet queue instead kept a view for frame after frame of its widgets' own
+        layout traffic (#644, round 3: CI 46097779329).
         """
         content = self.content
         under_a_dialog = content.screen.focused if self.screen is not content.screen else None
@@ -2613,7 +2618,6 @@ class FleetApp(SelectionHost, inherit_bindings=False):
             view
             for view in self._views_stopped_off_screen()
             if not any(_inside(node, view) for node in (under_a_dialog, *busy))
-            and not any(node.message_queue_size for node in view.walk_children(with_self=True))
         ]
 
     async def _remove_views_left(self) -> None:
