@@ -528,7 +528,7 @@ def test_a_repository_made_in_an_agents_dir_is_a_throwaway() -> None:
     assert paths.agent_tmp_root() in usage_stats._ephemeral_roots()
 
 
-# --- macOS: a socket bound in pytest's tmp_path under a real-length TMPDIR fits ---------
+# --- a socket bound in pytest's tmp_path fits under the TMPDIR a launch leaves ----------
 
 
 @pytest.fixture
@@ -544,20 +544,47 @@ def short_home() -> Iterator[Path]:
         shutil.rmtree(made, ignore_errors=True)
 
 
-@pytest.mark.skipif(sys.platform != "darwin", reason="macOS's 104-byte sun_path")
-def test_a_socket_in_tmp_path_binds_under_a_real_length_agent_dir(
-    short_home: Path, tmp_path: Path
-) -> None:
-    """The brief's proof. The agent directory a real home gives (``~/.rlx/tmp/<key>``) is
-    padded to this machine's length; a child pytest run with it as TMPDIR binds a socket in
-    ``tmp_path`` from a test whose name is at pytest's 30-character cap. The length is the
-    developer's home's, as the run found it (each test's own ``HOME`` is a sandbox, #54):
-    only its length is read, nothing in it."""
-    real = len(os.fsencode(conftest._DEVELOPERS_HOME / ".rlx" / "tmp" / "abc234"))
-    assert real <= agent_tmp.MAX_BYTES, f"the real path is {real} bytes"
-    directory = short_home / ("d" * (real - len(os.fsencode(short_home)) - 1))
+@pytest.fixture
+def tiny_root() -> Iterator[Path]:
+    """A directory under ``/tmp`` as short as one can be, NOT resolved: ``prepare`` measures
+    the home it is named verbatim, so a home under it gives agent directories from 27 bytes up
+    (a person's is 28-29). Removed after."""
+    if sys.platform == "win32":
+        pytest.skip("no /tmp, and no socket cap on Windows")
+    made = Path(tempfile.mkdtemp(prefix="h", dir="/tmp"))
+    try:
+        yield made
+    finally:
+        shutil.rmtree(made, ignore_errors=True)
+
+
+#: The agent directory of a home as long as a person's (``/Users/runner/.rlx/tmp/abc234``).
+A_PERSONS = 29
+
+#: The agent directory of a fleet checker's 172-byte scratch home (reviewer #4016).
+A_CHECKERS = 172 + len("/.rlx/tmp/abc234")
+
+#: The ``USER`` the child pytest runs as. It names ``pytest-of-<USER>`` in the socket's path,
+#: so the run's own (one of 16 characters already failed, reviewer #4031) would make the
+#: result depend on who runs it. CI's runners are ``runner``.
+A_USER = "runner"
+
+
+def _a_dir_of(length: int, under: Path) -> Path:
+    """A new directory under ``under`` whose path is ``length`` bytes, or the shortest one under
+    it can be: a socket that binds under a longer path binds under the shorter one too."""
+    pad = max(length - len(os.fsencode(under)) - 1, 1)
+    directory = under / ("d" * pad)
     directory.mkdir(mode=0o700)
-    assert len(os.fsencode(directory)) == real
+    return directory
+
+
+def _a_socket_in_tmp_path_under(
+    tmpdir: Path, short_home: Path, tmp_path: Path
+) -> subprocess.CompletedProcess[str]:
+    """A child pytest run as :data:`A_USER` with ``tmpdir`` as TMPDIR, binding a socket in
+    ``tmp_path`` from a test whose name is at pytest's 30-character cap: the run, for the test
+    to judge."""
     suite = tmp_path / "suite"
     suite.mkdir()
     (suite / "test_bind.py").write_text(
@@ -574,17 +601,120 @@ def test_a_socket_in_tmp_path_binds_under_a_real_length_agent_dir(
     env = {
         "PATH": os.environ.get("PATH", ""),
         "HOME": str(short_home),
-        "TMPDIR": str(directory),
-        "USER": os.environ.get("USER", "runner"),
+        "TMPDIR": str(tmpdir),
+        "USER": A_USER,
         "PYTEST_DISABLE_PLUGIN_AUTOLOAD": "1",
     }
-    done = subprocess.run(
+    return subprocess.run(
         [sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider", "-c", os.devnull,
          "--rootdir", str(suite), str(suite / "test_bind.py")],
         cwd=suite, env=env, capture_output=True, text=True, timeout=120,
     )  # fmt: skip
-    assert done.returncode == 0, done.stdout + done.stderr
-    assert "1 passed" in done.stdout
+
+
+def _bound(done: subprocess.CompletedProcess[str]) -> bool:
+    return done.returncode == 0 and "1 passed" in done.stdout
+
+
+def _prepared_at(
+    length: int, root: Path, monkeypatch: pytest.MonkeyPatch
+) -> tuple[str | None, dict[str, str], dict[str, str], int]:
+    """``prepare`` under a home (``RLX_HOME``, under ``root``) whose agent directories are
+    ``length`` bytes, or the shortest ``root`` allows: the branch depends on the length alone,
+    at most :data:`agent_tmp.MAX_BYTES` or over. Returns its line, the agent's env, this
+    process's environ (a stand-in) and the length measured."""
+    shortest = len(os.fsencode(root)) + len("/h/tmp/abc234")
+    length = max(length, shortest)
+    home = root / ("h" * (length - shortest + 1))
+    monkeypatch.setenv(paths.RLX_HOME_ENV, str(home))
+    assert len(os.fsencode(paths.agent_tmp_dir("abc234"))) == length
+    monkeypatch.setattr(tempfile, "tempdir", tempfile.tempdir)
+    env = {"TMPDIR": "/inherited"}
+    environ: dict[str, str] = {}
+    return agent_tmp.prepare(env, environ=environ), env, environ, length
+
+
+def _its_own(said: str | None, env: dict[str, str], length: int) -> bool:
+    """``prepare``'s own-dir branch: no line, and TMPDIR its own directory of ``length``."""
+    own = Path(env.get("TMPDIR", ""))
+    return (
+        said is None
+        and own.parent == paths.agent_tmp_root()
+        and own.is_dir()
+        and len(os.fsencode(own)) == length
+    )
+
+
+def _the_inherited_one(
+    said: str | None, env: dict[str, str], environ: dict[str, str], length: int
+) -> bool:
+    """``prepare``'s fallback: its one line, naming ``length``, the agent's TMPDIR and this
+    process's environ as they were, nothing made under the home."""
+    return (
+        said is not None
+        and said.startswith("agent temp: ")
+        and f"would be {length} bytes, over the {agent_tmp.MAX_BYTES} " in said
+        and said.endswith("it keeps the inherited one")
+        and env == {"TMPDIR": "/inherited"}
+        and environ == {}
+        and not paths.agent_tmp_root().exists()
+    )
+
+
+@posix
+def test_at_the_developers_home_length_prepare_takes_its_branch(
+    tiny_root: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """At the developer's home's length, as the run found it (each test's own ``HOME`` is a
+    sandbox, #54; only its length is read, nothing in it): an agent directory of at most
+    :data:`agent_tmp.MAX_BYTES` is the agent's own, a longer one (every fleet checker's
+    scratch home) keeps the inherited TMPDIR (#66). A home shorter than a scratch one can be
+    is measured at the shortest (27 bytes): the same branch.
+
+    Whether a socket fits is proved apart, at a person's length and under the fallback
+    (``test_both_lengths_of_home_take_a_socket_whoever_runs_them``). Between them lies a band
+    this does not bind in: an agent directory of 39-49 bytes (a 23-33-byte home) is the
+    agent's own, yet a socket in pytest's ``tmp_path`` under it (about 65 bytes more as
+    ``runner``) is past macOS's 104-byte ``sun_path``. That is no worse than macOS's own
+    ``TMPDIR`` (49 bytes, which ``MAX_BYTES`` is), where the same socket fails the same way:
+    ``MAX_BYTES`` promises a directory no longer than that one, not a socket that fits.
+    """
+    real = len(os.fsencode(conftest._DEVELOPERS_HOME / ".rlx" / "tmp" / "abc234"))
+    said, env, environ, measured = _prepared_at(real, tiny_root, monkeypatch)
+    if real <= agent_tmp.MAX_BYTES:
+        assert _its_own(said, env, measured), f"a {real}-byte agent dir: {said} {env}"
+    else:
+        assert measured == real
+        assert _the_inherited_one(said, env, environ, real), f"a {real}-byte agent dir: {said}"
+
+
+@posix
+@pytest.mark.parametrize(
+    "length",
+    [A_PERSONS, agent_tmp.MAX_BYTES + 1, A_CHECKERS],
+    ids=["a person's home: its own", "a byte too long: the inherited one", "a checker's home"],
+)
+def test_both_lengths_of_home_take_a_socket_whoever_runs_them(
+    length: int,
+    short_home: Path,
+    tiny_root: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Both branches at lengths padded here, so neither depends on who runs the suite (#66):
+    ``prepare``'s branch at ``length``, then a socket in ``tmp_path`` (the child as
+    :data:`A_USER`). At a person's length the agent's own directory takes it. Over
+    :data:`agent_tmp.MAX_BYTES` the inherited TMPDIR is kept, and the socket binds under a
+    stand-in for it of a person's length too, so that bind repeats the first one: what is
+    proved there is that the fallback leaves the socket where it was before rlx."""
+    said, env, environ, measured = _prepared_at(length, tiny_root, monkeypatch)
+    assert measured == length, "the premise: a scratch home of exactly that length"
+    if length <= agent_tmp.MAX_BYTES:
+        assert _its_own(said, env, length), f"a {length}-byte agent dir: {said} {env}"
+    else:
+        assert _the_inherited_one(said, env, environ, length), f"a {length}-byte dir: {said}"
+    done = _a_socket_in_tmp_path_under(_a_dir_of(A_PERSONS, short_home), short_home, tmp_path)
+    assert _bound(done), f"a {A_PERSONS}-byte TMPDIR: " + done.stdout + done.stderr
 
 
 def test_the_socket_bind_itself_needs_no_room_beyond_sun_path(short_home: Path) -> None:
