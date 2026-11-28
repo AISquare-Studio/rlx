@@ -28,7 +28,7 @@ from aisquare.cli.app import app
 from aisquare.core import cachedir, claude_accounts, paths, process_table
 from aisquare.core.config import TidySettings
 from aisquare.core.locking import holding
-from aisquare.core.store import store_session
+from aisquare.core.store import FLEET_HELD, store_session
 from aisquare.models import FleetAgent, ProjectInfo, TeamSession
 from aisquare.services import fleet as fleet_service
 from aisquare.services import tidy
@@ -102,27 +102,29 @@ def aged(path: Path, ago: timedelta) -> None:
     os.utime(path, (when, when))
 
 
-def session_dir(slot: int = 2, session: str | None = None, *, ended: bool = True) -> Path:
+def session_dir(
+    slot: int = 2, session: str | None = None, *, ended: timedelta | None = 3 * HOUR
+) -> Path:
     """A Claude session's temp under the accounts' temp root, as Claude Code lays it out under
-    the ``CLAUDE_CODE_TMPDIR`` rlx gives a managed slot. ``ended``: its board row says it ended
-    (the positive evidence tidy needs, review of #58 M1), its last hook a month ago; without,
-    no row and no word that it ended."""
+    the ``CLAUDE_CODE_TMPDIR`` rlx gives a managed slot. ``ended``: how long ago its board row
+    says it ended, its last hook then too (the current positive evidence tidy needs, review of
+    #58 M1 and M-a); ``None``: no row and no word that it ended."""
     name = session or str(uuid.uuid4())
     found = claude_accounts.tmp_root() / str(slot) / "claude-501" / "-Users-someone-code-repo"
     found = found / name
     (found / "scratchpad").mkdir(parents=True)
     (found / "scratchpad" / "notes.md").write_text("what the reviewer wrote\n", encoding="utf-8")
-    if ended:
-        month_ago = datetime.now(UTC) - 30 * timedelta(days=1)
+    if ended is not None:
+        when = datetime.now(UTC) - ended
         with store_session() as store:
             store.upsert_session(
                 TeamSession(
                     id=name,
                     project_id=BOARD,
                     role="reviewer",
-                    started_at=month_ago,
-                    last_seen_at=month_ago,
-                    ended_at=month_ago,
+                    started_at=when,
+                    last_seen_at=when,
+                    ended_at=when,
                 )
             )
         assert stored_ended(name), "inserted ended: end_session would stamp now"
@@ -144,7 +146,7 @@ def row(project: ProjectInfo, session: str, **fields: object) -> FleetAgent:
         role=str(fields.pop("role", "reviewer")),
         pane_id="%9",
         session_id=session,
-        cwd=project.root,
+        cwd=fields.pop("cwd", project.root),
         created_at=datetime.now(UTC) - 5 * HOUR,
         **fields,
     )
@@ -197,15 +199,16 @@ def _scratch_worktree(repo: Path, where: Path) -> Path:
     return where
 
 
-def test_a_scratch_worktree_with_a_commit_no_ref_has_is_kept_and_named_its_cache_freed(
+def test_a_scratch_worktree_is_kept_with_its_size_and_only_its_build_output_goes(
     tmp_path: Path, repo: Path, project: ProjectInfo
 ) -> None:
+    """rlx won't delete a repository (manager #3585): a session's checkout is listed under kept
+    with its size, whatever it holds; its untracked build output goes."""
     session = session_dir()
     checkout = _scratch_worktree(repo, session / "scratchpad" / "wt")
     (checkout / "probe.txt").write_text("a probe\n", encoding="utf-8")
     _git("add", "probe.txt", cwd=checkout)
     _git("commit", "-q", "-m", "only here", cwd=checkout)
-    sha = _git("rev-parse", "HEAD", cwd=checkout)
     target = tag(checkout / "target")
     _git("config", "status.showUntrackedFiles", "no", cwd=checkout)  # hides nothing from tidy
     aged(session, 3 * HOUR)
@@ -214,28 +217,25 @@ def test_a_scratch_worktree_with_a_commit_no_ref_has_is_kept_and_named_its_cache
 
     assert rules(made) == {target: tidy.SESSION_CACHE}
     (kept,) = [k for k in made.kept if k.path == checkout]
-    assert kept.rule == tidy.SESSION_CHECKOUT and sha[:12] in kept.why, kept
+    assert kept.rule == tidy.SESSION_CHECKOUT and kept.why == tidy.NEVER_A_REPOSITORY
+    assert kept.bytes is not None and kept.bytes > 0
     tidy.apply(made)
     assert not target.exists() and (checkout / "probe.txt").is_file()
     assert str(checkout) in _git("worktree", "list", cwd=repo)
 
 
-def test_a_clean_scratch_worktree_goes_through_git_and_leaves_the_repos_list(
+def test_even_a_clean_scratch_worktree_is_kept(
     tmp_path: Path, repo: Path, project: ProjectInfo
 ) -> None:
     session = session_dir()
     checkout = _scratch_worktree(repo, session / "scratchpad" / "wt")
-    tag(checkout / "target")  # untracked build output on a branch with no .gitignore for it
     aged(session, 3 * HOUR)
 
     made = planned(tmp_path)
 
-    assert rules(made) == {checkout: tidy.SESSION_CHECKOUT}
-    report = tidy.apply(made)
-    assert [i.path for i in report.freed] == [checkout] and report.not_freed == []
-    assert not checkout.exists()
-    assert str(checkout) not in _git("worktree", "list", cwd=repo)
-    assert (session / "scratchpad" / "notes.md").is_file()
+    assert made.items == [] and checkout in {k.path for k in made.kept}
+    tidy.apply(made)
+    assert checkout.is_dir() and str(checkout) in _git("worktree", "list", cwd=repo)
 
 
 def test_a_scratch_checkout_with_a_tracked_change_is_kept(
@@ -252,7 +252,7 @@ def test_a_scratch_checkout_with_a_tracked_change_is_kept(
     made = planned(tmp_path)
 
     assert made.items == []
-    assert [(k.path, k.why) for k in made.kept] == [(checkout, "uncommitted changes")]
+    assert [(k.path, k.why) for k in made.kept] == [(checkout, tidy.NEVER_A_REPOSITORY)]
 
 
 # --- F1 of #3507: a checkout whose repository goes with it keeps what no REMOTE has ------------
@@ -279,82 +279,52 @@ def _kept_why(made: tidy.Plan, path: Path) -> str:
     return why
 
 
-@pytest.mark.parametrize("age", [3 * HOUR, 8 * timedelta(days=1)], ids=["3 h", "8 d"])
-def test_a_clone_with_a_commit_on_no_remote_is_kept_however_old_its_session(
-    tmp_path: Path, repo: Path, age: timedelta
+@pytest.mark.parametrize(
+    "form", ["unpushed", "another branch", "a stash", "all on its remote", "8 days"]
+)
+def test_a_clone_in_a_session_is_never_deleted_whatever_it_holds(
+    tmp_path: Path, repo: Path, form: str
 ) -> None:
-    """Tester #3507's data loss: the commit sat on the clone's own ``main``, which goes with it."""
-    session = session_dir()
-    clone = _clone(repo, session / "scratchpad" / "clone")
-    sha = _commit(clone, "only-here.txt")
-    aged(session, age)
-
-    made = planned(tmp_path)
-
-    assert clone not in rules(made) and session not in rules(made)
-    why = _kept_why(made, clone)
-    assert sha[:12] in why and "on no remote" in why and "push" in why, why
-    tidy.apply(made)
-    assert _git("cat-file", "-t", sha, cwd=clone) == "commit"
-
-
-def test_a_clone_whose_other_branch_has_a_commit_on_no_remote_is_kept(
-    tmp_path: Path, repo: Path
-) -> None:
-    session = session_dir()
-    clone = _clone(repo, session / "scratchpad" / "clone")
-    _git("switch", "-q", "-c", "side", cwd=clone)
-    sha = _commit(clone, "side.txt")
-    _git("switch", "-q", "main", cwd=clone)  # HEAD itself is on the remote
-    aged(session, 3 * HOUR)
-
-    why = _kept_why(planned(tmp_path), clone)
-
-    assert sha[:12] in why and "push" in why, why
-
-
-def test_a_clone_with_a_stash_is_kept(tmp_path: Path, repo: Path) -> None:
+    """Round 2's F1 forms, and the control that went then: every clone is kept now, with its size
+    and the way to remove it by hand, and the session around it stays."""
     (repo / "tracked.txt").write_text("v1\n", encoding="utf-8")
     _git("add", "tracked.txt", cwd=repo)
     _git("commit", "-q", "-m", "tracked", cwd=repo)
-    session = session_dir()
+    session = session_dir(ended=8 * timedelta(days=1) if form == "8 days" else 3 * HOUR)
     clone = _clone(repo, session / "scratchpad" / "clone")
-    (clone / "tracked.txt").write_text("work in progress\n", encoding="utf-8")
-    _git("stash", "-q", cwd=clone)
-    aged(session, 3 * HOUR)
+    if form in ("unpushed", "8 days"):
+        _commit(clone, "only-here.txt")
+    elif form == "another branch":
+        _git("switch", "-q", "-c", "side", cwd=clone)
+        _commit(clone, "side.txt")
+        _git("switch", "-q", "main", cwd=clone)
+    elif form == "a stash":
+        (clone / "tracked.txt").write_text("work in progress\n", encoding="utf-8")
+        _git("stash", "-q", cwd=clone)
+    aged(session, 8 * timedelta(days=1) if form == "8 days" else 3 * HOUR)
+    before = every_path(clone)
 
-    assert _kept_why(planned(tmp_path), clone).startswith("a stash"), "kept for its stash"
+    made = planned(tmp_path)
+    tidy.apply(made)
+
+    assert made.items == [] and _kept_why(made, clone) == tidy.NEVER_A_REPOSITORY
+    assert every_path(clone) == before
 
 
-def test_a_worktree_whose_repository_is_inside_the_session_counts_only_remotes(
+def test_a_repository_inside_a_session_and_its_worktree_are_both_kept(
     tmp_path: Path, repo: Path
 ) -> None:
-    """Its commit is on a branch of a repository that goes with the session: no remote has it."""
-    session = session_dir()
+    session = session_dir(ended=8 * timedelta(days=1))
     inner = _clone(repo, session / "scratchpad" / "repo")
     tree = session / "scratchpad" / "wt"
     _git("worktree", "add", "-q", "-b", "feature", str(tree), cwd=inner)
-    sha = _commit(tree, "feature.txt")
+    _commit(tree, "feature.txt")
     aged(session, 8 * timedelta(days=1))
 
     made = planned(tmp_path)
 
-    assert session not in rules(made) and tree not in rules(made)
-    why = _kept_why(made, tree)
-    assert sha[:12] in why and "on no remote" in why, why
-
-
-def test_a_clone_with_everything_on_its_remote_goes(tmp_path: Path, repo: Path) -> None:
-    """The control: nothing of it lives only there."""
-    session = session_dir()
-    clone = _clone(repo, session / "scratchpad" / "clone")
-    aged(session, 3 * HOUR)
-
-    made = planned(tmp_path)
-
-    assert rules(made) == {clone: tidy.SESSION_CHECKOUT}
-    tidy.apply(made)
-    assert not clone.exists()
+    assert made.items == []
+    assert {inner, tree} <= {k.path for k in made.kept}
 
 
 # --- C2 of review #3522: a tag never authorises a root, nor anything holding a .git ----------
@@ -364,21 +334,20 @@ def test_a_clone_with_everything_on_its_remote_goes(tmp_path: Path, repo: Path) 
 def test_a_tagged_scratchpad_authorises_nothing_and_hides_no_checkout(
     tmp_path: Path, repo: Path, by: str
 ) -> None:
-    """A build pointed at the scratchpad tags its root: the tag is ignored and said so, and the
-    checkouts in it are judged by git alone, one kept for its unpushed commit, one gone through
-    git."""
+    """A build pointed at the scratchpad tags its root: the tag is ignored, said apart from what
+    is kept, and the checkouts in it are found and kept."""
     session = session_dir()
     scratchpad = tag(session / "scratchpad", files=1)
     unpushed = _clone(repo, scratchpad / "unpushed")
-    sha = _commit(unpushed, "only-here.txt")
+    _commit(unpushed, "only-here.txt")
     clean = _clone(repo, scratchpad / "clean")
     aged(session, 3 * HOUR)
 
     made = planned(tmp_path)
 
-    assert rules(made) == {clean: tidy.SESSION_CHECKOUT}, by
-    assert sha[:12] in _kept_why(made, unpushed)
-    assert tidy.Kept(tidy.SESSION_CACHE, scratchpad, tidy.ROOT_TAG) in made.kept
+    assert made.items == [], by
+    assert {unpushed, clean} <= {k.path for k in made.kept}
+    assert scratchpad in made.ignored and scratchpad not in {k.path for k in made.kept}
     tidy.apply(made)
     assert (scratchpad / "notes.md").is_file() and (unpushed / "only-here.txt").is_file()
 
@@ -387,34 +356,33 @@ def test_a_tag_at_a_live_coders_tree_root_never_takes_the_tree(
     tmp_path: Path, tmux: object, claude_on_path: Path, project: ProjectInfo
 ) -> None:
     """``pytest -o cache_dir=.`` tags a tree's root: only the build output strictly inside goes,
-    and the tree, its files and its .venv stay."""
+    and the tree, its files and its .venv stay. The root's tag is said apart from ``kept``."""
     _agent, tree = _idle_coder_tree(project, waited=25 * HOUR)
     (tree / cachedir.TAG).write_bytes(TAG)
 
     made = planned(tmp_path)
 
     assert rules(made) == {tree / "target": tidy.IDLE_BUILD_CACHE}
-    assert tidy.Kept(tidy.IDLE_BUILD_CACHE, tree, tidy.ROOT_TAG) in made.kept
+    assert tree in made.ignored and tree not in {k.path for k in made.kept}
     tidy.apply(made)
     assert (tree / "notes.txt").is_file() and (tree / ".venv").is_dir()
 
 
-def test_a_tracked_tag_is_judged_by_git_never_by_the_tag(tmp_path: Path, repo: Path) -> None:
-    """A repository that tracks a CACHEDIR.TAG at its root, and a tagged folder of tracked files:
-    in a kept checkout of it, neither is build output."""
+def test_a_tracked_tagged_folder_is_never_build_output(tmp_path: Path, repo: Path) -> None:
+    """A repository that tracks a CACHEDIR.TAG at its root and a tagged folder of tracked files:
+    in a session's checkout of it, neither goes; the checkout is kept."""
     (repo / cachedir.TAG).write_bytes(TAG)
     vendored = tag(repo / "vendor" / "cache", files=1)
     _git("add", "-f", cachedir.TAG, str(vendored.relative_to(repo)), cwd=repo)
     _git("commit", "-q", "-m", "tracked tags", cwd=repo)
     session = session_dir()
     checkout = _scratch_worktree(repo, session / "scratchpad" / "wt")
-    (checkout / "wip.txt").write_text("uncommitted\n", encoding="utf-8")
     aged(session, 3 * HOUR)
 
     made = planned(tmp_path)
 
-    assert made.items == []
-    assert _kept_why(made, checkout) == "uncommitted changes"
+    assert made.items == [] and checkout in made.ignored
+    assert _kept_why(made, checkout) == tidy.NEVER_A_REPOSITORY
 
 
 def test_a_tagged_folder_holding_a_repository_is_no_build_output(
@@ -446,38 +414,55 @@ def test_cachedir_never_counts_a_root_or_a_tagged_folder_holding_a_git(tmp_path:
 def test_a_session_with_no_word_that_it_ended_is_never_ended_by_idleness(
     tmp_path: Path,
 ) -> None:
-    quiet = session_dir(ended=False)
+    quiet = session_dir(ended=None)
     tag(quiet / "scratchpad" / "target")
     aged(quiet, 3 * HOUR)
 
     assert planned(tmp_path).items == []
 
 
-def test_a_session_with_no_word_that_it_ended_ages_out_whole_after_a_week_alone(
+def test_only_a_session_ended_a_week_ago_with_no_repository_goes_whole(
     tmp_path: Path, repo: Path
 ) -> None:
-    """Without evidence, only the evidence TTL ages it out, and only with nothing git keeps."""
-    empty = session_dir(ended=False)
-    aged(empty, 8 * timedelta(days=1))
-    holding = session_dir(ended=False)
+    """The whole directory goes on evidence that it ended a week ago, and only when no repository
+    is in it; with no evidence, never."""
+    week = 8 * timedelta(days=1)
+    empty = session_dir(ended=week)
+    aged(empty, week)
+    silent = session_dir(ended=None)
+    aged(silent, week)
+    holding = session_dir(ended=week)
     clone = _clone(repo, holding / "scratchpad" / "clone")
-    _commit(clone, "only-here.txt")
-    tag(holding / "scratchpad" / "target")
-    aged(holding, 8 * timedelta(days=1))
+    cache = tag(holding / "scratchpad" / "target")
+    aged(holding, week)
 
     made = planned(tmp_path)
 
-    assert rules(made) == {empty: tidy.SESSION_DIR}
+    assert rules(made) == {empty: tidy.SESSION_DIR, cache: tidy.SESSION_CACHE}
     assert clone in {k.path for k in made.kept}
 
 
-def test_rows_that_have_all_ended_are_evidence_enough(tmp_path: Path, project: ProjectInfo) -> None:
-    session = session_dir(ended=False)
-    row(project, session.name, ended_at=datetime.now(UTC) - 3 * HOUR)
-    cache = tag(session / "scratchpad" / "target")
+@pytest.mark.parametrize("how", ["rows ended, no board word", "a row made after its end"])
+def test_stale_or_missing_evidence_ends_no_session(
+    tmp_path: Path, project: ProjectInfo, how: str
+) -> None:
+    """Review of #58, M-a: ended rows alone are no evidence, and a row made after the board's
+    end (a resume) means it is not ended now."""
+    if how == "rows ended, no board word":
+        session = session_dir(ended=None)
+        row(project, session.name, ended_at=datetime.now(UTC) - 3 * HOUR)
+    else:
+        session = session_dir(ended=5 * HOUR)
+        resumed = row(project, session.name, ended_at=datetime.now(UTC) - 3 * HOUR)
+        assert resumed.created_at > datetime.now(UTC) - 6 * HOUR
+        with store_session() as store:
+            store.upsert_fleet_agent(
+                resumed.model_copy(update={"created_at": datetime.now(UTC) - 4 * HOUR})
+            )
+    tag(session / "scratchpad" / "target")
     aged(session, 3 * HOUR)
 
-    assert rules(planned(tmp_path)) == {cache: tidy.SESSION_CACHE}
+    assert planned(tmp_path).items == []
 
 
 def test_a_paused_row_in_a_forgotten_project_still_holds_its_session(
@@ -491,6 +476,169 @@ def test_a_paused_row_in_a_forgotten_project_still_holds_its_session(
     aged(session, 3 * HOUR)
 
     assert planned(tmp_path).items == []
+
+
+# --- round 3 (review #3584, manager #3585): no repository is ever deleted --------------------
+
+
+@pytest.mark.parametrize("nested", ["an ignored clone", "a submodule's .git file"])
+def test_reap_keeps_a_tree_that_holds_any_repository_but_its_own(
+    tmp_path: Path, tmux: object, claude_on_path: Path, project: ProjectInfo, nested: str
+) -> None:
+    """C-a: a repository git ignores, or a submodule whose commits live in its own git dir, is
+    judged by nothing in the tree's status: the tree is kept and named."""
+    agent = _ended_coder(project, "coder-nested")
+    (agent.cwd / ".gitignore").write_text("vendor/\n", encoding="utf-8")
+    _git("add", ".gitignore", cwd=agent.cwd)
+    _git("commit", "-q", "-m", "ignore vendor", cwd=agent.cwd)
+    inner = agent.cwd / "vendor" / "lib"
+    inner.mkdir(parents=True)
+    if nested == "an ignored clone":
+        _git("init", "-q", str(inner), cwd=agent.cwd)
+    else:
+        (inner / ".git").write_text("gitdir: ../../.git/modules/lib\n", encoding="utf-8")
+
+    report = fleet_service.reap(project)
+
+    assert (agent.cwd, fleet_service.NESTED_REPOSITORY) in report.worktrees_kept
+    assert (inner / ".git").exists()
+
+
+def test_a_cache_holding_a_bare_repository_is_never_freed(tmp_path: Path, repo: Path) -> None:
+    session = session_dir()
+    cache = tag(session / "scratchpad" / "target")
+    _git("init", "-q", "--bare", str(cache / "mirror.git"), cwd=tmp_path)
+    plain = tag(session / "scratchpad" / "plain-cache")
+    aged(session, 3 * HOUR)
+
+    assert rules(planned(tmp_path)) == {plain: tidy.SESSION_CACHE}
+
+
+def test_a_live_rows_tree_inside_a_session_holds_it(tmp_path: Path, project: ProjectInfo) -> None:
+    """M-c: liveness is not by id alone: a live row working inside the session's directory."""
+    session = session_dir()
+    row(project, str(uuid.uuid4()), label="coder-2", role="coder", cwd=session / "scratchpad")
+    tag(session / "scratchpad" / "target")
+    aged(session, 3 * HOUR)
+
+    assert planned(tmp_path).items == []
+
+
+def test_a_session_a_live_row_held_before_a_clear_is_held(
+    tmp_path: Path, project: ProjectInfo
+) -> None:
+    """M-c: ``fleet-held:<old id>``: the row moved on to another session, and is live."""
+    session = session_dir()
+    live = row(project, str(uuid.uuid4()), label="coder-3", role="coder")
+    with store_session() as store:
+        store.set_meta(f"{FLEET_HELD}{session.name}", live.id)
+    tag(session / "scratchpad" / "target")
+    aged(session, 3 * HOUR)
+
+    assert planned(tmp_path).items == []
+
+
+def test_the_one_delete_refuses_what_holds_a_project_or_lies_inside_one(tmp_path: Path) -> None:
+    """M-c: project roots by containment, not equality, forgotten ones included."""
+    temp = (tmp_path / "temp").resolve()
+    project_inside = temp / "a-project"
+    project_inside.mkdir(parents=True)
+    roots = tidy.Roots(temp=frozenset({temp}), checkouts=frozenset({project_inside}))
+    assert not roots.allows(temp / "a-project")
+    assert not roots.allows(temp / "a-project" / "src")
+    holder = temp / "holder"
+    (holder / "nested-project").mkdir(parents=True)
+    roots = tidy.Roots(
+        temp=frozenset({temp}), checkouts=frozenset({(holder / "nested-project").resolve()})
+    )
+    assert not roots.allows(holder) and roots.allows(temp / "elsewhere")
+
+
+@pytest.mark.parametrize("what", ["a cache", "the session dir"])
+def test_a_repository_that_appears_after_the_plan_is_never_deleted(
+    tmp_path: Path, what: str
+) -> None:
+    """M-d: apply runs the repository scan again just before each removal."""
+    if what == "a cache":
+        session = session_dir()
+        target = tag(session / "scratchpad" / "target")
+        aged(session, 3 * HOUR)
+        made = planned(tmp_path)
+        assert rules(made) == {target: tidy.SESSION_CACHE}
+        _git("init", "-q", str(target / "late"), cwd=tmp_path)
+        path = target
+    else:
+        session = session_dir(ended=8 * timedelta(days=1))
+        aged(session, 8 * timedelta(days=1))
+        made = planned(tmp_path)
+        assert rules(made) == {session: tidy.SESSION_DIR}
+        _git("init", "-q", str(session / "scratchpad" / "late"), cwd=tmp_path)
+        path = session
+
+    report = tidy.apply(made)
+
+    assert report.freed == [] and path.is_dir()
+    assert report.not_freed and report.not_freed[0][1].startswith("skipped")
+
+
+@pytest.mark.skipif(not hasattr(os, "getuid") or os.getuid() == 0, reason="needs a mode to bite")
+def test_a_folder_rmtree_cannot_open_is_loosened_never_a_traceback(tmp_path: Path) -> None:
+    """The rmtree hook made the failed ``os.open`` again without its flags: a TypeError that
+    escaped apply and reap. It loosens the folder and the second pass removes it."""
+    tree = tmp_path / "cache"
+    shut = tree / "shut"
+    shut.mkdir(parents=True)
+    (shut / "inside.bin").write_bytes(b"x")
+    shut.chmod(0)
+
+    cachedir.remove_dir(tree)
+
+    assert not tree.exists()
+
+
+def test_an_agent_taken_up_again_after_the_plan_keeps_its_tree(
+    tmp_path: Path, tmux: object, claude_on_path: Path, project: ProjectInfo
+) -> None:
+    """A spawn of the same label after the plan works in the same tree: the real run re-asks the
+    rows, under reap's lock, and removes nothing under the new agent."""
+    built = _ended_coder(project, "coder-built")
+    made = planned(tmp_path)
+    assert rules(made) == {built.cwd: tidy.ENDED_WORKTREE}
+    again = fleet_service.spawn(project, "coder", label="coder-built").agent
+    assert again.cwd == built.cwd and again.ended_at is None
+
+    report = tidy.apply(made)
+
+    assert built.cwd.is_dir() and report.freed == []
+
+
+def test_a_cache_holding_an_environment_deeper_is_not_an_idle_coders_build_output(
+    tmp_path: Path, tmux: object, claude_on_path: Path, project: ProjectInfo
+) -> None:
+    _agent, tree = _idle_coder_tree(project, waited=25 * HOUR)
+    tools = tag(tree / "tools-cache")
+    (tools / "venv").mkdir()
+    (tools / "venv" / cachedir.ENVIRONMENT_MARKER).write_text("home = /usr\n", encoding="utf-8")
+
+    assert rules(planned(tmp_path)) == {tree / "target": tidy.IDLE_BUILD_CACHE}
+
+
+def test_a_freed_tree_with_a_root_tag_is_never_also_said_kept(
+    tmp_path: Path, tmux: object, claude_on_path: Path, project: ProjectInfo
+) -> None:
+    """Tester #3577, m1: the root-tag note is its own list."""
+    built = _ended_coder(project, "coder-built")
+    exclude = Path(
+        _git("rev-parse", "--path-format=absolute", "--git-path", "info/exclude", cwd=built.cwd)
+    )
+    exclude.parent.mkdir(parents=True, exist_ok=True)
+    exclude.write_text(f"/{cachedir.TAG}\n", encoding="utf-8")  # git ignores it: the tree is clean
+    (built.cwd / cachedir.TAG).write_bytes(TAG)
+
+    made = planned(tmp_path)
+
+    assert rules(made) == {built.cwd: tidy.ENDED_WORKTREE}
+    assert built.cwd in made.ignored and built.cwd not in {k.path for k in made.kept}
 
 
 # --- the minors of review #3522 ----------------------------------------------------------------
@@ -571,18 +719,19 @@ def test_a_config_that_cannot_be_read_turns_the_coder_rule_off(
 
 @pytest.mark.skipif(not hasattr(os, "getuid") or os.getuid() == 0, reason="needs a mode to bite")
 def test_a_delete_never_changes_the_mode_of_what_a_link_points_at(tmp_path: Path) -> None:
+    """The removal hook loosens what refused inside the tree alone: a read-only folder holding a
+    link out goes, and the link's target keeps its mode."""
     outside = tmp_path / "outside.txt"
     outside.write_text("not ours\n", encoding="utf-8")
     outside.chmod(0o400)
     stuck = tmp_path / "stuck"
     stuck.mkdir()
     (stuck / "link").symlink_to(outside)
-    stuck.chmod(0o500)  # the link cannot be unlinked: the delete fails, as it should
-    try:
-        with pytest.raises(OSError):
-            cachedir.remove_dir(stuck)
-    finally:
-        stuck.chmod(0o700)
+    stuck.chmod(0o500)
+
+    cachedir.remove_dir(stuck)
+
+    assert not stuck.exists() and outside.is_file()
     assert oct(outside.stat().st_mode & 0o777) == oct(0o400)
 
 
@@ -614,16 +763,15 @@ def test_the_process_list_is_every_process_not_only_a_terminals(
     assert asked == [["ps", "-A", "-ww", "-o", "args="]]
 
 
-def test_a_session_whose_root_is_a_checkout_is_judged(tmp_path: Path, repo: Path) -> None:
-    session = session_dir()
+def test_a_session_whose_root_is_a_checkout_is_kept(tmp_path: Path, repo: Path) -> None:
+    session = session_dir(ended=8 * timedelta(days=1))
     shutil.rmtree(session / "scratchpad")
     _clone(repo, session)
-    sha = _commit(session, "only-here.txt")
     aged(session, 8 * timedelta(days=1))
 
     made = planned(tmp_path)
 
-    assert made.items == [] and sha[:12] in _kept_why(made, session)
+    assert made.items == [] and _kept_why(made, session) == tidy.NEVER_A_REPOSITORY
 
 
 def test_git_runs_with_no_variable_pointing_it_at_another_repository() -> None:
@@ -746,17 +894,14 @@ def test_a_coder_working_in_the_projects_own_checkout_is_never_touched(
 
 
 def test_an_ended_sessions_small_files_stay_a_week_then_its_directory_goes(
-    tmp_path: Path, repo: Path, project: ProjectInfo
+    tmp_path: Path, repo: Path
 ) -> None:
-    week_old = session_dir()
+    week_old = session_dir(ended=8 * timedelta(days=1))
     aged(week_old, 8 * timedelta(days=1))
-    days_old = session_dir()
+    days_old = session_dir(ended=3 * timedelta(days=1))
     aged(days_old, 3 * timedelta(days=1))
-    holding_work = session_dir()
+    holding_work = session_dir(ended=8 * timedelta(days=1))
     checkout = _scratch_worktree(repo, holding_work / "scratchpad" / "wt")
-    (checkout / "only.txt").write_text("x\n", encoding="utf-8")
-    _git("add", "only.txt", cwd=checkout)
-    _git("commit", "-q", "-m", "kept work", cwd=checkout)
     aged(holding_work, 8 * timedelta(days=1))
 
     made = planned(tmp_path)
@@ -765,7 +910,7 @@ def test_an_ended_sessions_small_files_stay_a_week_then_its_directory_goes(
     tidy.apply(made)
     assert not week_old.exists()
     assert (days_old / "scratchpad" / "notes.md").is_file()
-    assert (checkout / "only.txt").is_file() and checkout in {k.path for k in made.kept}
+    assert checkout.is_dir() and checkout in {k.path for k in made.kept}
 
 
 # --- 8. stale home-migration locks in the system temp directory --------------------------------
@@ -797,10 +942,10 @@ def test_a_real_run_frees_exactly_the_dry_runs_list_and_nothing_else(
     tmp_path: Path, repo: Path, project: ProjectInfo
 ) -> None:
     ended = session_dir()
-    checkout = _scratch_worktree(repo, ended / "scratchpad" / "wt")
+    _scratch_worktree(repo, ended / "scratchpad" / "wt")
     cache = tag(ended / "scratchpad" / "pytest-cache")
     aged(ended, 3 * HOUR)
-    old = session_dir()
+    old = session_dir(ended=8 * timedelta(days=1))
     aged(old, 8 * timedelta(days=1))
     lock = tmp_path / "system-temp" / f"rlx-home-migration-{'f' * 16}.lock"
     lock.write_bytes(b"")
@@ -812,7 +957,7 @@ def test_a_real_run_frees_exactly_the_dry_runs_list_and_nothing_else(
     report = tidy.apply(dry)
 
     listed = [item.path for item in dry.items]
-    assert sorted(listed) == sorted([checkout, cache, old, lock])
+    assert sorted(listed) == sorted([cache, old, lock])
     assert [item.path for item in report.freed] == listed and report.not_freed == []
     gone = before - set().union(*(every_path(root) for root in watched))
     assert all(any(p == item or p.is_relative_to(item) for item in listed) for p in gone)
@@ -906,7 +1051,7 @@ def test_a_link_out_of_a_session_is_never_followed(tmp_path: Path) -> None:
     outside = tmp_path / "outside"
     outside.mkdir()
     (outside / "precious.txt").write_text("not rlx's\n", encoding="utf-8")
-    old = session_dir()
+    old = session_dir(ended=8 * timedelta(days=1))
     (old / "scratchpad" / "link").symlink_to(outside, target_is_directory=True)
     aged(old, 8 * timedelta(days=1))
 

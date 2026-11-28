@@ -3224,7 +3224,7 @@ def _untracked_caches(tree: Path) -> tuple[str | None, list[Path], bool]:
     return None, caches, other
 
 
-def _remove_untracked_caches(tree: Path) -> list[Path]:
+def _remove_untracked_caches(tree: Path, only: Collection[Path] | None = None) -> list[Path]:
     """Delete the ``CACHEDIR.TAG`` directories in ``tree``'s untracked entries that hold
     nothing else (:func:`_untracked_caches`); the ones deleted. One that will not go is left
     for ``git worktree remove`` to refuse, which says so."""
@@ -3234,12 +3234,21 @@ def _remove_untracked_caches(tree: Path) -> list[Path]:
     removed: list[Path] = []
     for entry in caches:
         for tagged in [entry] if cachedir.is_cache(entry) else cachedir.cache_dirs(entry):
+            if only is not None and tagged not in only:
+                continue  # found after the plan: ``rlx tidy`` frees what it listed alone
             try:
                 cachedir.remove_within(tagged, tree)
             except (OSError, ValueError):
                 continue  # left in the tree: git's own refusal names it
             removed.append(tagged)
     return removed
+
+
+NESTED_REPOSITORY = (
+    "it holds another git repository (ignored, or a submodule): rlx won't delete a repository; "
+    "remove it by hand if you don't need it"
+)
+"""Why a tree that holds a repository besides its own is kept (#58, C-a)."""
 
 
 def _why_kept(root: Path, tree: Path, default: str) -> str | None:
@@ -3254,6 +3263,9 @@ def _why_kept(root: Path, tree: Path, default: str) -> str | None:
         return failed
     if other:
         return "uncommitted changes"
+    if cachedir.holds_repository(tree, below_only=True):
+        # Ignored by git, or a submodule's: its commits are judged by nothing here (#58, C-a).
+        return NESTED_REPOSITORY
     head = _git(tree, "rev-parse", "--verify", "--quiet", "HEAD")
     if head.returncode != 0 or not head.stdout.strip():
         return "no commit to check"
@@ -3490,6 +3502,7 @@ def _reap_tree(
     read_at: datetime,
     *,
     remove: bool = True,
+    caches: Collection[Path] | None = None,
 ) -> tuple[bool, str | None]:
     """Reap ``agent``'s tree: ``agent`` ended, and was the newest row at the tree's path when
     :func:`reap` read the rows at ``read_at``. Record on its row the branch the tree is on
@@ -3538,7 +3551,7 @@ def _reap_tree(
             _record_the_branch(store, agent)
             # Its build output first, whether or not the tree stays: regenerable by its own tag,
             # and deleted only here, under the lock, once no other agent is at the tree (#58).
-            _remove_untracked_caches(tree)
+            _remove_untracked_caches(tree, caches)
             if kept is not None:
                 return False, kept
             if not remove:  # ``rlx tidy`` planned it kept: it never decides again (#58)

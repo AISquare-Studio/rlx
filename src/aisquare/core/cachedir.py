@@ -64,22 +64,64 @@ def is_environment(path: Path) -> bool:
         return False
 
 
-def has_git(path: Path) -> bool:
-    """Whether a ``.git`` (a repository's directory or a worktree's file) is at or anywhere under
-    ``path``, links not followed. One that cannot be read is taken to hold one: kept."""
-    pending = [path]
+def _is_bare_repository(path: Path) -> bool:
+    """A bare repository's own shape: ``HEAD``, ``objects`` and ``refs`` at its root."""
+    return _is_file(path / "HEAD") and _is_dir(path / "objects") and _is_dir(path / "refs")
+
+
+def _is_file(path: Path) -> bool:
+    try:
+        return stat.S_ISREG(os.lstat(path).st_mode)
+    except OSError:
+        return False
+
+
+def holds_repository(path: Path, *, below_only: bool = False) -> bool:
+    """Whether a git repository of any kind is at or anywhere under ``path``: a ``.git`` (a
+    clone's directory, a worktree's or a submodule's file) or a bare repository, ignored by git
+    or not, links not followed (review of #58, C-a). ``below_only``: ``path``'s own ``.git`` (a
+    checkout's) does not count, a repository inside it does. A folder that cannot be read, or on
+    another filesystem (a mount), is taken to hold one: kept."""
+    try:
+        device = os.lstat(path).st_dev
+    except OSError:
+        return True
+    if not below_only and _is_bare_repository(path):
+        return True
+    pending: list[tuple[Path, bool]] = [(path, True)]
     while pending:
-        here = pending.pop()
+        here, top = pending.pop()
         try:
             with os.scandir(here) as listing:
                 entries = list(listing)
         except OSError:
             return True
         for entry in entries:
-            if entry.name == ".git":
+            if entry.name == ".git" and not (top and below_only):
                 return True
-            if entry.is_dir(follow_symlinks=False):
-                pending.append(Path(entry.path))
+            if not entry.is_dir(follow_symlinks=False):
+                continue
+            inner = Path(entry.path)
+            try:
+                if entry.stat(follow_symlinks=False).st_dev != device:
+                    return True  # a mount: not ours to walk, so taken to hold one
+            except OSError:
+                return True
+            if _is_bare_repository(inner):
+                return True
+            pending.append((inner, False))
+    return False
+
+
+def holds_environment(path: Path) -> bool:
+    """Whether a virtual environment (PEP 405's ``pyvenv.cfg``) is at or anywhere under
+    ``path``, links not followed."""
+    pending = [path]
+    while pending:
+        here = pending.pop()
+        if is_environment(here):
+            return True
+        pending.extend(_subdirectories(here))
     return False
 
 
@@ -92,8 +134,9 @@ def _entries(path: Path) -> Iterator[os.DirEntry[str]]:
 
 
 def is_cache(path: Path) -> bool:
-    """Whether ``path`` is a removable cache: tagged by the spec, holding no ``.git``."""
-    return is_cache_dir(path) and not has_git(path)
+    """Whether ``path`` is a removable cache: tagged by the spec, holding no repository of any
+    kind and crossing no mount (:func:`holds_repository`)."""
+    return is_cache_dir(path) and not holds_repository(path)
 
 
 def cache_dirs(root: Path, *, skip: Callable[[Path], bool] | None = None) -> list[Path]:
@@ -107,11 +150,11 @@ def cache_dirs(root: Path, *, skip: Callable[[Path], bool] | None = None) -> lis
         if skip is not None and skip(here):
             continue
         if is_cache_dir(here):
-            if not has_git(here):
+            if not holds_repository(here):
                 found.append(here)
             continue
-        if _there(here / ".git"):
-            continue  # a nested checkout: git judges it, never a tag
+        if _there(here / ".git") or _is_bare_repository(here):
+            continue  # a repository: git judges it, never a tag
         pending.extend(_subdirectories(here))
     return sorted(found)
 
@@ -134,7 +177,7 @@ def only_caches(root: Path) -> bool:
     An empty directory holds nothing; one that cannot be read is taken to hold something, the
     side that keeps it."""
     if is_cache_dir(root):
-        return not has_git(root)
+        return not holds_repository(root)
     if not _is_dir(root):
         return False
     try:
@@ -152,19 +195,28 @@ def remove_dir(path: Path) -> None:
     unlinks a link it meets, and refuses one given as ``path``); a read-only entry, as git and
     some builds leave, is made writable and tried again. Raises what the delete raised."""
 
-    def writable_then_again(
-        function: Callable[..., object], name: str, _exc: BaseException | object
-    ) -> None:
-        if os.path.islink(name):
-            os.unlink(name)  # a link is unlinked, never chmod'ed through
-            return
-        os.chmod(name, stat.S_IWRITE | stat.S_IREAD | stat.S_IEXEC)
-        function(name)
+    top = os.path.realpath(path)
+
+    def loosen(_function: Callable[..., object], name: str, _exc: BaseException | object) -> None:
+        """Make what refused writable, and its folder, inside ``path`` alone, never through a
+        link; the second pass removes it. The failed call is never made again: rmtree's
+        ``os.open`` takes flags this hook does not have (review of #58, a TypeError)."""
+        for target in (name, os.path.dirname(name)):
+            try:
+                real = os.path.realpath(target)
+                if os.path.islink(target) or os.path.commonpath([real, top]) != top:
+                    continue
+                mode = stat.S_IRWXU if os.path.isdir(target) else stat.S_IRUSR | stat.S_IWUSR
+                os.chmod(target, mode)
+            except OSError:
+                continue
 
     if sys.version_info >= (3, 12):
-        shutil.rmtree(path, onexc=writable_then_again)
+        shutil.rmtree(path, onexc=loosen)
     else:  # pragma: no cover - 3.11 names the hook onerror
-        shutil.rmtree(path, onerror=writable_then_again)
+        shutil.rmtree(path, onerror=loosen)
+    if os.path.lexists(path):
+        shutil.rmtree(path)  # what still refuses is raised now
 
 
 def remove_within(path: Path, root: Path) -> None:
@@ -178,8 +230,8 @@ def remove_within(path: Path, root: Path) -> None:
     here = os.path.join(parent, path.name)
     if here == top or os.path.commonpath([here, top]) != top:
         raise ValueError(f"{path} is not inside {root}")
-    if has_git(path):
-        raise ValueError(f"{path} holds a git checkout")
+    if holds_repository(path):
+        raise ValueError(f"{path} holds a repository, or crosses a mount")
     remove_dir(path)
 
 

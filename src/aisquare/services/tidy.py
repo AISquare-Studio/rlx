@@ -13,21 +13,25 @@ a standard says, never from a directory's name:
 
 The rules (:data:`RULES`):
 
+**rlx tidy never deletes a git repository** (manager #3585, for 0.10.2): every round of review
+found a new way whole-checkout deletion could lose commits, while most of the space is
+regenerable build output inside the checkouts. Deleting scratch checkouts is 0.10.3's, behind an
+explicit confirmation per path.
+
 1. **Ended agents' worktrees**: reap's worktree half, the trees ``fleet.ended_trees`` chooses,
    each judged by ``fleet._why_kept`` and removed by ``fleet._reap_tree`` under reap's branch
    lock. A tree's untracked ``CACHEDIR.TAG`` output keeps it no longer; it is deleted first,
-   kept tree or not.
+   kept tree or not. A tree that holds any repository but its own is kept and named.
 2. **Ended sessions' temp trees**, under the ``CLAUDE_CODE_TMPDIR`` rlx gives each managed
-   Claude slot (``claude-<uid>/<project>/<session id>/``; slot 1 and Codex have none of
-   rlx's). A session is ENDED when all
-   three hold: no live or paused fleet row in any project names it, no running process names
-   it on its command line, and nothing of it moved for :data:`ENDED_IDLE`. Then its git
-   checkouts go (through ``git worktree remove`` for a registered worktree, without
-   ``--force``) unless one holds something found nowhere else, which is kept and named (one
-   whose repository goes with the session, a clone or a worktree of a repository inside it,
-   counts only its remotes: :func:`_checkout_kept`); its tagged directories go; and once nothing
-   of it moved for :data:`EVIDENCE_TTL` the whole session directory goes, unless it holds a kept
-   checkout. The per-agent ``TMPDIR`` is #57's, which adds its rule here (manager #3494).
+   Claude slot (``claude-<uid>/<project>/<session id>/``; slot 1 and Codex have none of rlx's).
+   A session is ENDED on CURRENT positive evidence alone: its board row's ``ended_at``, set and
+   not cleared by a resume; every row naming it ended (``fleet-held:`` ids included) and none
+   made after; no live or paused row working in its directory; no running process naming it;
+   and nothing of it moved for :data:`ENDED_IDLE`. Then only its caches go: ``CACHEDIR.TAG``
+   folders strictly inside it, holding no repository at any depth, in no tag-at-a-root, and
+   tracking nothing in a checkout around them. Every repository in it is KEPT and listed with
+   its size. The whole directory goes only once it ended :data:`EVIDENCE_TTL` ago and holds no
+   repository at all. The per-agent ``TMPDIR`` is #57's, which adds its rule here (#3494).
 3. **Idle live coders' build output**: a live coder whose board session has waited
    ``[tidy] idle_build_hours`` with no task in doing loses the tagged directories in its
    worktree, never one that is a PEP 405 environment (``core.cachedir.is_environment``: the one
@@ -58,13 +62,12 @@ import uuid
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
-from functools import partial
 from pathlib import Path
 
 from aisquare.core import cachedir, claude_accounts, process_table
 from aisquare.core.config import TidySettings, load_config
 from aisquare.core.locking import holding
-from aisquare.core.store import ContextStore, store_session
+from aisquare.core.store import FLEET_HELD, ContextStore, store_session
 from aisquare.models import FleetAgent, ProjectInfo
 from aisquare.services import fleet as fleet_service
 
@@ -116,7 +119,10 @@ ROOT_TAG = (
     "a CACHEDIR.TAG at the root of what tidy judges authorises nothing (CARGO_TARGET_DIR or "
     "UV_CACHE_DIR there, pytest -o cache_dir=.): ignored, git alone judges it"
 )
-"""What a plan says of a tag it ignores (review of #58, C2)."""
+"""What a plan says of the tags it ignores (review of #58, C2): :attr:`Plan.ignored`."""
+NEVER_A_REPOSITORY = "rlx won't delete a repository: remove it by hand if you don't need it"
+"""Why every repository in a session's temp is kept (manager #3585: ``rlx tidy`` never deletes
+a git repository in 0.10.2)."""
 
 
 # --- what may be deleted -------------------------------------------------------------------
@@ -144,20 +150,29 @@ class Roots:
     locks: frozenset[Path] = frozenset()
     """The system temp directories the migration locks are looked for in, for those alone."""
     checkouts: frozenset[Path] = frozenset()
-    """Every project's own root: never deleted, nor anything that resolves to one."""
+    """Every project's own root, forgotten ones included: never deleted, nor anything that
+    holds one, nor anything inside one but its ``.aisquare-worktrees``."""
 
     def allows(self, path: Path) -> bool:
-        """Whether ``path`` lies strictly inside a tree or temp root (a migration lock's name in a
-        lock directory), is no project's root, and its parent holds no link out of the root."""
+        """Whether ``path`` (its real place) lies strictly inside a tree or temp root (or is a
+        migration lock's name in a lock directory), holds no project's root, and lies inside no
+        project's root but through its ``.aisquare-worktrees`` (review of #58, M-c: containment,
+        not equality)."""
         parent = _real(path.parent)
         if parent is None:
             return False
         here = parent / path.name
-        if here in self.checkouts or here in self.trees or here in self.temp:
+        if here in self.trees or here in self.temp:
             return False
         if parent in self.locks and LOCK_NAME.fullmatch(path.name):
             return True
-        return any(here.is_relative_to(root) for root in (*self.trees, *self.temp))
+        in_trees = any(here.is_relative_to(root) for root in self.trees)
+        for checkout in self.checkouts:
+            if checkout.is_relative_to(here):
+                return False  # is, or holds, a project's own checkout
+            if here.is_relative_to(checkout) and not in_trees:
+                return False
+        return in_trees or any(here.is_relative_to(root) for root in self.temp)
 
 
 def _remove(path: Path, roots: Roots) -> None:
@@ -197,11 +212,13 @@ class Item:
 
 @dataclass(frozen=True)
 class Kept:
-    """One path a rule looked at and keeps, with why: what in it is found nowhere else."""
+    """One path a rule looked at and keeps, with why, and its size where that helps a person
+    decide (a repository rlx won't delete)."""
 
     rule: str
     path: Path
     why: str
+    bytes: int | None = None
 
 
 @dataclass
@@ -223,6 +240,9 @@ class Plan:
     """``(repo, branch)``: the ``fleet/…`` branches reap's sweep deletes once the planned trees
     are gone (``fleet.sweep_plan``), shown in the dry run and deleted, those alone, by apply."""
     sweeps: list[Callable[[fleet_service.ReapReport], None]] = field(default_factory=list)
+    ignored: list[Path] = field(default_factory=list)
+    """Roots whose CACHEDIR.TAG authorises nothing (:data:`ROOT_TAG`), said apart from what is
+    kept, so a freed tree is never also named under ``kept`` (tester #3577, m1)."""
 
     @property
     def bytes(self) -> int:
@@ -265,7 +285,7 @@ def plan(*, now: datetime | None = None) -> Plan:
         # Liveness from every row there is, a forgotten project's too (review of #58, M2):
         # forgetting refuses only live rows, so a paused agent can sit in one.
         every = _every_row(store)
-        result = Plan(roots=_roots(projects))
+        result = Plan(roots=_roots(projects, store.list_projects(all=True, include_forgotten=True)))
         commands = _command_lines()
         for project in projects:
             _ended_worktrees(store, project, result)
@@ -310,7 +330,7 @@ def apply(made: Plan) -> Report:
     return report
 
 
-def _roots(projects: Iterable[ProjectInfo]) -> Roots:
+def _roots(projects: Iterable[ProjectInfo], every: Iterable[ProjectInfo]) -> Roots:
     def real(paths_: Iterable[Path]) -> frozenset[Path]:
         return frozenset(found for found in (_real(path) for path in paths_) if found is not None)
 
@@ -318,7 +338,7 @@ def _roots(projects: Iterable[ProjectInfo]) -> Roots:
         trees=real(project.root / WORKTREES_DIR for project in projects),
         temp=real((claude_accounts.tmp_root(),)),
         locks=real(_system_temp_dirs()),
-        checkouts=real(project.root for project in projects),
+        checkouts=real(project.root for project in every),
     )
 
 
@@ -357,21 +377,25 @@ def _ended_worktrees(store: ContextStore, project: ProjectInfo, result: Plan) ->
                 Kept(ENDED_WORKTREE, tree, f"not under {WORKTREES_DIR}: reap judges it")
             )
             continue
+        if not _there(tree / ".git"):
+            # Asked there, git would answer for the repository above it (review of #58).
+            result.kept.append(Kept(ENDED_WORKTREE, tree, "it has no .git of its own: kept"))
+            continue
         if cachedir.is_cache_dir(tree):
-            result.kept.append(Kept(ENDED_WORKTREE, tree, ROOT_TAG))
+            result.ignored.append(tree)
         try:
             why = fleet_service._why_kept(trees.root, tree, trees.default)
         except fleet_service.FleetError as exc:
             result.kept.append(Kept(ENDED_WORKTREE, tree, f"git could not be asked ({exc})"))
             continue
+        caches = _untracked_caches(tree)
         if why is None:
             going.append(tree)
             items = [Item(ENDED_WORKTREE, tree, cachedir.allocated_bytes(tree))]
         else:
             result.kept.append(Kept(ENDED_WORKTREE, tree, why))
-            caches = _untracked_caches(tree)
             items = [Item(ENDED_WORKTREE_CACHE, c, cachedir.allocated_bytes(c)) for c in caches]
-        result.add(items, _reap_one(project, agent, trees, remove=why is None))
+        result.add(items, _reap_one(project, agent, trees, remove=why is None, caches=caches))
     unplaced = fleet_service._unplaced_trees_kept(trees.placed, trees.owners, trees.in_use)
     result.kept.extend(Kept(ENDED_WORKTREE, tree, why) for tree, why in unplaced)
     root, common, default = trees.root, trees.common, trees.default
@@ -391,12 +415,27 @@ def _ended_worktrees(store: ContextStore, project: ProjectInfo, result: Plan) ->
 
 
 def _reap_one(
-    project: ProjectInfo, agent: FleetAgent, trees: fleet_service.EndedTrees, *, remove: bool
+    project: ProjectInfo,
+    agent: FleetAgent,
+    trees: fleet_service.EndedTrees,
+    *,
+    remove: bool,
+    caches: list[Path],
 ) -> Callable[[], str | None]:
     def run() -> str | None:
         with store_session() as store:
+            now = store.get_fleet_agent(agent.id)
+            if now is None or now.paused_at is not None or now.ended_at is None:
+                return "skipped: the agent is paused or back since the plan"
             removed, kept = fleet_service._reap_tree(
-                store, project, agent, trees.default, trees.common, trees.read_at, remove=remove
+                store,
+                project,
+                agent,
+                trees.default,
+                trees.common,
+                trees.read_at,
+                remove=remove,
+                caches=caches,
             )
         if removed or not remove:
             return None if removed else kept
@@ -490,29 +529,59 @@ class _Liveness:
     """What says whether a session is over, read once for the plan and again before each act."""
 
     held: bool
-    """A live or paused row in any project names it."""
-    ended: bool
-    """POSITIVE evidence it ended (review of #58, M1): its board row's ``ended_at``, or rows
-    naming it that have all ended. Idleness alone is never evidence."""
+    """A live or paused row names it (its own id, or one it held before a ``/clear``:
+    ``fleet-held:``), or works in its directory (review of #58, M-c)."""
+    ended_at: datetime | None
+    """CURRENT positive evidence it ended (review of #58, M1 and M-a): its board row's
+    ``ended_at``, set and not cleared by a resume, every row naming it ended, and none made
+    after it ended (a resume names it again). ``None``: not ended, whatever its idleness."""
     running: bool | None
     """A running process names it; ``None`` when the processes could not be read."""
     wrote: datetime | None
     """When the session itself last wrote: its board row's last hook, its transcript."""
 
 
+def _naming(store: ContextStore, session_id: str, every: list[FleetAgent]) -> list[FleetAgent]:
+    """The rows naming ``session_id``: its own, and the row it was before a ``/clear`` or a
+    hand-over moved that row to another session (``store.FLEET_HELD``)."""
+    rows = [row for row in every if row.session_id == session_id]
+    holder = store.get_meta(f"{FLEET_HELD}{session_id}")
+    if holder:
+        row = store.get_fleet_agent(holder)
+        if row is not None and all(row.id != known.id for known in rows):
+            rows.append(row)
+    return rows
+
+
 def _liveness(
-    store: ContextStore, session_id: str, rows: list[FleetAgent], commands: list[str] | None
+    store: ContextStore,
+    session_id: str,
+    directory: Path,
+    every: list[FleetAgent],
+    commands: list[str] | None,
 ) -> _Liveness:
+    rows = _naming(store, session_id, every)
+    inside = _real(directory)
+    working_there = inside is not None and any(
+        (cwd := _real(row.cwd)) is not None and cwd.is_relative_to(inside)
+        for row in every
+        if row.ended_at is None or row.paused_at is not None
+    )
     session = store.get_session(session_id)
     wrote: list[datetime | None] = []
+    ended_at = None
     if session is not None:
         transcript = _mtime(Path(session.transcript_path)) if session.transcript_path else None
         wrote = [session.last_seen_at, transcript]
+        end = session.ended_at
+        if end is not None and all(
+            row.ended_at is not None and row.created_at <= end for row in rows
+        ):
+            ended_at = end
     known = [moment for moment in wrote if moment is not None]
-    ended_row = bool(rows) and all(row.ended_at is not None for row in rows)
     return _Liveness(
-        held=_held_by(rows),
-        ended=ended_row or (session is not None and session.ended_at is not None),
+        held=_held_by(rows) or working_there,
+        ended_at=ended_at,
         running=_named_running(session_id, commands),
         wrote=max(known) if known else None,
     )
@@ -532,36 +601,26 @@ def _session_trees(
             Kept(SESSION_DIR, root, "the running processes could not be read: no session ended")
         )
         return
-    by_session: dict[str, list[FleetAgent]] = {}
-    for row in every:
-        if row.session_id:
-            by_session.setdefault(row.session_id, []).append(row)
     for directory in sessions:
         session_id = directory.name
-        alive = _liveness(store, session_id, by_session.get(session_id, []), commands)
-        if alive.held or alive.running is not False:
-            continue
+        alive = _liveness(store, session_id, directory, every, commands)
+        if alive.held or alive.running is not False or alive.ended_at is None:
+            continue  # without current evidence it ended, nothing of it is touched (M1)
         moved = _last_moved(directory, alive.wrote)
-        if moved is None:
+        if moved is None or at - moved < ENDED_IDLE:
             continue
-        idle = at - moved
-        if alive.ended and idle >= ENDED_IDLE:
-            _one_session(directory, session_id, moved, at, result, ended=True)
-        elif idle >= EVIDENCE_TTL:
-            # No word that it ended (a hand launch without tracing, `claude --continue`): never
-            # ended by tidy, only aged out whole, once git would keep none of its checkouts.
-            _one_session(directory, session_id, moved, at, result, ended=False)
+        _one_session(directory, session_id, alive.ended_at, at, result)
 
 
-def _checkouts(directory: Path) -> list[Path]:
-    """The git checkouts in ``directory``, ``directory`` itself among them when it is one: each
-    directory holding a ``.git`` (a linked worktree's file or a clone's directory), the outermost
-    only, never through a link. A tag hides none (review of #58, C2)."""
+def _repositories(directory: Path) -> list[Path]:
+    """Every git repository in ``directory``, ``directory`` itself among them when it is one:
+    each folder holding a ``.git`` (a clone's, a worktree's or a submodule's) and each bare
+    repository, the outermost only, links not followed. A tag hides none (review of #58, C2)."""
     found: list[Path] = []
     pending = [directory]
     while pending:
         here = pending.pop()
-        if _there(here / ".git"):
+        if _there(here / ".git") or cachedir._is_bare_repository(here):
             found.append(here)
             continue
         pending.extend(_subdirs(here))
@@ -570,77 +629,6 @@ def _checkouts(directory: Path) -> list[Path]:
 
 def _git(cwd: Path, *args: str) -> fleet_service._GitResult:
     return fleet_service._git(cwd, *args)
-
-
-def _repository_goes(checkout: Path, scope: Path) -> bool:
-    """Whether ``checkout``'s repository is deleted with ``scope``: a clone's is its own ``.git``;
-    a linked worktree's is its common directory, gone with ``scope`` when it lies inside it. One
-    whose repository cannot be found is taken to go with it, the side that keeps more."""
-    if (checkout / ".git").is_dir():
-        return True
-    common = _common_dir(checkout)
-    if common is None:
-        return True
-    found = _real(common)
-    within = _real(scope)
-    return found is None or within is None or found.is_relative_to(within)
-
-
-def _commits(shas: list[str], where: str, then: str) -> str:
-    many = "commit" if len(shas) == 1 else "commits"
-    return f"{len(shas)} {many} {where} (newest {shas[0][:12]}): {then}, then tidy again"
-
-
-def _checkout_kept(checkout: Path, scope: Path) -> str | None:
-    """Why ``checkout`` stays, or ``None``: changed or untracked work outside caches, or a commit
-    found nowhere that outlives the deletion (#58: kept and named on any doubt, git's word being
-    the only one taken).
-
-    Where the checkout's repository is deleted with ``scope`` (:func:`_repository_goes`), its own
-    branches and tags go too: only its REMOTES count as elsewhere, so every commit any of its refs
-    or worktrees reach must be on one, and its stash must be empty (tester #3507: a clone's
-    unpushed commit was deleted, counted as safe on the clone's own branch). A linked worktree of
-    a repository that stays counts that repository's branches and tags as well."""
-    try:
-        failed, _caches, other = fleet_service._untracked_caches(checkout)
-        if failed is not None:
-            return failed
-        if other:
-            return "uncommitted changes"
-        if _repository_goes(checkout, scope):
-            stash = _git(checkout, "rev-parse", "--verify", "--quiet", "refs/stash")
-            if stash.returncode == 0 and stash.stdout.strip():
-                return "a stash, which goes with its repository: apply and push it, then tidy again"
-            alone = _git(checkout, "rev-list", "--all", "--not", "--remotes")
-            where, then = "on no remote", "push them"
-        else:
-            head = _git(checkout, "rev-parse", "--verify", "--quiet", "HEAD")
-            if head.returncode != 0 or not head.stdout.strip():
-                return None  # no commit at all: nothing of it lives only here
-            alone = _git(checkout, "rev-list", "HEAD", "--not", "--branches", "--tags", "--remotes")
-            where, then = "no branch, tag or remote has", "branch or push them"
-        if alone.returncode != 0:
-            return f"git could not say what only it has ({alone.stderr.strip()})"
-        shas = alone.stdout.split()
-        if shas:
-            return _commits(shas, where, then)
-    except fleet_service.FleetError as exc:
-        return f"git could not be asked ({exc})"
-    return None
-
-
-def _common_dir(checkout: Path) -> Path | None:
-    """A linked worktree's repository (``git rev-parse --git-common-dir``); ``None`` for a clone
-    or where git cannot say."""
-    if not (checkout / ".git").is_file():
-        return None
-    try:
-        found = _git(checkout, "rev-parse", "--path-format=absolute", "--git-common-dir")
-    except fleet_service.FleetError:
-        return None
-    if found.returncode != 0 or not found.stdout.strip():
-        return None
-    return Path(found.stdout.strip())
 
 
 def _tracked_inside(checkout: Path, tagged: Path) -> bool:
@@ -653,109 +641,122 @@ def _tracked_inside(checkout: Path, tagged: Path) -> bool:
     return listed.returncode != 0 or bool(listed.stdout.strip())
 
 
-def _checkout_caches(checkout: Path) -> list[Path]:
-    """The caches STRICTLY inside a judged ``checkout`` that git tracks nothing of and that hold
-    no ``.git``: untracked or ignored build output alone."""
-    return [t for t in cachedir.cache_dirs(checkout) if not _tracked_inside(checkout, t)]
-
-
-def _remove_checkout(checkout: Path, roots: Roots) -> str | None:
-    """``checkout`` gone: its untracked caches first, as reap deletes them (inside it alone, no
-    link followed), then through its repository's ``git worktree remove`` (no ``--force``: one
-    git will not remove stays, and says why) for a linked worktree, or deleted for a clone."""
-    if not roots.allows(checkout):
-        raise Refused(f"{checkout} is outside rlx's own folders")
-    fleet_service._remove_untracked_caches(checkout)
-    common = _common_dir(checkout)
-    if common is None:
-        if (checkout / ".git").is_file():
-            return "its repository could not be found: kept"
-        _remove(checkout, roots)
-        return None
-    removal = _git(common, "worktree", "remove", str(checkout))
-    if removal.returncode != 0:
-        return f"git worktree remove refused: {removal.stderr.strip() or 'no reason'}"
+def _enclosing_checkout(path: Path, directory: Path) -> Path | None:
+    """The nearest folder at or above ``path``, up to ``directory``, that is a checkout."""
+    for here in (path, *path.parents):
+        if _there(here / ".git"):
+            return here
+        if here == directory:
+            return None
     return None
+
+
+def _session_cache(tagged: Path, directory: Path) -> bool:
+    """Whether ``tagged`` is a cache tidy may free in the session ``directory`` (asked at the plan
+    and again just before, review of #58 M-d): tagged, holding no repository and crossing no
+    mount (``cachedir.is_cache``); not the session's own folder, nor one of its top folders (a
+    scratchpad), nor a checkout's root, whose tags authorise nothing; and tracking nothing in
+    the checkout it lies in."""
+    if tagged == directory or tagged.parent == directory or _there(tagged / ".git"):
+        return False
+    if not cachedir.is_cache(tagged):
+        return False
+    checkout = _enclosing_checkout(tagged.parent, directory)
+    return checkout is None or not _tracked_inside(checkout, tagged)
+
+
+def _session_caches(directory: Path, result: Plan) -> list[Path]:
+    """The caches in a session ``directory`` (:func:`_session_cache`), outermost, found through
+    every folder but a bare repository and a mount, checkouts included: their ignored or
+    untracked build output is most of the space (the brief). Ignored roots are said."""
+    found: list[Path] = []
+    pending = [directory]
+    try:
+        device = os.lstat(directory).st_dev
+    except OSError:
+        return []
+    while pending:
+        here = pending.pop()
+        top = here == directory or here.parent == directory or _there(here / ".git")
+        if top and cachedir.is_cache_dir(here):
+            result.ignored.append(here)
+        elif _session_cache(here, directory):
+            found.append(here)
+            continue
+        if cachedir._is_bare_repository(here):
+            continue
+        for inner in _subdirs(here):
+            try:
+                if os.lstat(inner).st_dev != device:
+                    continue  # a mount: not walked, not freed
+            except OSError:
+                continue
+            pending.append(inner)
+    return sorted(found)
 
 
 def _one_session(
-    directory: Path, session_id: str, moved: datetime, at: datetime, result: Plan, *, ended: bool
+    directory: Path, session_id: str, ended_at: datetime, at: datetime, result: Plan
 ) -> None:
-    """``ended``: with positive evidence, its checkouts and caches go, and after
-    :data:`EVIDENCE_TTL` the whole directory. Without (aged out): the whole directory alone,
-    and only when git would keep none of its checkouts."""
-    for top in (directory, *_subdirs(directory)):
-        if cachedir.is_cache_dir(top):
-            result.kept.append(Kept(SESSION_CACHE, top, ROOT_TAG))
-    kept: list[Path] = []
-    gone: list[Path] = []
-    # A linked worktree before any clone: its repository may be one of them.
-    for checkout in sorted(_checkouts(directory), key=lambda c: (c / ".git").is_dir()):
-        why = _checkout_kept(checkout, directory)
-        if why is None and _common_dir(checkout) is None and (checkout / ".git").is_file():
-            why = "a worktree whose repository could not be found: git can't say what it holds"
-        if why is None:
-            gone.append(checkout)
-        else:
-            kept.append(checkout)
-            result.kept.append(Kept(SESSION_CHECKOUT, checkout, why))
+    """An ENDED session (current evidence, no process, idle): its repositories are kept and
+    listed with their size, never removed (manager #3585); its caches holding no repository go;
+    and once it ended :data:`EVIDENCE_TTL` ago, the whole directory, if it holds no repository
+    at all."""
+    repositories = _repositories(directory)
+    for repository in repositories:
+        result.kept.append(
+            Kept(
+                SESSION_CHECKOUT,
+                repository,
+                NEVER_A_REPOSITORY,
+                cachedir.allocated_bytes(repository),
+            )
+        )
     roots = result.roots
-    if at - moved >= EVIDENCE_TTL and not kept and directory not in gone:
+    if not repositories and at - ended_at >= EVIDENCE_TTL:
         whole = Item(SESSION_DIR, directory, cachedir.allocated_bytes(directory))
 
         def drop() -> str | None:
-            for checkout in gone:
-                why = _remove_checkout(checkout, roots)
-                if why is not None:
-                    return why
+            if cachedir.holds_repository(directory):
+                return "skipped: a repository is there now"
             _remove(directory, roots)
             return None
 
-        result.add([whole], _guarded(session_id, directory, drop, ended=ended))
+        result.add([whole], _guarded(session_id, directory, drop, at_least=EVIDENCE_TTL))
         return
-    if not ended:
-        return
-    for checkout in gone:
-        item = Item(SESSION_CHECKOUT, checkout, cachedir.allocated_bytes(checkout))
-        result.add(
-            [item],
-            _guarded(session_id, directory, partial(_remove_checkout, checkout, roots), ended=True),
-        )
-    caches = [
-        tagged
-        for top in _subdirs(directory)
-        if not _there(top / ".git")
-        for tagged in cachedir.cache_dirs(top)
-    ]
-    for checkout in kept:
-        caches.extend(_checkout_caches(checkout))
-    for tagged in sorted(caches):
+    for tagged in _session_caches(directory, result):
         item = Item(SESSION_CACHE, tagged, cachedir.allocated_bytes(tagged))
-        result.add(
-            [item], _guarded(session_id, directory, partial(_removed, tagged, roots), ended=True)
-        )
 
+        def free(path: Path = tagged) -> str | None:
+            if not _session_cache(path, directory):
+                return "skipped: it is no longer a cache tidy may free"
+            _remove(path, roots)
+            return None
 
-def _removed(path: Path, roots: Roots) -> str | None:
-    _remove(path, roots)
-    return None
+        result.add([item], _guarded(session_id, directory, free))
 
 
 def _guarded(
-    session_id: str, directory: Path, run: Callable[[], str | None], *, ended: bool
+    session_id: str,
+    directory: Path,
+    run: Callable[[], str | None],
+    *,
+    at_least: timedelta = timedelta(0),
 ) -> Callable[[], str | None]:
-    """``run``, once the session is still as planned: no row took it up, no process names it now,
-    it wrote nothing since (its board row, its transcript), and, for one planned ``ended``, the
-    evidence it ended stands. Its directory's own times are not asked again: this run's deletes
-    move them."""
+    """``run``, once the session is still as planned, every guard asked again (review of #58,
+    M-d): no row took it up or works in it, no process names it, the evidence it ended stands
+    (and is ``at_least`` old), and it wrote nothing since. Its directory's own times are not
+    asked again: this run's deletes move them. ``run`` re-runs its own scan before it acts."""
 
     def checked() -> str | None:
+        now = _now()
         with store_session() as store:
-            rows = [row for row in _every_row(store) if row.session_id == session_id]
-            alive = _liveness(store, session_id, rows, _command_lines())
-        if alive.held or alive.running is not False or (ended and not alive.ended):
+            alive = _liveness(store, session_id, directory, _every_row(store), _command_lines())
+        if alive.held or alive.running is not False or alive.ended_at is None:
             return "skipped: the session is no longer ended"
-        if alive.wrote is not None and _now() - alive.wrote < ENDED_IDLE:
+        if now - alive.ended_at < at_least:
+            return "skipped: the session is no longer ended"
+        if alive.wrote is not None and now - alive.wrote < ENDED_IDLE:
             return "skipped: the session is no longer ended"
         return run()
 
@@ -802,25 +803,37 @@ def _idle_build_output(
         if not roots.allows(tree):
             continue  # the project's own checkout, or a tree outside the fleet's folder
         if cachedir.is_cache_dir(tree):
-            result.kept.append(Kept(IDLE_BUILD_CACHE, tree, ROOT_TAG))
+            result.ignored.append(tree)
         for tagged in _build_output(tree):
             item = Item(IDLE_BUILD_CACHE, tagged, cachedir.allocated_bytes(tagged))
-            result.add([item], _while_idle(project, row, config.idle_build_hours, tagged, roots))
+            result.add(
+                [item], _while_idle(project, row, config.idle_build_hours, tree, tagged, roots)
+            )
 
 
 def _build_output(tree: Path) -> list[Path]:
-    """The caches STRICTLY inside ``tree`` (never its root, nor one holding a ``.git``), never an
-    environment nor any inside one (a live agent runs its commands from it), and none that git
-    tracks anything of."""
+    """The caches STRICTLY inside ``tree`` (never its root, nor one holding a repository or
+    crossing a mount), none of them an environment, inside one or holding one at any depth (a
+    live agent runs its commands from it), and none that git tracks anything of."""
     return [
         tagged
         for tagged in cachedir.cache_dirs(tree, skip=cachedir.is_environment)
-        if not _tracked_inside(tree, tagged)
+        if _idle_output(tree, tagged)
     ]
 
 
+def _idle_output(tree: Path, tagged: Path) -> bool:
+    """:func:`_build_output`'s test for one cache, asked again just before it goes (M-d)."""
+    return (
+        tagged != tree
+        and cachedir.is_cache(tagged)
+        and not cachedir.holds_environment(tagged)
+        and not _tracked_inside(tree, tagged)
+    )
+
+
 def _while_idle(
-    project: ProjectInfo, row: FleetAgent, hours: float, tagged: Path, roots: Roots
+    project: ProjectInfo, row: FleetAgent, hours: float, tree: Path, tagged: Path, roots: Roots
 ) -> Callable[[], str | None]:
     def run() -> str | None:
         with store_session() as store:
@@ -828,6 +841,8 @@ def _while_idle(
             idle = now_row is not None and _idle_coder(store, project, now_row, hours, _now())
         if not idle:
             return "skipped: the coder is no longer idle"
+        if not _idle_output(tree, tagged):
+            return "skipped: it is no longer build output tidy may free"
         _remove(tagged, roots)
         return None
 

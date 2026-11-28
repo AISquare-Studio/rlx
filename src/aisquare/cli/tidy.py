@@ -9,6 +9,7 @@ exactly that list, and says what it did not free and why.
 from __future__ import annotations
 
 import json
+from pathlib import Path
 from typing import Any
 
 import typer
@@ -36,7 +37,7 @@ def _item(item: tidy_service.Item) -> dict[str, Any]:
 
 
 def _kept(kept: tidy_service.Kept) -> dict[str, Any]:
-    return {"rule": kept.rule, "path": str(kept.path), "why": kept.why}
+    return {"rule": kept.rule, "path": str(kept.path), "why": kept.why, "bytes": kept.bytes}
 
 
 def plan_json(plan: tidy_service.Plan) -> dict[str, Any]:
@@ -48,6 +49,7 @@ def plan_json(plan: tidy_service.Plan) -> dict[str, Any]:
         "kept": [_kept(kept) for kept in plan.kept],
         "counts": plan.counts(),
         "branches": [{"repo": str(repo), "branch": branch} for repo, branch in plan.branches],
+        "ignored_tags": [str(path) for path in plan.ignored],
     }
 
 
@@ -88,7 +90,22 @@ def _print_reasons(title: str, rows: list[tuple[str, str, str]]) -> None:
 
 
 def _print_kept(kept: list[tidy_service.Kept]) -> None:
-    _print_reasons("kept:", [(k.rule, paths.shown(k.path), k.why) for k in kept])
+    rows = [
+        (k.rule, paths.shown(k.path) + (f"  ({size(k.bytes)})" if k.bytes else ""), k.why)
+        for k in kept
+    ]
+    _print_reasons("kept:", rows)
+
+
+def _print_ignored(ignored: list[Path]) -> None:
+    """The roots whose CACHEDIR.TAG authorised nothing, apart from ``kept`` (a freed tree is
+    never said kept: tester #3577, m1)."""
+    if not ignored:
+        return
+    console = stdout_console()
+    console.print(f"\nignored, a CACHEDIR.TAG at a root: {tidy_service.ROOT_TAG}", markup=False)
+    for path in ignored:
+        console.print(f"  {paths.shown(path)}", markup=False)
 
 
 def tidy(
@@ -117,6 +134,7 @@ def tidy(
         for repo, branch in plan.branches:
             console.print(f"branch {branch} in {paths.shown(repo)} would go", markup=False)
         _print_kept(plan.kept)
+        _print_ignored(plan.ignored)
         return
     report = tidy_service.apply(plan)
     if get_state().json_output:
