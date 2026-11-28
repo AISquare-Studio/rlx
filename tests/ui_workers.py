@@ -16,6 +16,9 @@ assert holds.
 ``watch_until`` is the look for a fact that does not last (a toast), on the event loop's own
 clock: no settle comes before it, because on Windows a settle can outlast the fact.
 
+``pause_until`` pauses the app until a fact holds, for so many seconds of the wall clock, and
+fails saying what it waited for: for a worker's step on its own thread, where no settle helps.
+
 ``released`` waits out a Button's press effect before the next click on it.
 
 ``laid_out`` is whether the screen has laid out every change asked of it. ``settle_page`` waits
@@ -250,6 +253,41 @@ async def settle_until_held(
         if done():
             return
     raise AssertionError(f"waited {timeout:g} s for {what}, and it never held")
+
+
+UNTIL_S = 15.0
+"""Seconds :func:`pause_until` waits at most: of the wall clock, whatever the runner's speed."""
+_PAUSE_S = 0.01
+
+
+async def pause_until(
+    pilot: Pilot[Any],
+    done: Callable[[], object],
+    *,
+    what: str | Callable[[], str],
+    timeout: float = UNTIL_S,
+) -> None:
+    """Pause the app (``pilot.pause``, 10 ms a look) until ``done()`` holds, for ``timeout``
+    seconds of the wall clock at most, then FAIL naming ``what`` (a callable: said as it reads
+    when the time is up).
+
+    For a worker's step on a thread of its own (a save's store write, a reading's answer),
+    which the test then relies on. Bounded by ``time.monotonic()``, never by a count of pauses:
+    each pause lasts what the runner gives it, so 500 pauses of 10 ms were 5 s on a fast
+    machine and less real time for the worker on a slow one. On windows-py3.12 a save wrote
+    just after such a budget ran out (run 46132629560, shard 3/10, #67): a slow worker, not a
+    hang. A widget ``done`` reads that is not mounted yet is a fact that does not hold yet.
+    """
+    deadline = time.monotonic() + timeout
+    while True:
+        with contextlib.suppress(NoMatches):
+            if done():
+                return
+        if time.monotonic() >= deadline:
+            break
+        await pilot.pause(_PAUSE_S)
+    said = what() if callable(what) else what
+    raise AssertionError(f"waited {timeout:g} s for {said}, and it never held")
 
 
 async def _handled(app: App[Any]) -> None:

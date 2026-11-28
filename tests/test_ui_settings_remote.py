@@ -65,7 +65,7 @@ from tests.test_ui_remote import (  # noqa: F401 — the autouse fixtures, appli
     written,
 )
 from tests.toast_log import record
-from tests.ui_workers import settle_page
+from tests.ui_workers import pause_until, settle_page
 
 
 def path_with(tmp_path: Path, *tools: str) -> None:
@@ -291,12 +291,9 @@ NEW_TOKEN = "2newTOKEN_9876543210zyxwvutsrqponmlkjihgfedcb"
 
 
 async def until(pilot: Pilot[None], done: Callable[[], bool], *, what: str) -> None:
-    """Pause until ``done()`` holds: ngrok's answer comes on a thread of its own."""
-    for _ in range(500):
-        if done():
-            return
-        await pilot.pause(0.01)
-    raise AssertionError(f"never: {what}")
+    """Pause until ``done()`` holds: ngrok's answer comes on a thread of its own. Bounded by
+    the wall clock, not a count of pauses (``pause_until``, #67)."""
+    await pause_until(pilot, done, what=what)
 
 
 def slot_seen(section: RemotePanel) -> tuple[bool, str, bool]:

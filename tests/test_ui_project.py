@@ -89,7 +89,7 @@ from aisquare.services import explainability_ops as ops
 from aisquare.services import fleet as fleet_service
 from aisquare.services import team as team_service
 from tests.ci_support import git
-from tests.ui_workers import settle_page
+from tests.ui_workers import pause_until, settle_page
 
 T = TypeVar("T")
 
@@ -1115,21 +1115,19 @@ def test_the_board_keys_answer_as_soon_as_its_tab_is_clicked(project: ProjectInf
         # The click's chain (the tab activated, its pane shown, the panel's on_show taking the
         # keys) is several messages long; one pause() guesses "idle" from CPU time and, on a
         # loaded Windows runner, returned before its end (#29). Wait for the focus itself.
-        for _ in range(500):  # bounded: 10 s at most
-            if inside():
-                break
-            await pilot.pause(0.02)
-        else:
-            pytest.fail(f"the tab's click left the focus outside the board: {host.focused!r}")
+        await pause_until(
+            pilot,
+            inside,
+            what=lambda: f"the tab's click to bring the focus into the board (on {host.focused!r})",
+        )
         took = inside()
         folded = "done" in panel.folds
         await pilot.press("d")  # no click inside the board first: Done unfolds (B2)
-        for _ in range(500):
-            if "done" not in panel.folds:
-                break
-            await pilot.pause(0.02)
-        else:
-            pytest.fail(f"d did not reach the board: its folds read {sorted(panel.folds)}")
+        await pause_until(
+            pilot,
+            lambda: "done" not in panel.folds,
+            what=lambda: f"d to reach the board and unfold Done (folds {sorted(panel.folds)})",
+        )
         return took, folded, "done" in panel.folds
 
     inside, folded, still = drive(project, scenario)
@@ -1839,11 +1837,7 @@ def test_a_config_write_made_while_save_setup_runs_is_not_saved_over(
         armed.set()
         _attach_in_setup(host, "pk-race-0123456789")
         try:
-            for _ in range(500):
-                if asked.is_set():
-                    break
-                await pilot.pause(0.01)
-            assert asked.is_set(), "the save never asked git"
+            await pause_until(pilot, asked.is_set, what="the save to ask git")
             during = [host.query_one(switch, Button).disabled for switch in switches]
             host.query_one("#explainability-disable", Button).press()
             await pilot.pause()
@@ -2542,10 +2536,7 @@ def test_enter_then_leaving_the_nickname_before_its_save_lands_keeps_it_once(
         await pilot.click("#nickname")
         field.value = "Auth"
         await pilot.press("enter")
-        for _ in range(500):  # bounded: the worker's store write, on its own thread
-            if written.is_set():
-                break
-            await pilot.pause(0.01)
+        await pause_until(pilot, written.is_set, what="the save's store write")
         seen: dict[str, Any] = {"held": (written.is_set(), field.kept)}
         field.blur()  # left before the page has heard the save
         await pilot.pause()
@@ -2611,10 +2602,7 @@ def test_a_refresh_between_the_nicknames_write_and_its_report_leaves_ctrl_z_the_
         await pilot.click("#nickname")
         field.value = "Auth"
         await pilot.press("enter")
-        for _ in range(500):  # bounded: the worker's store write, on its own thread
-            if written.is_set():
-                break
-            await pilot.pause(0.01)
+        await pause_until(pilot, written.is_set, what="the save's store write")
         page.show_project(from_store())  # the frame: the store's project, the new name in it
         await pilot.pause()
         seen: dict[str, Any] = {"framed": (written.is_set(), page.project.nickname)}
@@ -2625,10 +2613,7 @@ def test_a_refresh_between_the_nicknames_write_and_its_report_leaves_ctrl_z_the_
         await pilot.pause()
         await pilot.press("ctrl+z")
         undo_written, undo_let_go = gates[None]
-        for _ in range(500):
-            if undo_written.is_set():
-                break
-            await pilot.pause(0.01)
+        await pause_until(pilot, undo_written.is_set, what="Undo's store write")
         page.show_project(from_store())  # a frame in the Undo's window too: codename back
         await pilot.pause()
         # Not typed in (it shows what it last kept), the field follows the frame: the name
@@ -2689,13 +2674,6 @@ def test_a_save_superseded_before_its_report_is_heard_records_no_undo_and_keeps_
         with store_session() as store:
             return store.get_project(project.id).nickname  # type: ignore[union-attr]
 
-    async def until(pilot: Pilot[None], done: Callable[[], bool]) -> None:
-        for _ in range(500):  # bounded: a worker's step, on its own thread
-            if done():
-                return
-            await pilot.pause(0.01)
-        raise AssertionError("never happened")
-
     async def scenario(pilot: Pilot[None], host: Host) -> dict[str, Any]:
         host.query_one(ProjectView).active = "tab-settings"
         await settle(pilot)
@@ -2704,7 +2682,7 @@ def test_a_save_superseded_before_its_report_is_heard_records_no_undo_and_keeps_
         await pilot.click("#nickname")
         field.value = "V1"
         await pilot.press("enter")
-        await until(pilot, gates["V1"][0].is_set)
+        await pause_until(pilot, gates["V1"][0].is_set, what="V1's store write")
         first = page._nickname_worker
         assert first is not None
         queued: list[Message] = []
@@ -2722,10 +2700,14 @@ def test_a_save_superseded_before_its_report_is_heard_records_no_undo_and_keeps_
 
         monkeypatch.setattr(page, "post_message", hold_firsts_report)
         gates["V1"][1].set()
-        await until(pilot, lambda: first.state is WorkerState.SUCCESS and bool(queued))
+        await pause_until(
+            pilot,
+            lambda: first.state is WorkerState.SUCCESS and bool(queued),
+            what="V1's save to finish, its report held back",
+        )
         field.value = "V2"
         await pilot.press("enter")  # V2 asked while V1's report waits
-        await until(pilot, gates["V2"][0].is_set)
+        await pause_until(pilot, gates["V2"][0].is_set, what="V2's store write")
         monkeypatch.setattr(page, "post_message", post)
         post(queued[0])  # V1's report reaches the page, after V2 was asked
         await pilot.pause()
@@ -2786,10 +2768,7 @@ def test_a_name_kept_after_an_undo_it_superseded_records_its_own_undo(
         await pilot.press("enter")
         await settle(pilot)
         await pilot.press("ctrl+z")  # Undo's save, held after its write
-        for _ in range(500):  # bounded: the worker's store write, on its own thread
-            if written.is_set():
-                break
-            await pilot.pause(0.01)
+        await pause_until(pilot, written.is_set, what="Undo's store write")
         after_undo = len(page.changes)
         field.value = "V3"
         await pilot.press("enter")  # a new name before Undo's report is heard
@@ -2826,14 +2805,6 @@ def _nickname_page_held(
     return gates
 
 
-async def _until(pilot: Pilot[None], done: Callable[[], bool]) -> None:
-    for _ in range(500):  # bounded: a worker's step, on its own thread
-        if done():
-            return
-        await pilot.pause(0.01)
-    raise AssertionError("never happened")
-
-
 @pytest.mark.parametrize("undo_report", ["cancelled", "finished"])
 def test_a_name_asked_before_an_undo_is_heard_undoes_to_the_name_the_undo_wrote(
     project: ProjectInfo, monkeypatch: pytest.MonkeyPatch, undo_report: str
@@ -2867,7 +2838,7 @@ def test_a_name_asked_before_an_undo_is_heard_undoes_to_the_name_the_undo_wrote(
         await pilot.press("enter")
         await settle(pilot)
         await pilot.press("ctrl+z")  # Undo's save, held after it writes no nickname
-        await _until(pilot, undo_written.is_set)
+        await pause_until(pilot, undo_written.is_set, what="Undo's store write")
         undo = page._nickname_worker
         assert undo is not None
         queued: list[Message] = []
@@ -2886,7 +2857,11 @@ def test_a_name_asked_before_an_undo_is_heard_undoes_to_the_name_the_undo_wrote(
 
             monkeypatch.setattr(page, "post_message", hold_undos_report)
             undo_let_go.set()
-            await _until(pilot, lambda: undo.state is WorkerState.SUCCESS and bool(queued))
+            await pause_until(
+                pilot,
+                lambda: undo.state is WorkerState.SUCCESS and bool(queued),
+                what="Undo's save to finish, its report held back",
+            )
         field.value = "V3"
         await pilot.press("enter")  # asked before Undo's report is heard
         await settle(pilot)
@@ -2936,7 +2911,7 @@ def test_an_earlier_saves_report_leaves_the_name_being_typed_in_the_field(
         await pilot.click("#nickname")
         field.value = "V1"
         await pilot.press("enter")
-        await _until(pilot, written.is_set)
+        await pause_until(pilot, written.is_set, what="V1's store write")
         field.value = "V2"  # typed, not entered
         let_go.set()
         await settle(pilot)

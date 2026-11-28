@@ -30,7 +30,7 @@ from tests import test_ui_shell as ui_suite
 from tests import toast_log
 from tests.fleet_fakes import list_agents_as
 from tests.test_ui_shell import Script, drive, fleet_app, refreshed, row_for, seed, shown, status
-from tests.ui_workers import settle_until
+from tests.ui_workers import pause_until, settle_until
 
 # The UI suite's fixtures, bound here so pytest finds them for this module's tests
 # (``no_real_tmux`` is autouse there: every tmux call held to a private socket).
@@ -46,13 +46,10 @@ async def until(pilot: Pilot[None], done: Callable[[], bool], *, what: str) -> N
     Windows CI ``pilot.pause()`` returned between the two halves (its idle wait
     rides a coarse timer): the test body ended, and the rest of the handler ran
     during teardown — ``NoMatches`` for the Doctor section (#219, 77ed31cb, job
-    108064714234). So a test waits for the handler's LAST effect, not for a pause.
+    108064714234). So a test waits for the handler's LAST effect, not for a pause, and for so
+    many seconds of the wall clock, not a count of pauses (``pause_until``, #67).
     """
-    for _ in range(200):
-        if done():
-            return
-        await pilot.pause(0.02)
-    raise AssertionError(f"the UI never settled: {what}")
+    await pause_until(pilot, done, what=f"the UI to settle: {what}")
 
 
 async def quiet(pilot: Pilot[None]) -> None:
