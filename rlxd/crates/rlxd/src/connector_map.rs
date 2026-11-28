@@ -177,7 +177,7 @@ impl ConnectorMap {
     /// `connectors.list {refresh: true}` on the no-turn route: reads `only`'s connectors,
     /// or every account's (asking the brain for them first). Fails only when no read
     /// succeeded: with the first read's error.
-    pub async fn refresh(&self, only: Option<u32>) -> Result<(), ErrorBody> {
+    pub async fn refresh(&self, only: Option<u32>, identify: bool) -> Result<(), ErrorBody> {
         self.learn_accounts().await;
         let accounts: Vec<Account> = match only {
             Some(slot) => self.connectors.account(slot).into_iter().collect(),
@@ -194,8 +194,9 @@ impl ConnectorMap {
             }
         }
         // Who each account is on its connectors: on an explicit refresh only (never a
-        // tick's), with the call route on and an app connected to decide each call.
-        if self.connectors.call_route() && self.runner.app_present() {
+        // tick's) by a client that may make a connectors.call (`identify`: app, cli and
+        // tui, not remote), with the call route on and an app connected to decide each.
+        if identify && self.connectors.call_route() && self.runner.app_present() {
             for account in &fresh {
                 self.identify(account).await;
             }

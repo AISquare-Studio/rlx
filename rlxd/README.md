@@ -483,16 +483,22 @@ listing, 5.5 and 7.7): `crate::connectors`, and the gate in `crate::runner::conn
     itself (its settings' hook is `rlxd __probe-deny`, which opens no connection), and
     reports `model_turns: 1`. rlxd's log says when each probe and each read ran, of which
     slot, and holds neither a probe's prompt nor what either listed.
-  - **Identity** (task #14, step 2; `crate::identity`): after an explicit refresh's reads,
-    and only with the capability `connectors.call` on and an app connected now, rlxd asks
+  - **Identity** (task #14, step 2; `crate::identity`): after an explicit refresh's reads
+    by an `app`, `cli` or `tui` client (a `remote` refresh reads the statuses alone, as
+    `connectors.call` refuses `remote`), and only with the capability `connectors.call`
+    on and an app connected now, rlxd asks
     who each account is on each connector its identity table names: `{workspace?, user?,
     email?}`. One call per account and connector, at most, of the table's read tool with
     its fixed input, and only when that account's own listing holds the connector
     `connected` and the tool with `read_only_hint: true`. Each is a `connectors.call` run
     on that account's environment, a gated `watch` run in `run.list` and the ledger
-    started by `rlxd-identity`, and the app decides it. A deny, a failure or an answer
-    that says nothing changes nothing; an identity stays as read until the account is
-    signed in as someone else. Never from a tick, and never in rlxd's log. A release
+    started by `rlxd-identity`, and the app decides it. Its result is the identity
+    reader's alone: the run's `run.tool_result` carries no content (`null`), so no event
+    and nothing in the run's folder holds it; only the identity read from it, in the cache
+    and `connectors.list`'s reply. A deny, a failure or an answer that says nothing
+    changes nothing; an identity stays as read until the account is signed in as someone
+    else, and a new mark forgets it at once, before any read. Never from a tick, and
+    never in rlxd's log. A release
     build's table is empty until the owner's probe (M4) names each connector's tool; a
     test build's holds the fixture's `claude.ai Fixture` `whoami`.
   - **In the background**, only with `connectors.no_turn` (no turn is ever spent unasked):

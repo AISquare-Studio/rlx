@@ -337,10 +337,21 @@ impl Saved {
 impl Entry {
     /// Keeps `account`'s label, homes and mark, as rlx gave them, with what was read.
     fn keep(&mut self, account: &Account) {
+        if account.signed_in_again(self) {
+            self.forget_identities();
+        }
         self.label.clone_from(&account.label);
         self.config_dir.clone_from(&account.config_dir);
         self.tmp_dir.clone_from(&account.tmp_dir);
         self.login.clone_from(&account.login);
+    }
+
+    /// Forgets who the account was on each connector: another sign-in may be another
+    /// workspace's.
+    fn forget_identities(&mut self) {
+        for connector in &mut self.connectors {
+            connector.identity = None;
+        }
     }
 }
 
@@ -638,6 +649,11 @@ impl Connectors {
                 None => to_read.push(account.clone()),
                 Some(entry) => {
                     if account.signed_in_again(entry) {
+                        // Signed in as someone else: who it was is forgotten at once.
+                        if entry.connectors.iter().any(|c| c.identity.is_some()) {
+                            entry.forget_identities();
+                            changed = true;
+                        }
                         to_read.push(account.clone());
                     }
                     if entry.label != account.label {
@@ -1546,6 +1562,38 @@ mod tests {
             .find(|a| a.account == slot)
             .unwrap()
             .clone()
+    }
+
+    #[test]
+    fn an_identity_is_read_only_of_a_connected_connector_with_the_tables_tool_read_only() {
+        let dir = Dir::new();
+        let connectors = dir.connectors();
+        let whoami = "mcp__claude_ai_Fixture__whoami".to_owned();
+        let read_only = HashMap::from([(whoami.clone(), true)]);
+        let sources = HashMap::new();
+        let read = |status: &str, tools: &[String], hints: &HashMap<String, bool>| {
+            let servers = [McpServer::new("claude.ai Fixture", status)];
+            connectors.observe(Observed {
+                servers: &servers,
+                sources: &sources,
+                tools,
+                hints,
+            });
+            connectors
+                .identity_sources(DEFAULT_ACCOUNT)
+                .iter()
+                .map(|source| source.tool)
+                .collect::<Vec<_>>()
+        };
+        let tools = [whoami.clone()];
+        assert_eq!(read("connected", &tools, &read_only), [whoami.as_str()]);
+        // Its tool still mounted, but signed out: no call.
+        assert!(read("needs-auth", &tools, &read_only).is_empty());
+        // Connected, its tool not read-only, or not the table's: no call.
+        assert!(read("connected", &tools, &HashMap::new()).is_empty());
+        let other = ["mcp__claude_ai_Fixture__whois".to_owned()];
+        let other_read_only = HashMap::from([(other[0].clone(), true)]);
+        assert!(read("connected", &other, &other_read_only).is_empty());
     }
 
     #[test]

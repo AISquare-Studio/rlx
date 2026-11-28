@@ -182,6 +182,10 @@ pub(super) struct CallRun {
     /// The account whose environment the call runs on, when rlxd makes it for that
     /// account (an identity read, [`Runner::identity_call`]); else rlxd's own.
     account: Option<Account>,
+    /// Whether the call's result is the caller's alone (an identity read): its
+    /// `run.tool_result` carries no content, so neither the run's events nor its folder
+    /// hold any.
+    withheld: bool,
 }
 
 impl CallRun {
@@ -191,6 +195,7 @@ impl CallRun {
             input: Map::new(),
             outcome: Mutex::new(None),
             account: None,
+            withheld: false,
         }
     }
 
@@ -308,6 +313,7 @@ impl Runner {
         let call = CallRun {
             input: params.input,
             outcome: Mutex::new(None),
+            withheld: account.is_some(),
             account,
         };
         self.start_checked(start, client, job_id, loud, watch_job, Some(call))
@@ -955,8 +961,13 @@ impl Runner {
                 truncated,
             });
         }
-        let data =
-            RunToolResultData::new(call_id, tool, is_error, content.clone()).truncated(truncated);
+        // An identity read's content is its reader's alone: the stream says only how it
+        // came out.
+        let data = if call.withheld {
+            RunToolResultData::new(call_id, tool, is_error, Value::Null)
+        } else {
+            RunToolResultData::new(call_id, tool, is_error, content.clone()).truncated(truncated)
+        };
         self.emit(run, &mut inner, run_types::TOOL_RESULT, &data);
         drop(inner);
         if let Some(error) = failure {

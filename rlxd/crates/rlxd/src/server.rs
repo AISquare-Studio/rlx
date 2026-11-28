@@ -2132,7 +2132,10 @@ impl Daemon {
             return printed(&off_worker(|| self.connectors.list(0, only)));
         }
         if self.connectors.no_turn() {
-            self.map.refresh(only).await?;
+            // Identity reads are connectors.call runs, which remote may not make: its
+            // refresh reads the statuses alone.
+            let identify = matches!(session.role, Role::App | Role::Cli | Role::Tui);
+            self.map.refresh(only, identify).await?;
             return printed(&off_worker(|| self.connectors.list(0, only)));
         }
         if !params.allow_turn() {

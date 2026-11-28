@@ -170,6 +170,14 @@ fn starts(home: &TestHome) -> Vec<Value> {
 
 /// Every `mcp_call` a start was sent, with that start's `CLAUDE_CONFIG_DIR`.
 fn mcp_calls(home: &TestHome) -> Vec<(String, Option<String>)> {
+    mcp_calls_with_arguments(home)
+        .into_iter()
+        .map(|(tool, dir, _)| (tool, dir))
+        .collect()
+}
+
+/// [`mcp_calls`], each with the arguments it was sent.
+fn mcp_calls_with_arguments(home: &TestHome) -> Vec<(String, Option<String>, Value)> {
     starts(home)
         .iter()
         .flat_map(|start| {
@@ -181,33 +189,68 @@ fn mcp_calls(home: &TestHome) -> Vec<(String, Option<String>)> {
                 .cloned()
                 .unwrap_or_default()
                 .into_iter()
-                .map(move |call| (call["tool"].as_str().unwrap().to_owned(), dir.clone()))
+                .map(move |call| {
+                    let tool = call["tool"].as_str().unwrap().to_owned();
+                    (tool, dir.clone(), call["arguments"].clone())
+                })
         })
         .collect()
+}
+
+/// How many identity runs `run.list` holds: the runs started by `rlxd-identity`.
+fn identity_runs(home: &TestHome) -> usize {
+    let runs = home.rlxd(&["call", "run.list"]).data();
+    runs["runs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|run| run["client"] == "rlxd-identity")
+        .count()
+}
+
+/// Every file under `dir`, as text.
+fn texts_under(dir: &std::path::Path) -> String {
+    let mut all = String::new();
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return all;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            all.push_str(&texts_under(&path));
+        } else if let Ok(bytes) = std::fs::read(&path) {
+            all.push_str(&String::from_utf8_lossy(&bytes));
+        }
+    }
+    all
 }
 
 #[test]
 fn with_an_app_each_account_gains_its_identity_from_one_read_call_on_its_own_home() {
     let (home, managed) = identity_home(
-        &fixture("Fixture Works", "ada", true),
-        &fixture("Other Works", "grace", true),
+        &fixture("Tidewater Works", "Zoltan", true),
+        &fixture("Kestrel Works", "Quinn", true),
         &[],
     );
     let _app = App::open(&home);
     let (data, asked) = refresh_deciding(&home, "allow");
     assert_eq!(
         fixture_row(&data, 1)["identity"],
-        json!({"workspace": "Fixture Works", "user": "ada"}),
+        json!({"workspace": "Tidewater Works", "user": "Zoltan"}),
         "{data:#}"
     );
     assert_eq!(
         fixture_row(&data, 2)["identity"],
-        json!({"workspace": "Other Works", "user": "grace"}),
+        json!({"workspace": "Kestrel Works", "user": "Quinn"}),
         "{data:#}"
     );
     // One call per account, of the read tool, each decided by the app.
     assert_eq!(asked.len(), 2, "{asked:#?}");
     assert!(asked.iter().all(|a| a["tool"] == WHOAMI), "{asked:#?}");
+    // Each sent with the table's fixed input, nothing of the user's.
+    for (_, _, arguments) in mcp_calls_with_arguments(&home) {
+        assert_eq!(arguments, json!({}), "the fixed input");
+    }
     let calls = mcp_calls(&home);
     assert_eq!(calls.len(), 2, "{calls:#?}");
     assert!(
@@ -239,8 +282,25 @@ fn with_an_app_each_account_gains_its_identity_from_one_read_call_on_its_own_hom
             .all(|run| run["kind"] == "watch" && run["state"] == "done"),
         "{runs:#}"
     );
-    // The values are on the wire, never in rlxd's log.
-    for said in ["Fixture Works", "Other Works", "ada", "grace"] {
+    // The values are in connectors.list's reply and the cache alone: never in an event
+    // (the identity runs' run.tool_result carries no content), a run's folder, or
+    // rlxd's log.
+    let events = home.rlxd(&["events", "--since", "0"]).stdout.clone();
+    let results: Vec<Value> = home
+        .rlxd(&["events", "--topics", "run", "--since", "0"])
+        .lines()
+        .into_iter()
+        .filter(|e| e["type"] == "run.tool_result")
+        .collect();
+    assert_eq!(results.len(), 2, "{results:#?}");
+    assert!(
+        results.iter().all(|e| e["data"]["content"].is_null()),
+        "{results:#?}"
+    );
+    let runs = texts_under(&home.root().join("rlxd").join("runs"));
+    for said in ["Tidewater Works", "Kestrel Works", "Zoltan", "Quinn"] {
+        assert!(!events.contains(said), "{said} in an event");
+        assert!(!runs.contains(said), "{said} in a run's folder");
         assert!(!home.log().contains(said), "{said} in rlxd's log");
     }
     // A later refresh keeps them, and reads them again: one more call each.
@@ -255,8 +315,8 @@ fn with_an_app_each_account_gains_its_identity_from_one_read_call_on_its_own_hom
 #[test]
 fn with_no_app_the_identity_stays_null_and_nothing_is_called() {
     let (home, _) = identity_home(
-        &fixture("Fixture Works", "ada", true),
-        &fixture("Other Works", "grace", true),
+        &fixture("Tidewater Works", "Zoltan", true),
+        &fixture("Kestrel Works", "Quinn", true),
         &[],
     );
     let (data, asked) = refresh_deciding(&home, "allow");
@@ -274,8 +334,8 @@ fn with_no_app_the_identity_stays_null_and_nothing_is_called() {
 #[test]
 fn a_denied_read_leaves_the_identity_null() {
     let (home, _) = identity_home(
-        &fixture("Fixture Works", "ada", true),
-        &fixture("Other Works", "grace", true),
+        &fixture("Tidewater Works", "Zoltan", true),
+        &fixture("Kestrel Works", "Quinn", true),
         &[],
     );
     let _app = App::open(&home);
@@ -298,14 +358,18 @@ fn a_denied_read_leaves_the_identity_null() {
 #[test]
 fn a_tool_that_accounts_listing_does_not_hold_read_only_is_never_called() {
     let (home, _) = identity_home(
-        &fixture("Fixture Works", "ada", true),
-        &fixture("Other Works", "grace", false),
+        &fixture("Tidewater Works", "Zoltan", true),
+        &fixture("Kestrel Works", "Quinn", false),
         &[],
     );
     let _app = App::open(&home);
     let (data, asked) = refresh_deciding(&home, "allow");
     assert_eq!(asked.len(), 1, "slot 1's alone: {asked:#?}");
-    assert_eq!(fixture_row(&data, 1)["identity"]["user"], "ada", "{data:#}");
+    assert_eq!(
+        fixture_row(&data, 1)["identity"]["user"],
+        "Zoltan",
+        "{data:#}"
+    );
     assert_eq!(fixture_row(&data, 2)["identity"], Value::Null, "{data:#}");
     assert_eq!(mcp_calls(&home).len(), 1);
     // Not even started for slot 2: one identity run, slot 1's (the gate's own rules would
@@ -323,8 +387,8 @@ fn a_tool_that_accounts_listing_does_not_hold_read_only_is_never_called() {
 #[test]
 fn without_connectors_call_no_identity_is_read() {
     let (home, _) = identity_home(
-        &fixture("Fixture Works", "ada", true),
-        &fixture("Other Works", "grace", true),
+        &fixture("Tidewater Works", "Zoltan", true),
+        &fixture("Kestrel Works", "Quinn", true),
         &[("RLXD_TEST_CONNECTORS_CALL", "0")],
     );
     let _app = App::open(&home);
@@ -337,8 +401,8 @@ fn without_connectors_call_no_identity_is_read() {
 #[test]
 fn the_background_never_reads_an_identity() {
     let (home, _) = identity_home(
-        &fixture("Fixture Works", "ada", true),
-        &fixture("Other Works", "grace", true),
+        &fixture("Tidewater Works", "Zoltan", true),
+        &fixture("Kestrel Works", "Quinn", true),
         &[("RLXD_TEST_CONNECTOR_MAP_MS", "200,1000")],
     );
     let _app = App::open(&home);
@@ -354,15 +418,15 @@ fn the_background_never_reads_an_identity() {
 #[test]
 fn a_new_sign_in_forgets_the_identity_read_before() {
     let (home, _) = identity_home(
-        &fixture("Fixture Works", "ada", true),
-        &fixture("Other Works", "grace", true),
+        &fixture("Tidewater Works", "Zoltan", true),
+        &fixture("Kestrel Works", "Quinn", true),
         &[],
     );
     let app = App::open(&home);
     let (data, _) = refresh_deciding(&home, "allow");
     assert_eq!(
         fixture_row(&data, 2)["identity"]["user"],
-        "grace",
+        "Quinn",
         "{data:#}"
     );
     drop(app);
@@ -375,5 +439,118 @@ fn a_new_sign_in_forgets_the_identity_read_before() {
     std::fs::write(&listed, accounts.to_string()).unwrap();
     let (data, _) = refresh_deciding(&home, "allow");
     assert_eq!(fixture_row(&data, 2)["identity"], Value::Null, "{data:#}");
-    assert_eq!(fixture_row(&data, 1)["identity"]["user"], "ada", "{data:#}");
+    assert_eq!(
+        fixture_row(&data, 1)["identity"]["user"],
+        "Zoltan",
+        "{data:#}"
+    );
+}
+
+#[test]
+fn a_new_sign_in_forgets_the_identity_at_once_even_when_its_read_then_fails() {
+    let (home, _) = identity_home(
+        &fixture("Tidewater Works", "Zoltan", true),
+        &fixture("Kestrel Works", "Quinn", true),
+        &[],
+    );
+    let app = App::open(&home);
+    let (data, _) = refresh_deciding(&home, "allow");
+    assert_eq!(
+        fixture_row(&data, 2)["identity"]["user"],
+        "Quinn",
+        "{data:#}"
+    );
+    drop(app);
+    eventually("the app is gone", || home.app_clients() == 0);
+    // Slot 2 signed in as someone else, and its next read fails.
+    let listed = home.root().join("accounts.json");
+    let mut accounts: Value =
+        serde_json::from_str(&std::fs::read_to_string(&listed).unwrap()).unwrap();
+    accounts[1]["login"] = json!("another-mark");
+    std::fs::write(&listed, accounts.to_string()).unwrap();
+    // As soon as rlxd hears the new mark (a list that has it ask the brain, no read).
+    let unknown = home.rlxd(&["call", "connectors.list", r#"{"account":9}"#]);
+    assert_eq!(unknown.error_code(), "no_such_account", "{unknown:?}");
+    let data = list(&home);
+    assert_eq!(
+        fixture_row(&data, 2)["identity"],
+        Value::Null,
+        "forgotten at once: {data:#}"
+    );
+    std::fs::write(home.root().join("scenario"), "mcp-accounts-old").unwrap();
+    let failed = home.rlxd(&["call", "connectors.list", r#"{"refresh":true}"#]);
+    assert_eq!(failed.error_code(), "no_route", "{failed:?}");
+    let data = list(&home);
+    assert_eq!(
+        fixture_row(&data, 2)["identity"],
+        Value::Null,
+        "forgotten at once: {data:#}"
+    );
+    // And a good read later, with no app to ask who, has none either.
+    std::fs::write(home.root().join("scenario"), "mcp-accounts").unwrap();
+    let (data, asked) = refresh_deciding(&home, "allow");
+    assert!(asked.is_empty());
+    assert_eq!(fixture_row(&data, 2)["identity"], Value::Null, "{data:#}");
+    assert_eq!(
+        fixture_row(&data, 1)["identity"]["user"],
+        "Zoltan",
+        "{data:#}"
+    );
+}
+
+#[test]
+fn a_remote_refresh_reads_the_statuses_but_never_an_identity() {
+    let (home, _) = identity_home(
+        &fixture("Tidewater Works", "Zoltan", true),
+        &fixture("Kestrel Works", "Quinn", true),
+        &[],
+    );
+    let _app = App::open(&home);
+    let refreshed = home.rlxd(&[
+        "call",
+        "--role",
+        "remote",
+        "connectors.list",
+        r#"{"refresh":true}"#,
+    ]);
+    assert_eq!(refreshed.code(), Some(0), "{refreshed:?}");
+    let data = refreshed.data();
+    assert_eq!(fixture_row(&data, 1)["status"], "connected", "{data:#}");
+    assert_eq!(fixture_row(&data, 1)["identity"], Value::Null, "{data:#}");
+    assert!(mcp_calls(&home).is_empty());
+}
+
+#[test]
+fn a_connector_that_is_not_connected_there_gets_no_call() {
+    let mut signed_out = fixture("Kestrel Works", "Quinn", true);
+    signed_out[0]["status"] = json!("needs-auth");
+    let (home, _) = identity_home(
+        &fixture("Tidewater Works", "Zoltan", true),
+        &signed_out,
+        &[],
+    );
+    let _app = App::open(&home);
+    let (data, asked) = refresh_deciding(&home, "allow");
+    assert_eq!(asked.len(), 1, "slot 1's alone: {asked:#?}");
+    assert_eq!(fixture_row(&data, 2)["identity"], Value::Null, "{data:#}");
+    assert_eq!(mcp_calls(&home).len(), 1);
+    assert_eq!(identity_runs(&home), 1, "none even started for slot 2");
+}
+
+#[test]
+fn only_the_tables_tool_qualifies() {
+    // Slot 2 lists a read-only tool of the fixture's, but not the table's whoami.
+    let mut other_tool = fixture("Kestrel Works", "Quinn", true);
+    other_tool[0]["tools"][0]["name"] = json!("whois");
+    let (home, _) = identity_home(
+        &fixture("Tidewater Works", "Zoltan", true),
+        &other_tool,
+        &[],
+    );
+    let _app = App::open(&home);
+    let (data, asked) = refresh_deciding(&home, "allow");
+    assert_eq!(asked.len(), 1, "slot 1's alone: {asked:#?}");
+    assert_eq!(fixture_row(&data, 2)["identity"], Value::Null, "{data:#}");
+    assert!(mcp_calls(&home).iter().all(|(tool, _)| tool == WHOAMI));
+    assert_eq!(identity_runs(&home), 1, "none even started for slot 2");
 }
