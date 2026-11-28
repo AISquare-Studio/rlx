@@ -506,6 +506,14 @@ def test_the_lift_lets_a_real_agent_through_here_and_in_a_child_told_so(
     assert refusals(own_log) == []
 
 
+#: A child's first import of a module nothing has loaded: the path finder lists every
+#: ``sys.path`` entry up to it, the cwd first.
+FIRST_IMPORT = (
+    "import sys; assert 'colorsys' not in sys.modules, 'colorsys is loaded already'; "
+    "import colorsys, rlx_keychain_guard as g; print(g.__file__)"
+)
+
+
 @pytest.mark.parametrize(
     "kept", [True, False], ids=["the checkout kept a run root", "round 2's narrowing"]
 )
@@ -514,8 +522,12 @@ def test_a_child_started_in_a_checkout_inside_a_guarded_dir_is_let_through(
 ) -> None:
     """Pin for tester #3851: a checkout under a scratch ``~/.aisquare``, as a Claude Code
     scratchpad worktree lies, with the guard loaded from it. A child started in it lists it
-    at import: let through while the lift test's run roots keep the checkout, and refused
-    under round 2's narrowing, which shows this shape is the one that went red."""
+    at its first import of a module not yet loaded (``sys.path[0]`` is the cwd): let through
+    while the lift test's run roots keep the checkout, and refused under round 2's narrowing,
+    which shows this shape is the one that went red.
+
+    The child makes that import itself: one that only reads ``sys.modules`` lists nothing
+    on 3.11 or 3.12 (CI run 46118149468), and so would make the refused case pass vacuously."""
     guarded = tmp_path.resolve() / "home" / ".aisquare"
     checkout = guarded / "cache" / "scratch" / "wt"
     copy = checkout / "tests" / "keychain_guard"
@@ -530,7 +542,7 @@ def test_a_child_started_in_a_checkout_inside_a_guarded_dir_is_let_through(
         ),
     }
     child = subprocess.run(
-        [sys.executable, "-c", "import rlx_keychain_guard as g; print(g.__file__)"],
+        [sys.executable, "-c", FIRST_IMPORT],
         env=env,
         cwd=checkout,
         capture_output=True,
