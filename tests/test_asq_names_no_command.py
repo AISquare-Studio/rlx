@@ -6,6 +6,10 @@ to type; the Doctor's buttons say what they do, never their command line; a row 
 button is handed to the manager (ruled Q2), which knows the command line, or says plainly
 that a manager can fix it. The shell keeps every command: ``doctor``'s text, ``--help``,
 errors printed in a terminal.
+
+The guard knows every top-level command from the CLI itself (:data:`GUARD`), not from the
+Doctor's hand list (``COMMAND``), which missed ``status``, ``service``, ``tidy`` and more
+(reviewer #4085).
 """
 
 from __future__ import annotations
@@ -13,14 +17,19 @@ from __future__ import annotations
 import ast
 import asyncio
 import re
-from collections.abc import Iterator
+import tomllib
+from collections.abc import Iterable, Iterator
 from pathlib import Path
 from typing import Any
 
 import pytest
+import typer
+import typer.main
 from textual.app import App, ComposeResult
 from textual.widgets import Button, Static
+from typer.core import TyperGroup
 
+from aisquare.cli.app import app as cli_app
 from aisquare.cli.ui.views.doctor import (
     COMMAND,
     NO_MANAGER_WAY,
@@ -33,7 +42,42 @@ from aisquare.core import selfcli
 from aisquare.models import CheckStatus, DoctorCheck
 from aisquare.services.onboarding import FixCommand, FixResult
 
-UI = Path(__file__).resolve().parents[1] / "src" / "aisquare" / "cli" / "ui"
+ROOT = Path(__file__).resolve().parents[1]
+UI = ROOT / "src" / "aisquare" / "cli" / "ui"
+
+
+def _programs() -> list[str]:
+    """The names a person types rlx by: every console script that runs the CLI's ``main``."""
+    project = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))["project"]
+    return sorted(name for name, at in project["scripts"].items() if at == "aisquare.cli.app:main")
+
+
+def _commands(app: typer.Typer) -> set[str]:
+    """Every top-level command and group ``app`` registers, hidden ones too, as the shell types
+    it: read off the command group Typer builds from it, so one added is known at once."""
+    group = typer.main.get_command(app)
+    assert isinstance(group, TyperGroup), group
+    return set(group.commands)
+
+
+def _naming(programs: Iterable[str], commands: Iterable[str]) -> re.Pattern[str]:
+    """``<program> <command>``, for each program and command; the longest of each first."""
+
+    def either(words: Iterable[str]) -> str:
+        return "|".join(sorted(map(re.escape, words), key=lambda word: (-len(word), word)))
+
+    return re.compile(rf"\b(?:{either(programs)}) (?:{either(commands)})\b")
+
+
+def _guard(app: typer.Typer) -> re.Pattern[str]:
+    """The Doctor's ``COMMAND``, every rule of it (a package manager's, tmux's, a backticked
+    flag), with each of ``app``'s commands after each of the CLI's names besides."""
+    every = _naming(_programs(), _commands(app))
+    return re.compile(f"{every.pattern}|{COMMAND.pattern}")
+
+
+GUARD = _guard(cli_app)
+"""What a command to type looks like in asq's text, as this guard reads it."""
 
 PRINTED_IN_A_TERMINAL = {"instance_gate.py"}
 """asq's files whose text is printed in the terminal, before asq draws or after it quits:
@@ -87,9 +131,9 @@ def _literals() -> Iterator[tuple[str, int, str]]:
 def test_no_asq_string_names_a_command_to_type() -> None:
     """Every string asq shows — f-strings' literal parts included — is free of a command."""
     found = [
-        f"{name}:{line}: {COMMAND.search(text).group(0)!r} in {text[:70]!r}"  # type: ignore[union-attr]
+        f"{name}:{line}: {GUARD.search(text).group(0)!r} in {text[:70]!r}"  # type: ignore[union-attr]
         for name, line, text in _literals()
-        if COMMAND.search(text)
+        if GUARD.search(text)
     ]
     assert found == []
 
@@ -102,10 +146,57 @@ def test_the_guard_catches_what_it_is_for() -> None:
         "tmux -L asq attach -t =asq-x",
         "install it: npm install -g @openai/codex",
         "curl -fsSL https://claude.ai/install.sh | bash",
+        "see rlx status",
+        "asq service install starts it at login",
+        "relax tidy --dry-run",
     ):
-        assert COMMAND.search(said), said
-    for prose in ("rlx — keys", "Restart on its sidebar row", "rlx's doctor: its tmux check"):
-        assert not COMMAND.search(prose), prose
+        assert GUARD.search(said), said
+    for prose in (
+        "rlx — keys",
+        "Restart on its sidebar row",
+        "rlx's doctor: its tmux check",
+        "rlx statuses",
+        "rlx's service",
+    ):
+        assert not GUARD.search(prose), prose
+
+
+def test_the_guard_knows_every_command_the_cli_has() -> None:
+    """Reviewer #4085: the hand list missed ``status``, ``service`` and more, so asq's text
+    could name them unseen. Each command the shell lists, after each of its names, is one."""
+    root = typer.main.get_command(cli_app)
+    assert isinstance(root, TyperGroup), root
+    listed = sorted(root.commands)
+    visible = [name for name in listed if not root.commands[name].hidden]
+
+    assert {"status", "service", "tidy", "fleet", "doctor"} <= set(visible), visible
+    assert {"rlx", "asq", "aisquare"} <= set(_programs())
+    missed = [
+        f"{program} {name}"
+        for program in _programs()
+        for name in listed
+        if not GUARD.search(f"say {program} {name} here")
+    ]
+    assert missed == []
+
+
+def test_a_command_the_cli_gains_is_known_with_no_hand_list(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A command or group registered on the real CLI is known from then on, hidden or not."""
+    # Registered on copies of the app's lists, which the monkeypatch puts back after.
+    monkeypatch.setattr(cli_app, "registered_commands", list(cli_app.registered_commands))
+    monkeypatch.setattr(cli_app, "registered_groups", list(cli_app.registered_groups))
+    stand_in = typer.Typer()
+    stand_in.command("go")(lambda: None)
+    cli_app.command("zz-stand-in")(lambda: None)
+    cli_app.command("zz-quiet", hidden=True)(lambda: None)
+    cli_app.add_typer(stand_in, name="zz-group")
+    before, after = GUARD, _guard(cli_app)
+
+    for said in ("rlx zz-stand-in", "asq zz-quiet --now", "aisquare zz-group go"):
+        assert after.search(said) and not before.search(said), said
+    assert {"zz-stand-in", "zz-quiet", "zz-group"} <= _commands(cli_app)
 
 
 def test_asq_calls_no_function_that_spells_a_command() -> None:
@@ -342,7 +433,7 @@ def test_the_install_rows_name_no_command_in_asq_on_any_platform(
     for row, page in zip(rows, pages, strict=True):
         assert row.fix is not None and COMMAND.search(row.fix), (row.name, row.fix)
         way = ui_way(row, {})
-        assert way is not None and not COMMAND.search(way), (row.name, way)
+        assert way is not None and not GUARD.search(way), (row.name, way)
         assert page in way, f"{row.name}: asq links its install page: {way}"
 
 
@@ -366,15 +457,19 @@ def test_the_gh_rows_sign_in_note_names_its_command_at_a_shell_and_none_in_asq(
     monkeypatch.setenv(prog.IN_APP_ENV, "1")
     app = diagnostics._check_gh()
     assert app.detail.endswith("(not signed in to GitHub CLI)"), app.detail
-    assert not COMMAND.search(app.detail), app.detail
+    assert not GUARD.search(app.detail), app.detail
 
 
 def test_no_doctor_row_s_asq_wording_names_a_command() -> None:
+    """Its ``ui_fix``, and what asq's Doctor says under it (:func:`ui_way`): a ``fix`` naming a
+    command the Doctor's own pattern does not know would be said as it is."""
     from aisquare.services import diagnostics
 
     rows = diagnostics.doctor()
     assert rows, "the doctor ran"
-    assert [row.name for row in rows if row.ui_fix and COMMAND.search(row.ui_fix)] == []
+    assert [row.name for row in rows if row.ui_fix and GUARD.search(row.ui_fix)] == []
+    said = {row.name: ui_way(row, {}) for row in rows}
+    assert [f"{name}: {way}" for name, way in said.items() if way and GUARD.search(way)] == []
 
 
 @pytest.mark.parametrize(
@@ -414,7 +509,9 @@ def test_the_disk_row_s_asq_wording_names_no_command(
 
     assert [row.status for row in rows] == [CheckStatus.warn]
     [row] = rows
-    assert row.ui_fix and not COMMAND.search(row.ui_fix), row.ui_fix
-    assert not COMMAND.search(row.detail), row.detail
-    assert row.fix and COMMAND.search(row.fix), "the shell's fix names its command"
-    assert COMMAND.search("rlx tidy") and COMMAND.search("aisquare tidy --dry-run")
+    assert row.ui_fix and not GUARD.search(row.ui_fix), row.ui_fix
+    assert not GUARD.search(row.detail), row.detail
+    said = ui_way(row, {})
+    assert said == row.ui_fix and not GUARD.search(said), said
+    assert row.fix and GUARD.search(row.fix), "the shell's fix names its command"
+    assert COMMAND.search(row.fix), "the Doctor's own pattern knows it, so asq never says it"
