@@ -16,6 +16,8 @@ import logging
 import subprocess
 import sys
 import textwrap
+import threading
+from collections.abc import Callable
 from pathlib import Path
 
 import pytest
@@ -28,16 +30,21 @@ from aisquare.cli.ui import remote_control
 from aisquare.cli.ui.remote_control import RemoteController
 from aisquare.cli.ui.sidebar import SettingsRow
 from aisquare.cli.ui.views.app_settings import REMOTE_TAB
-from aisquare.cli.ui.views.settings_captain import CaptainToggle, ExperimentalSection, RemoteToggle
+from aisquare.cli.ui.views.settings_captain import (
+    CaptainToggle,
+    ExperimentalSection,
+    RemoteSwitched,
+    RemoteToggle,
+)
 from aisquare.core import experimental, paths
 from aisquare.core import program as prog
 from aisquare.core.config import load_config, salvaged_remote, save_config
 from aisquare.core.state_file import update_state
-from aisquare.services import diagnostics, service_host
+from aisquare.services import diagnostics, remote_server, service_host
 from aisquare.services.service_host import RemotePart
 from tests import test_ui_shell as ui_suite
 from tests.test_captain_view import drive
-from tests.test_remote_control import fake_server, fake_tunnel_factory
+from tests.test_remote_control import FakeServer, fake_server, fake_tunnel_factory
 from tests.test_ui_shell import Script, fleet_app
 from tests.ui_workers import settle_page
 
@@ -329,7 +336,13 @@ _STARTED_TUI = textwrap.dedent(
             print("ON", app.remote_on, getattr(app, "remote", None) is not None, key)
             print("TABS", len(app.query("#tab-remote")), len(app.query("#remote-chip")))
             print("LOADED", " ".join(sorted(m for m in sys.modules if m in {modules!r})))
-        app.exit()
+            # A tick, the housekeeping tick (Remote's auto-off check), then the quit's own path.
+            app.refresh_data()
+            app._housekeeping()
+            for _ in range(5):
+                await pilot.pause()
+            await app.action_quit()
+        print("QUIT", " ".join(sorted(m for m in sys.modules if m in {modules!r})))
 
     asyncio.run(main())
     """
@@ -345,20 +358,22 @@ def _started(variable: str) -> dict[str, str]:
     )
     assert result.returncode == 0, result.stderr[-2000:]
     lines = dict(line.split(" ", 1) for line in result.stdout.splitlines() if " " in line)
-    return {key: lines.get(key, "") for key in ("ON", "TABS", "LOADED")}
+    return {key: lines.get(key, "") for key in ("ON", "TABS", "LOADED", "QUIT")}
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="the headless start is POSIX's here")
 def test_with_remote_off_a_started_tui_loads_and_shows_nothing_of_it() -> None:
     """Acceptance 1: off, no module of Remote in sys.modules after a start, the R key, the
-    Settings it opens and all: no tab, no chip. On, the same start loads them (the control:
-    the check can fail)."""
+    Settings it opens and all: no tab, no chip; nor after a tick, the housekeeping tick and the
+    quit (review of #46, #3780). On, the same start loads them (the control: the check can
+    fail)."""
     off = _started("0")
     on = _started("1")
 
     assert off["ON"] == "False False False", off
     assert off["TABS"] == "0 0", off
     assert off["LOADED"] == "", off
+    assert off["QUIT"] == "", off
     assert on["ON"] == "True True True", on
     assert on["TABS"] == "1 1", on
     assert set(on["LOADED"].split()) == set(REMOTE_MODULES), on
@@ -450,6 +465,94 @@ def test_the_remote_box_brings_remote_up_and_down_at_once_and_ctrl_z_takes_it_ba
     assert on == (True, True, 1, True, True, 1, True)
     assert off == (False, False, 0, False, False, 0, False), "ctrl+z: off again, and kept"
     assert stopping == (True,), "stopped on its own thread; run_ui waits for it at the quit"
+
+
+class _HeldWrites(FakeServer):
+    """Remote's server and ``remote.json``, one for every controller as the real runtime is.
+    The write switch's write waits for the test's word (a write in flight), and starts are
+    recorded beside the stops."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.held = threading.Event()
+
+    def set_allow_write(self, enabled: bool) -> None:
+        assert self.held.wait(30), "the test never let the write land"
+        super().set_allow_write(enabled)
+
+    def start_remote_server(
+        self, dist_dir: Path | None, port: int = 8750
+    ) -> remote_server.RemoteInfo:
+        self.calls.append("start_remote_server")
+        return super().start_remote_server(dist_dir, port)
+
+
+async def _until(pilot: Pilot[None], holds: Callable[[], object], what: str) -> None:
+    for _ in range(600):  # 30 s at most
+        if holds():
+            return
+        await pilot.pause(0.05)
+    raise AssertionError(f"never: {what}")
+
+
+def test_remote_off_then_on_at_once_waits_for_the_one_still_stopping(
+    script: Script, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Review of #46 (#3780): a quick off then on built a new controller and brought it up at
+    once, beside the one still stopping with a write in flight. The two share ``remote.json``
+    and the server's runtime, and their locks are each their own. The new one now comes up only
+    once the old one is off and its write has landed: one controller left, serving, and the
+    write switch as a restore leaves it. The old one's write landed first and the restore then
+    turned writes off (``_restored_read_only``). Without the wait, the held write landed after
+    the restore: writes on behind a Remote that said it came back read-only."""
+    server = _HeldWrites()
+    made: list[RemoteController] = []
+
+    def controller() -> RemoteController:
+        made.append(
+            RemoteController(server=server, tunnel_factory=fake_tunnel_factory(url="x.ngrok.app"))
+        )
+        return made[-1]
+
+    monkeypatch.setattr(remote_control, "RemoteController", controller)
+    update_state("remote_enabled", True)  # Remote's own switch on: each start serves
+
+    async def body(pilot: Pilot[None]) -> dict[str, object]:
+        app = fleet_app(pilot)
+        await _until(pilot, lambda: made and made[0].remote_serving, "the first Remote serving")
+        old = made[0]
+        old.set_allow_write(True, wait=False)  # held: a write in flight
+        app.post_message(RemoteSwitched(False))
+        app.post_message(RemoteSwitched(True))
+        await _until(pilot, lambda: len(made) == 2, "a second controller")
+        new = made[1]
+        for _ in range(10):
+            await pilot.pause(0.02)
+        held = new.remote_serving
+        server.held.set()
+        await _until(pilot, lambda: new.remote_serving, "the new Remote serving")
+        await settle_page(app)
+        calls = list(server.calls)
+        last_stop = len(calls) - 1 - calls[::-1].index("stop_remote_server")
+        return {
+            "new serving while the old one's write was in flight": held,
+            "the app's controller is the new one": getattr(app, "remote", None) is new,
+            "the old one is off": old.wait_until_off(5) and not old.remote_serving,
+            "server running": server.running,
+            "write switch": (server.allow_write, new.write_actions_allowed()),
+            "its writes, in order": list(server.allow_write_calls),
+            "starts after the last stop": calls[last_stop:].count("start_remote_server"),
+        }
+
+    assert drive(body) == {
+        "new serving while the old one's write was in flight": False,
+        "the app's controller is the new one": True,
+        "the old one is off": True,
+        "server running": True,
+        "write switch": (False, False),
+        "its writes, in order": [True, False],
+        "starts after the last stop": 1,
+    }
 
 
 # --- the rlx service ---------------------------------------------------------------------------

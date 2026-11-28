@@ -61,6 +61,7 @@ from textual.widgets._footer import FooterKey
 from textual.worker import Worker, WorkerState, WorkType
 from textual.worker_manager import WorkerManager
 
+from aisquare.cli.ui import remote_workers  # Remote's worker names alone: no Remote
 from aisquare.cli.ui.agent_menu import RENAME as AGENT_RENAME
 from aisquare.cli.ui.agent_menu import RESUME as AGENT_RESUME
 from aisquare.cli.ui.agent_menu import AgentMenu
@@ -1887,17 +1888,49 @@ class FleetApp(SelectionHost, inherit_bindings=False):
         self.service_client.use_remote(controller)
 
     def _start_remote(self) -> None:
-        """Remote, built, brought up as its saved switch says, with its chip and tunnel check."""
+        """Remote, built, brought up as its saved switch says, with its chip and tunnel check.
+
+        One turned off a moment ago may still be stopping, a write of it still in flight
+        (Remote off and on again at once). The two share ``remote.json`` and the server's
+        runtime, and their locks are each their own, so this one comes up only once that one
+        is off and its writes have landed: waited for off the UI thread
+        (:meth:`_restore_after`), as stopping takes seconds (review of #46, #3780)."""
         from aisquare.cli.ui.views.settings_remote import RemoteChip
 
         remote = self._remote
         assert remote is not None
-        # wait=False here and below: a Remote that stops runs down on a thread of its own,
-        # since stopping uvicorn and ngrok froze the fleet UI for seconds (r3 review of #243).
-        remote.restore(wait=False)
+        stopping = [
+            old
+            for old in self.remotes_stopping
+            if not (old.wait_until_off(0) and old.writes_done(0))
+        ]
+        if stopping:
+            self.run_worker(
+                lambda: self._restore_after(remote, stopping),
+                name=remote_workers.RESTORE_WORKER,
+                thread=True,
+                exit_on_error=False,
+            )
+        else:
+            # wait=False here and below: a Remote that stops runs down on a thread of its own,
+            # since stopping uvicorn and ngrok froze the fleet UI for seconds (r3 review of #243).
+            remote.restore(wait=False)
         # "📡 remote · N devices" under the status line while Remote is on (#33).
         self.query_one("#others").mount(RemoteChip(remote, id="remote-chip"))
         self._remote_revive = self.set_interval(30.0, remote.revive_tunnel_if_dead)
+
+    def _restore_after(self, remote: RemoteController, stopping: list[RemoteController]) -> None:
+        """On a worker's thread: wait for ``stopping`` to be off, their writes landed, then
+        bring ``remote`` up on the UI thread, unless it was turned off again meanwhile."""
+        for old in stopping:
+            old.wait_until_off()
+            old.writes_done()
+        with contextlib.suppress(RuntimeError):  # rlx quit meanwhile: nothing to bring up
+            self.call_from_thread(self._restore_if_current, remote)
+
+    def _restore_if_current(self, remote: RemoteController) -> None:
+        if self._remote is remote:
+            remote.restore(wait=False)
 
     async def _bring_remote_down(self) -> None:
         """Remote turned off from Settings: what shows of it gone, and it stopped on its own
@@ -5266,6 +5299,7 @@ def _waited_reads() -> dict[str, str]:
         captain.BAR_WORKER: "the captain's bar",
         captain.MIC_WORKER: "the captain's microphone check",
         remote_workers.CHECK_WORKER: "what Remote needs",
+        remote_workers.RESTORE_WORKER: "Remote's wait for the one turning off",
         terminal.WSLPATH_WORKER: "a pasted Windows path's conversion",
         fresh.PLAN_WORKER: "Start fresh's read of the project",
     }
