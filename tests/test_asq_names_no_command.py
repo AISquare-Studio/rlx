@@ -470,3 +470,48 @@ def test_no_doctor_row_s_asq_wording_names_a_command() -> None:
     assert [row.name for row in rows if row.ui_fix and GUARD.search(row.ui_fix)] == []
     said = {row.name: ui_way(row, {}) for row in rows}
     assert [f"{name}: {way}" for name, way in said.items() if way and GUARD.search(way)] == []
+
+
+@pytest.mark.parametrize(
+    ("watching", "every", "deletes"),
+    [(True, 60, True), (True, 15, True), (False, 60, True), (True, 0, True), (True, 60, False)],
+)
+def test_the_disk_row_s_asq_wording_names_no_command(
+    monkeypatch: pytest.MonkeyPatch, watching: bool, every: float, deletes: bool
+) -> None:
+    """#60, manager #3817: the ``disk`` row's in-app way, with GBs to free and a folder it
+    cannot read, in every state: the watcher frees it, isn't running, the job is off, native
+    Windows only reports. Never a shell or a command; the shell's fix keeps ``tidy``, which the
+    sweep's pattern knows."""
+    from aisquare.core.config import load_config, save_config
+    from aisquare.services import diagnostics, tidy
+    from aisquare.services import watch as watch_service
+
+    use = tidy.DiskUse(
+        worktrees=20 * 10**9,
+        build_caches=6 * 10**9,
+        session_temp=8 * 10**9,
+        use_whole=False,
+        would_free=3 * 10**9,
+        free_whole=False,
+        unreadable=(Path("/nowhere/.aisquare-worktrees"),),
+    )
+    monkeypatch.setattr(tidy, "disk_use", lambda **kwargs: use)
+    monkeypatch.setattr(tidy, "DELETES", deletes)
+    monkeypatch.setattr(
+        watch_service, "watch_status", lambda: watch_service.Status(1 if watching else None, None)
+    )
+    config = load_config()
+    config.tidy.every_minutes = every
+    save_config(config)
+
+    rows = [row for row in diagnostics.doctor() if row.name == "disk"]
+
+    assert [row.status for row in rows] == [CheckStatus.warn]
+    [row] = rows
+    assert row.ui_fix and not GUARD.search(row.ui_fix), row.ui_fix
+    assert not GUARD.search(row.detail), row.detail
+    said = ui_way(row, {})
+    assert said == row.ui_fix and not GUARD.search(said), said
+    assert row.fix and GUARD.search(row.fix), "the shell's fix names its command"
+    assert COMMAND.search(row.fix), "the Doctor's own pattern knows it, so asq never says it"

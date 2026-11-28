@@ -14,6 +14,7 @@ from collections.abc import Callable, Collection, Container, Iterable, Mapping, 
 from datetime import UTC, datetime, timedelta
 from importlib import metadata
 from pathlib import Path, PurePath
+from typing import TYPE_CHECKING
 from urllib.parse import urlsplit
 
 from aisquare.core import agents as agent_core
@@ -77,6 +78,9 @@ from aisquare.services import project as project_service
 from aisquare.services import settings as settings_service
 from aisquare.services import team as team_service
 from aisquare.services.onboarding import BROWSER_TOOLS_ARGV
+
+if TYPE_CHECKING:
+    from aisquare.services.tidy import DiskUse
 
 
 def status() -> StatusReport:
@@ -214,6 +218,9 @@ def doctor(*, live: bool = False, cwd: Path | None = None) -> list[DoctorCheck]:
             # Can warn (memory below the floor, pressure at warn), so it waits with the late rows.
             _check_fleet_capacity(),
             _check_watcher(),
+            # Beside the watcher, whose periodic tidy frees what it counts (#60). Late: it warns
+            # at 1 GB to free, which never pushes an urgent row out of the sidebar's first three.
+            _check_disk(),
             # Warns when two asqs, or an asq and this aisquare, run different releases (#20), so
             # it waits with the late rows.
             _check_instances(),
@@ -3192,6 +3199,121 @@ def _check_watcher() -> DoctorCheck:
             f"{prog.word()} watch --stop; then {prog.word()} watch --detach",
         )
     return _ok(name, f"running (pid {found.pid}), {looked}")
+
+
+def _check_disk() -> DoctorCheck:
+    """``disk`` (#60, the owner's disk tidy, item 4): what rlx's folders take (the agents'
+    worktrees, the build output in them, the sessions' temp) and what tidy would free. Warns at
+    ``tidy.RECEIPT_BYTES`` (1 GB) to free, or at a folder it cannot read. One look, within
+    ``tidy.DISK_BUDGET_S``, per Doctor run (``tidy.disk_use``): the last periodic pass's stamp
+    while fresh, else a dry run; past the budget each size is a lower bound. It never frees:
+    the fix is ``tidy``'s, or the watcher's (R13: in asq, rlx's own words, never a command).
+    asq runs the Doctor on a worker, never on its UI thread."""
+    name = "disk"
+    try:
+        if (uncreated := _uncreated_home(name)) is not None:
+            return uncreated
+        from aisquare.services import tidy
+        from aisquare.services import watch as watch_service
+
+        use = tidy.disk_use()
+        every = tidy._settings().every_minutes
+        watching = watch_service.watch_status().pid is not None
+    except Exception as exc:  # diagnostics must never crash
+        return _ok(name, f"not evaluated ({exc})")
+    detail = _disk_detail(use)
+    named = ", ".join(str(root) for root in use.unreadable)
+    if named:
+        detail += f"; {named} could not be read, so nothing in it was measured"
+    to_free = use.would_free >= tidy.RECEIPT_BYTES
+    if not (named or to_free):
+        return _ok(name, detail)
+    unread = [f"make {named} readable by you: nothing in it is measured or freed"] if named else []
+    return _warn(
+        name,
+        detail,
+        "; ".join(
+            [
+                *unread,
+                *(
+                    [
+                        f"{prog.word()} tidy"
+                        if tidy.DELETES
+                        else f"{prog.word()} tidy in WSL, where the fleet runs: on native "
+                        "Windows it only reports"
+                    ]
+                    if to_free
+                    else []
+                ),
+            ]
+        ),
+        ui_fix="; ".join(
+            [
+                *(f"{way[0].upper()}{way[1:]}" for way in unread),
+                *([_disk_way_in_app(every, watching, deletes=tidy.DELETES)] if to_free else []),
+            ]
+        ),
+    )
+
+
+def _disk_detail(use: DiskUse) -> str:
+    """``disk``'s detail: the sizes, "at least" where the look ran out of time, and what tidy
+    would free, now or as of the last pass (local time). A size the look never reached is
+    said so, never as "at least 0 B" (reviewer #4085, NIT 1)."""
+    from aisquare.services.tidy import size_text
+
+    def amount(count: int, whole: bool) -> str:
+        return size_text(count) if whole else f"at least {size_text(count)}"
+
+    whole, trees = use.use_whole, use.trees_whole
+    if not (trees or use.worktrees):
+        sizes = "rlx's folders: not reached in time"
+    else:
+        head = (
+            f"rlx's folders take {amount(use.total, whole)}"
+            if whole or use.total
+            else "rlx's folders"
+        )
+        caches = (
+            f" (build caches {amount(use.build_caches, trees)} of it)"
+            if trees or use.build_caches
+            else ""
+        )
+        temp = (
+            amount(use.session_temp, whole) if whole or use.session_temp else "not reached in time"
+        )
+        sizes = (
+            f"{head}: worktrees {amount(use.worktrees, trees)}{caches}, session and agent temp "
+            f"{temp}"
+        )
+    free = (
+        f"tidy would free {amount(use.would_free, use.free_whole)}"
+        if use.free_whole or use.would_free
+        else "what tidy would free was not reached in time"
+    )
+    said = f"{sizes}; {free}"
+    if use.as_of_said is not None:  # tidy's to say: no clock is spelt here (#152)
+        said += f" as of its last pass {use.as_of_said}, which freed {size_text(use.freed_then)}"
+    return said
+
+
+def _disk_way_in_app(every: float, watching: bool, *, deletes: bool) -> str:
+    """What asq says under a ``disk`` row with GBs to free (R13, manager #3817): rlx's own
+    way, never a command. Native Windows only reports; the watcher's periodic tidy frees it,
+    while it runs and is on."""
+    if not deletes:
+        return "rlx only reports this here: on native Windows it frees nothing"
+    if every <= 0:
+        return "rlx's own tidy is off in its settings, so nothing frees it by itself"
+    if not watching:
+        return "The fleet watcher isn't running, so rlx doesn't free it by itself"
+    if every == 60:
+        within = "within the hour"
+    elif every > 60 and every % 60 == 0:
+        within = f"within {every / 60:g} hours"
+    else:
+        within = f"within {every:g} minutes"
+    return f"rlx frees it by itself {within}"
 
 
 def _check_instances() -> DoctorCheck:
