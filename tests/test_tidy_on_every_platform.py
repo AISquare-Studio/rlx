@@ -239,5 +239,10 @@ def test_with_its_cache_step_off_reap_judges_a_tree_as_0_10_1_did(
     assert fleet_service._why_kept(repo, repo, "main") == "uncommitted changes"
     assert fleet_service._remove_untracked_caches(repo) == []
     assert (target / "out.bin").is_file()
+    # Its delete holds the switch too, whatever the listing says.
+    with monkeypatch.context() as listed:
+        listed.setattr(fleet_service, "_untracked_caches", lambda tree: (None, [target], False))
+        assert fleet_service._remove_untracked_caches(repo) == []
+    assert (target / "out.bin").is_file()
     monkeypatch.setattr(fleet_service, "REAP_FREES_CACHES", True)
     assert fleet_service._why_kept(repo, repo, "main") is None
