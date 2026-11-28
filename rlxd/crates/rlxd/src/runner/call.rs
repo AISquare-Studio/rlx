@@ -65,8 +65,8 @@ use std::time::Duration;
 
 use rlxd_proto::{
     CallState, ConnectorState, ConnectorStatus, ConnectorsCallData, ConnectorsCallParams,
-    DecidedBy, Decision, ErrorBody, FailReason, McpServer, Mount, PinnedCall, RunDoneData,
-    RunFailedData, RunId, RunKind, RunRef, RunStartParams, RunStartedData, RunState,
+    DecidedBy, Decision, ErrorBody, FailReason, McpServer, Mount, PinnedCall, RouteBy, RunAccount,
+    RunDoneData, RunFailedData, RunId, RunKind, RunRef, RunStartParams, RunStartedData, RunState,
     RunToolResultData, codes, run_types,
 };
 use serde_json::{Map, Value, json};
@@ -315,13 +315,19 @@ impl Runner {
             Some(job) => (Some(job.job_id), Some(job.loud), job.watch),
             None => (None, None, false),
         };
+        // An identity read is on its account, which rlxd pins; any other call on the app's
+        // environment, as a default run is (#15).
+        let on = match &account {
+            Some(account) => RunAccount::new(Some(account.slot), RouteBy::Pinned),
+            None => RunAccount::new(None, RouteBy::Default),
+        };
         let call = CallRun {
             input: params.input,
             outcome: Mutex::new(None),
             withheld: account.is_some(),
             account,
         };
-        self.start_checked(start, client, job_id, loud, watch_job, Some(call))
+        self.start_checked(start, client, job_id, loud, watch_job, Some(call), on)
     }
 
     /// `connectors.call`: the call's run, started and waited for, and its reply. A deny is
@@ -406,6 +412,13 @@ impl Runner {
             Some(account) => RanOn::Account(account.slot),
             None => RanOn::Home(values.claude_config_dir.as_deref()),
         };
+        if call.account.is_none() {
+            // A default run's slot, as its home is filed (#15).
+            let slot = self
+                .connectors
+                .slot_of_home(values.claude_config_dir.as_deref());
+            run.inner().account = RunAccount::new(slot, RouteBy::Default);
+        }
         let program = match claude_from(resolved) {
             Ok(program) => program,
             Err(refused) => return failed(refused.message),
@@ -719,8 +732,9 @@ impl Runner {
             let mut tools: Vec<String> = listed.tools.iter().cloned().collect();
             tools.sort();
             inner.listed = listed;
-            let data =
-                RunStartedData::new(cwd.display().to_string(), "", "").with_tools(tools, servers);
+            let data = RunStartedData::new(cwd.display().to_string(), "", "")
+                .with_tools(tools, servers)
+                .on_account(inner.account);
             self.emit(run, &mut inner, run_types::STARTED, &data);
             // rlxd's own rules, before anything is sent (the module's doc).
             gate::rlxd_rule(

@@ -9,18 +9,18 @@ use schemars::{JsonSchema, Schema};
 use serde_json::Value;
 
 use crate::{
-    BrainInput, BrainOutput, ConnectorChanged, ConnectorId, ConnectorLoginDone,
-    ConnectorLoginError, ConnectorLoginOpenUrl, ConnectorLoginWaiting, ConnectorsCallData,
-    ConnectorsCallParams, ConnectorsList, ConnectorsListParams, ConnectorsLoginData,
-    ConnectorsLoginParams, DaemonRecord, EnvValues, Envelope, Event, HelloData, HelloParams,
-    HereData, HookEventData, HookParams, HookReply, JobEvent, JobListData, JobListParams,
-    JobPutParams, JobRef, JobRunNowData, PtyExited, PtyKillParams, PtyList, PtyOutput, PtyRef,
-    PtyResizeParams, PtyScreen, PtyScreenParams, PtySpawnParams, PtySubscribeParams,
-    PtyWriteParams, Request, RunCancelData, RunDecideData, RunDecideParams, RunEvent,
-    RunEventsData, RunEventsParams, RunGetData, RunListData, RunListParams, RunRef, RunResumeData,
-    RunResumeParams, RunStartParams, Setting, SettingsChanged, SettingsDeleteParams,
-    SettingsGetParams, SettingsList, SettingsListParams, SettingsSetParams, SpaceEnsureData,
-    SpaceEraseData, SpaceParams, StatusData, SubscribeParams,
+    AmbiguousAccount, BrainInput, BrainOutput, ConnectorAccountLimited, ConnectorChanged,
+    ConnectorId, ConnectorLoginDone, ConnectorLoginError, ConnectorLoginOpenUrl,
+    ConnectorLoginWaiting, ConnectorUnavailable, ConnectorsCallData, ConnectorsCallParams,
+    ConnectorsList, ConnectorsListParams, ConnectorsLoginData, ConnectorsLoginParams, DaemonRecord,
+    EnvValues, Envelope, Event, HelloData, HelloParams, HereData, HookEventData, HookParams,
+    HookReply, JobEvent, JobListData, JobListParams, JobPutParams, JobRef, JobRunNowData,
+    PtyExited, PtyKillParams, PtyList, PtyOutput, PtyRef, PtyResizeParams, PtyScreen,
+    PtyScreenParams, PtySpawnParams, PtySubscribeParams, PtyWriteParams, Request, RunCancelData,
+    RunDecideData, RunDecideParams, RunEvent, RunEventsData, RunEventsParams, RunGetData,
+    RunListData, RunListParams, RunRef, RunResumeData, RunResumeParams, RunStartParams, Setting,
+    SettingsChanged, SettingsDeleteParams, SettingsGetParams, SettingsList, SettingsListParams,
+    SettingsSetParams, SpaceEnsureData, SpaceEraseData, SpaceParams, StatusData, SubscribeParams,
 };
 
 /// One schema file: its name under `schemas/v1/`, and its contents.
@@ -35,14 +35,17 @@ pub struct SchemaFile {
 /// Every schema file of this schema version, in name order.
 pub fn all() -> Vec<SchemaFile> {
     let mut files = vec![
+        file::<AmbiguousAccount>("ambiguous-account.json"),
         file::<BrainInput>("brain-input.json"),
         file::<BrainOutput>("brain-output.json"),
+        file::<ConnectorAccountLimited>("connector-account-limited.json"),
         file::<ConnectorChanged>("connector-changed.json"),
         file::<ConnectorId>("connector-id.json"),
         file::<ConnectorLoginDone>("connector-login-done.json"),
         file::<ConnectorLoginError>("connector-login-error.json"),
         file::<ConnectorLoginOpenUrl>("connector-login-open-url.json"),
         file::<ConnectorLoginWaiting>("connector-login-waiting.json"),
+        file::<ConnectorUnavailable>("connector-unavailable.json"),
         file::<ConnectorsList>("connectors.json"),
         file::<ConnectorsCallParams>("connectors-call.json"),
         file::<ConnectorsCallData>("connectors-call-reply.json"),

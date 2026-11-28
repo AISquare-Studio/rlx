@@ -575,8 +575,19 @@
       "description": "`job.skipped`.",
       "type": "object",
       "properties": {
+        "account": {
+          "description": "For `connector_account_limited`: the account that holds it, limited (the one whose\nlimit resets soonest, when several do).",
+          "type": "integer",
+          "format": "uint32",
+          "maximum": 4294967295,
+          "minimum": 1
+        },
         "code": {
           "description": "For `start_failed`: the error code the run's start was refused with.",
+          "type": "string"
+        },
+        "connector": {
+          "description": "For `connector_account_limited`: the connector its route was refused by.",
           "type": "string"
         },
         "job_id": {
@@ -586,6 +597,11 @@
         "reason": {
           "description": "Why.",
           "$ref": "#/$defs/SkipReason"
+        },
+        "resets_at": {
+          "description": "For `connector_account_limited`: when that account's limit resets, if rlx knows\n(RFC 3339).",
+          "type": "string",
+          "format": "date-time"
         },
         "scheduled_for": {
           "description": "The scheduled time it skipped (RFC 3339, UTC).",
@@ -673,6 +689,11 @@
           "description": "Its run could not be started: `code` says why (`run.start`'s refusal code, or\n`engine_restarted` for a start rlxd stopped in the middle of).",
           "type": "string",
           "const": "start_failed"
+        },
+        {
+          "description": "Its template routes by `connectors`, and every account that has them all\nconnected is usage-limited (#15): `connector`, `account` and `resets_at` say\nwhich, as `run.start`'s `connector_account_limited` does. No run is started on\nanother account.",
+          "type": "string",
+          "const": "connector_account_limited"
         }
       ]
     }

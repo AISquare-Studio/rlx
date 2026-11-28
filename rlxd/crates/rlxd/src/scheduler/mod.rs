@@ -44,6 +44,7 @@ use self::decide::{Cause, Decision, Moment, Presence, RunNowRefused};
 use self::schedule::Plan;
 use crate::bus::Bus;
 use crate::log::{info, warning};
+use crate::route::{Router, Usage};
 use crate::runner::{JobTag, RunNote, Runner};
 
 /// How late a due fire may be decided and still count as on time: later, it was missed
@@ -67,10 +68,32 @@ const ENGINE_RESTARTED: &str = "engine_restarted";
 /// The client name a job's runs carry, in `run.list`.
 const CLIENT: &str = "scheduler";
 
+/// How old the brain's usage a fire routes by may be ([`Scheduler::prefetch`]): it is
+/// read just before the pass that fires, so this only bounds a pass that comes late.
+const USAGE_FRESH: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Which jobs [`Scheduler::prefetch`] reads the brain's usage for.
+#[derive(Clone, Copy, Debug)]
+pub enum Prefetch<'a> {
+    /// A job that routes by connectors and is due, owed or waiting now: the loop's pass.
+    Due,
+    /// This job, when it routes by connectors: `job.run_now`.
+    Job(&'a JobId),
+    /// Any job that routes by connectors: the test clock's move, which may make any due.
+    #[cfg(feature = "debug-methods")]
+    Any,
+}
+
 /// The scheduler.
 pub struct Scheduler {
     bus: Arc<Bus>,
     runner: Arc<Runner>,
+    /// Routes a run job's fire by its template's `connectors` and `account` (#15).
+    router: Arc<Router>,
+    /// The brain's usage, read by the async side before a pass that may fire a job that
+    /// routes by connectors ([`Scheduler::prefetch`]), and when: a fire's route reads it,
+    /// never the brain, under the jobs' lock.
+    usage: Mutex<Option<(std::time::Instant, Usage)>>,
     db: db::Db,
     /// Where a database it could not read was moved, and why.
     set_aside: Option<String>,
@@ -119,6 +142,7 @@ impl Scheduler {
         home: &Home,
         bus: Arc<Bus>,
         runner: Arc<Runner>,
+        router: Arc<Router>,
         apps: watch::Receiver<u32>,
     ) -> Result<Arc<Self>, String> {
         let opened = db::open(&home.root().join("rlxd"))?;
@@ -129,6 +153,8 @@ impl Scheduler {
         let scheduler = Arc::new(Self {
             bus,
             runner,
+            router,
+            usage: Mutex::new(None),
             db: opened.db,
             set_aside: opened.set_aside,
             clock,
@@ -264,6 +290,7 @@ impl Scheduler {
             if self.stopping.load(Ordering::SeqCst) {
                 return;
             }
+            self.prefetch(Prefetch::Due).await;
             let this = Arc::clone(&self);
             blocking(move || this.tick());
             let sleep = self.sleep();
@@ -277,6 +304,7 @@ impl Scheduler {
                     }
                     let now_present = *apps.borrow_and_update() > 0;
                     if now_present && !present {
+                        self.prefetch(Prefetch::Due).await;
                         let this = Arc::clone(&self);
                         blocking(move || this.app_connected());
                     }
@@ -289,6 +317,32 @@ impl Scheduler {
                 }
             }
         }
+    }
+
+    /// Reads the brain's usage for a pass that may fire a job of `which` that routes by
+    /// its template's connectors with no pinned account (#15), so the fire's route has it
+    /// with no wait under the jobs' lock. No such job: nothing is asked.
+    pub async fn prefetch(&self, which: Prefetch<'_>) {
+        let wanted = {
+            let now = self.clock.now();
+            self.jobs().values().any(|job| job.wants_usage(which, now))
+        };
+        if wanted {
+            let usage = self.router.usage().await;
+            *self.held_usage() = Some((std::time::Instant::now(), usage));
+        }
+    }
+
+    /// The usage [`Scheduler::prefetch`] read, while it is fresh.
+    fn usage_now(&self) -> Option<Usage> {
+        self.held_usage()
+            .as_ref()
+            .filter(|(at, _)| at.elapsed() <= USAGE_FRESH)
+            .map(|(_, usage)| usage.clone())
+    }
+
+    fn held_usage(&self) -> MutexGuard<'_, Option<(std::time::Instant, Usage)>> {
+        self.usage.lock().unwrap_or_else(|p| p.into_inner())
     }
 
     /// How long the loop may sleep: until the next job is due, at most [`LONGEST_SLEEP`];
@@ -816,7 +870,16 @@ impl Scheduler {
                         "refused by RLXD_TEST_REFUSE_FIRES".to_owned(),
                     )),
                     (None, watch_job::Start::Run(params)) => {
-                        self.runner.start(*params, CLIENT, Some(tag))
+                        // Routed as run.start routes (#15), by the usage read before this
+                        // pass: a refusal is this fire's skip.
+                        let usage = Router::wants_usage(&params)
+                            .then(|| self.usage_now())
+                            .flatten();
+                        self.router
+                            .route(&params, usage.as_ref())
+                            .and_then(|account| {
+                                self.runner.start(*params, CLIENT, Some(tag), account)
+                            })
                     }
                     (None, watch_job::Start::Call(call)) => {
                         let started = self.runner.start_call(call, CLIENT, Some(tag));
@@ -864,7 +927,15 @@ impl Scheduler {
                     error.code,
                     error.message
                 );
-                let reason = SkipReason::StartFailed.as_str();
+                // A limited sole holder is its own reason (#15); any other refusal is
+                // start_failed, with its code.
+                let limited = limited_of(&error);
+                let skip = if limited.is_some() {
+                    SkipReason::ConnectorAccountLimited
+                } else {
+                    SkipReason::StartFailed
+                };
+                let reason = skip.as_str();
                 match id {
                     Some(id) => self.settle(id, "skipped", Some(reason), Some(&error.code)),
                     None => {
@@ -887,15 +958,15 @@ impl Scheduler {
                     }
                 }
                 job.skipped_count += 1;
-                self.publish(
-                    job_types::SKIPPED,
-                    &JobSkippedData::new(
-                        job.def.job_id.clone(),
-                        scheduled.to_string(),
-                        SkipReason::StartFailed,
-                    )
-                    .with_code(error.code.clone()),
-                );
+                let mut skipped =
+                    JobSkippedData::new(job.def.job_id.clone(), scheduled.to_string(), skip);
+                skipped = match limited {
+                    Some(limited) => {
+                        skipped.limited(limited.connector, limited.account, limited.resets_at)
+                    }
+                    None => skipped.with_code(error.code.clone()),
+                };
+                self.publish(job_types::SKIPPED, &skipped);
                 Err(error)
             }
         }
@@ -957,6 +1028,43 @@ impl Scheduler {
 }
 
 impl Job {
+    /// Whether its fires route by connectors (#15): a run job whose template names
+    /// `connectors` and pins no `account`. Its fires' routes read the brain's usage.
+    fn routes(&self) -> bool {
+        if self.def.r#type != JobType::Run {
+            return false;
+        }
+        let Some(template) = &self.def.run else {
+            return false;
+        };
+        let names = template
+            .0
+            .get("connectors")
+            .and_then(Value::as_array)
+            .is_some_and(|connectors| !connectors.is_empty());
+        let pinned = template.0.get("account").is_some_and(|a| !a.is_null());
+        names && !pinned
+    }
+
+    /// Whether a pass of `which` at `now` may fire it by a route that reads the brain's
+    /// usage ([`Scheduler::prefetch`]): it routes by connectors, and is due, owed or
+    /// waiting (`Due`), is the one named (`Job`), or is any (`Any`).
+    fn wants_usage(&self, which: Prefetch<'_>, now: Timestamp) -> bool {
+        if !self.routes() {
+            return false;
+        }
+        match which {
+            Prefetch::Due => {
+                self.owed.is_some()
+                    || self.startup_wait.is_some()
+                    || self.next.is_some_and(|next| next <= now)
+            }
+            Prefetch::Job(id) => self.def.job_id == *id,
+            #[cfg(feature = "debug-methods")]
+            Prefetch::Any => true,
+        }
+    }
+
     /// What [`decide`] reads of it.
     fn view(&self) -> decide::Job {
         decide::Job {
@@ -1118,6 +1226,19 @@ pub(crate) fn fresh_run_id() -> RunId {
     RunId::new(id).expect("a formatted UUID is a run id")
 }
 
+/// A `connector_account_limited` refusal's detail (#15), or `None` for any other.
+fn limited_of(error: &ErrorBody) -> Option<rlxd_proto::ConnectorAccountLimited> {
+    if error.code != codes::CONNECTOR_ACCOUNT_LIMITED {
+        return None;
+    }
+    match &error.detail {
+        Some(rlxd_proto::Detail::Object(fields)) => {
+            serde_json::from_value(Value::Object(fields.clone())).ok()
+        }
+        _ => None,
+    }
+}
+
 fn refusal(code: &str, message: String) -> ErrorBody {
     ErrorBody::new(code, message).expect("a scheduler refusal has a code and a message")
 }
@@ -1154,5 +1275,91 @@ mod tests {
     fn catch_up_names_its_two_policies() {
         assert_eq!(CatchUp::Once.as_str(), "once");
         assert_eq!(CatchUp::Skip.as_str(), "skip");
+    }
+
+    const T0: &str = "2027-01-01T00:00:00Z";
+
+    /// A job of `run`'s template (`None`: a watch job), due next at `next`.
+    fn job(id: &str, run: Option<Value>, next: Option<&str>) -> Job {
+        let mut def = serde_json::json!({"job_id": id, "type": "run",
+            "schedule": {"every_minutes": 60}, "catch_up": "skip", "enabled": true});
+        match run {
+            Some(run) => def["run"] = run,
+            None => {
+                def["type"] = "watch".into();
+                def["connector"] = "claude.ai GitHub".into();
+                def["tool"] = "mcp__claude_ai_GitHub__get_check_runs".into();
+                def["input"] = serde_json::json!({});
+            }
+        }
+        let def: JobPutParams = serde_json::from_value(def).unwrap();
+        let t0: Timestamp = T0.parse().unwrap();
+        Job {
+            plan: Plan::of(&def.schedule).unwrap(),
+            def,
+            anchor: t0,
+            next: next.map(|at| at.parse().unwrap()),
+            last_scheduled_for: None,
+            paused: false,
+            owed: None,
+            held_until: None,
+            last_fire_at: None,
+            last_run_id: None,
+            last_state: None,
+            skipped_count: 0,
+            put_at: t0,
+            startup_wait: None,
+            call_fire: None,
+        }
+    }
+
+    fn template(connectors: Value, account: Option<u32>) -> Value {
+        let mut run = serde_json::json!({"kind": "task", "prompt": "digest",
+            "mount": {"kind": "connectors", "connectors": ["claude.ai Slack"]},
+            "connectors": connectors});
+        if let Some(slot) = account {
+            run["account"] = slot.into();
+        }
+        run
+    }
+
+    #[test]
+    fn only_a_run_job_routed_by_connectors_with_no_pin_reads_usage() {
+        let slack = serde_json::json!(["claude.ai Slack"]);
+        assert!(job("a", Some(template(slack.clone(), None)), None).routes());
+        assert!(!job("b", Some(template(slack, Some(2))), None).routes());
+        assert!(!job("c", Some(template(serde_json::json!([]), None)), None).routes());
+        assert!(!job("d", None, None).routes());
+    }
+
+    #[test]
+    fn a_pass_reads_usage_for_a_routed_job_due_owed_or_waiting_and_no_other() {
+        let now: Timestamp = "2027-01-01T01:00:00Z".parse().unwrap();
+        let slack = || Some(template(serde_json::json!(["claude.ai Slack"]), None));
+        let due = job("due", slack(), Some("2027-01-01T01:00:00Z"));
+        let later = job("later", slack(), Some("2027-01-01T02:00:00Z"));
+        let mut owed = job("owed", slack(), None);
+        owed.owed = Some(now);
+        let mut waiting = job("waiting", slack(), Some("2027-01-01T05:00:00Z"));
+        waiting.startup_wait = Some(now);
+        let unrouted = job(
+            "plain",
+            Some(serde_json::json!({"kind": "task", "prompt": "hi",
+                "mount": {"kind": "no_tools"}})),
+            Some(T0),
+        );
+        assert!(due.wants_usage(Prefetch::Due, now));
+        assert!(owed.wants_usage(Prefetch::Due, now));
+        assert!(waiting.wants_usage(Prefetch::Due, now));
+        assert!(!later.wants_usage(Prefetch::Due, now));
+        assert!(!unrouted.wants_usage(Prefetch::Due, now));
+        // job.run_now: the job named, due or not.
+        let id = later.def.job_id.clone();
+        assert!(later.wants_usage(Prefetch::Job(&id), now));
+        assert!(!due.wants_usage(Prefetch::Job(&id), now));
+        assert!(!unrouted.wants_usage(Prefetch::Job(&unrouted.def.job_id.clone()), now));
+        // The test clock's move: any that routes.
+        assert!(later.wants_usage(Prefetch::Any, now));
+        assert!(!unrouted.wants_usage(Prefetch::Any, now));
     }
 }

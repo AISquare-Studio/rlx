@@ -787,6 +787,46 @@
         }
       ]
     },
+    "RouteBy": {
+      "description": "Why a run is on the account it is on (#15).",
+      "oneOf": [
+        {
+          "description": "`run.start`'s `account` pinned it.",
+          "type": "string",
+          "const": "pinned"
+        },
+        {
+          "description": "rlxd picked it by the run's `connectors`.",
+          "type": "string",
+          "const": "connectors"
+        },
+        {
+          "description": "Neither was given: the run is on the app's environment, as every run was before\nrouting.",
+          "type": "string",
+          "const": "default"
+        }
+      ]
+    },
+    "RunAccount": {
+      "description": "The account a run is on, and why (#15): kept from its start, through every try and\n`run.resume`. A route is never picked again.",
+      "type": "object",
+      "properties": {
+        "by": {
+          "description": "Why it is on that account.",
+          "$ref": "#/$defs/RouteBy"
+        },
+        "slot": {
+          "description": "Its rlx slot, as `connectors.list` names accounts. Absent only for a `default` run\nwhose environment is no account rlx knows.",
+          "type": "integer",
+          "format": "uint32",
+          "maximum": 4294967295,
+          "minimum": 1
+        }
+      },
+      "required": [
+        "by"
+      ]
+    },
     "RunDoneData": {
       "description": "`run.done`: the run ended with a result.",
       "type": "object",
@@ -930,6 +970,10 @@
       "description": "`run.started`: Claude Code's stream-json `system/init`.",
       "type": "object",
       "properties": {
+        "account": {
+          "description": "The account the run is on, and why (#15).",
+          "$ref": "#/$defs/RunAccount"
+        },
         "claude_version": {
           "description": "Claude Code's version.",
           "type": "string"

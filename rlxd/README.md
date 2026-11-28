@@ -403,6 +403,56 @@ rlxd runs Claude Code headless, with no tmux and no PTY (handoff 0.10.3, 2.1, 2.
   `kind_mount_mismatch` (also `needs_connectors` with mount `no_tools`, which loads no
   connector) and `pinned_call_required`. Each kind has its own pool (tasks 2, refreshes and
   watches 1, the rest 2); over it, a run waits as `run.queued {position}`.
+- **Its account** (task #15, `crate::route`): `run.start {connectors?, account?}` (and a
+  job's run template) picks the account the run goes on. It is decided once, at
+  `run.start`, so its refusals are the start's reply, and it is kept in `run.json`: a
+  queued run, every try (5.5) and `run.resume` keep it, and none is picked again.
+  `run.started`, `run.get` and `run.list` carry it as `account: {slot, by}`, `by` being
+  `pinned`, `connectors` or `default`.
+  - **Pinned** (`account`, a slot as `connectors.list` names it): the slot must be one
+    rlx knows (`no_such_account`) with both its homes (`account_unknown`), and each of
+    `connectors` connected there now (`connector_unavailable`). A pin is never refused
+    as usage-limited: the run may end `rate_limited`.
+  - **By connectors** (`connectors` and no `account`): the accounts whose connector map
+    holds every one of them `connected` now, with both homes known, may take it. None:
+    `connector_unavailable {connector, accounts: [{account, status}]}`, for the first of
+    `connectors` that leaves none, `status` being the map's (`needs-auth`, `pending`,
+    `failed`), `absent` (read, and not listed) or `unread` (never read, or its homes not
+    known). `accounts` are those that hold every connector named before it (every
+    account, for the first), so connecting it on any of them is what the run needs, and
+    it is never `connected` there; an account dropped for an earlier one isn't listed.
+    For a pin, `accounts` are every account rlx knows. Two or more: `ambiguous_account {connector, candidates: [{account,
+    identity}]}`, unless every one's identity on every connector is known and they are
+    all the same (manager #4188, the strict rule: a release build reads no identity yet,
+    so a send never picks an account by its headroom alone); `identity` is `null` where
+    rlxd hasn't read it, and only a row connected now has one. The client asks once and
+    pins `account`. Then the brain's `usage` ranks them: those not limited, least used
+    first; one with no reading on record last, but still eligible; the lowest slot on a
+    tie. All limited: `connector_account_limited {connector, account, resets_at?}`, the
+    one whose limit resets soonest; no run starts on an account without the connector.
+    Ambiguity is decided before limits, so a limited account's workspace is never traded
+    for another's.
+  - **Neither:** the app's environment, as every run before routing (`by: default`, its
+    slot the account the attempt's home is, when rlx knows one).
+  - The route reads the connector map as it is: nothing is read at `run.start`, which
+    stays fast; a refusal names what is `unread`, and the client refreshes
+    (`connectors.list {refresh: true}`) and starts again. Usage is Python's: rlxd asks the
+    brain's read-only `usage` (each account's fullest window, percent used, from the
+    reading on record, and whether it refuses requests now, by Python's rule, with when
+    that ends), within 1 s to accept and 2 s to answer; with no brain, or no answer,
+    every account ranks as one with no reading and none is refused as limited.
+  - A pinned or routed run's every attempt runs on its account's homes, as the map's
+    reads do: the app's `claude` and values from one snapshot, then a managed slot's
+    `CLAUDE_CONFIG_DIR` and `CLAUDE_CODE_TMPDIR`, or both taken away for the plain
+    account, and no `CLAUDE_SECURESTORAGE_CONFIG_DIR` but the account's own. Its init is
+    filed under that account, and a sign-in there clears its `needs_you {reason:
+    "auth"}`. Its sessions are in that account's `CLAUDE_CONFIG_DIR`, the home its `run.json`
+    records, which a gated try's take-back reaches too, and `space.erase` takes its
+    transcript from (below). Its `connectors` are checked at init as
+    `needs_connectors` are (5.5). It is gated like any other run (5.1). An attempt whose
+    account rlx no longer knows fails, and `run.resume` of its run is refused
+    `no_such_account` (or `account_unknown`). rlxd's log names the slot and why (`run …:
+    on account 2 (connectors)`), never a home or an identity.
 - **The command line** is 2.1's exactly: `-p --output-format stream-json --verbose
   --input-format stream-json --session-id <run_id> [--no-session-persistence] --tools ""
   [--strict-mcp-config] [--json-schema …] [--append-system-prompt …]
@@ -487,16 +537,23 @@ rlxd runs Claude Code headless, with no tmux and no PTY (handoff 0.10.3, 2.1, 2.
   `.claude/settings.json`, and returns its resolved path. It is not a project: no `.git`,
   not onboarded. Names are 1 to 64 lower-case letters, digits, `-`, `_` and `.`, with no
   separator, no `..` and no leading dot. `space.erase {name}` deletes the folder, the
-  Claude Code session files of its runs, and rlxd's records of them. Session files are
-  `projects/<encoded space dir>/<run_id>.jsonl` under `CLAUDE_CONFIG_DIR` and `~/.claude`
-  (every account's config directory once the brain serves rlx's list), the space dir
-  encoded as Claude Code does: no other project folder is touched.
+  Claude Code session files of its runs, and rlxd's records of them. A run's session
+  file (2.5's alone: hub #2519 on other kinds is open) is
+  `projects/<encoded space dir>/<run_id>.jsonl`, the space dir encoded as Claude Code
+  does, under the one home that run recorded in `run.json` (contract #4276): the
+  `CLAUDE_CONFIG_DIR` its latest attempt ran on, a pinned or routed run's account's (the
+  plain account's `~/.claude`), or, with none recorded, rlxd's own (its
+  `CLAUDE_CONFIG_DIR`, else `~/.claude`). A relative one is taken in the space, as Claude
+  Code took it. No other home and no other project folder is touched, and a home that
+  is gone has nothing of the run's to remove. What is joined below the home is one plain
+  name each, never `..`.
   It refuses `runs_live` while a run in the space is queued, running, being started or
   being resumed, and `link_refused` (`detail.paths`) when a link, a junction or a mount
-  point is below a root on the way: `spaces/`, the space itself, a config directory's
+  point is below a root on the way: `spaces/`, the space itself, a run's home's
   `projects/`, or the space's folder there; nothing is removed then. `<home>` and each
-  config directory are roots, taken as they resolve once (a `~/.claude` kept in dotfiles
-  is fine), and the config directories are only gone into when the space has runs. Every folder on the way is
+  run's home are roots, taken as they resolve once (a `~/.claude` kept in dotfiles is
+  fine), and a home is only gone into for a run of the space. A run's session file that
+  is a link goes as a link, its target left. Every folder on the way is
   opened once without following a link, and checked and removed through what was opened
   (`openat` and `unlinkat` on macOS and Linux; on Windows, handles that keep the folders
   from being renamed meanwhile), so a link put there after the check is never followed.
@@ -838,11 +895,17 @@ them by `job_id`; rlxd keeps a definition only to fire it, and records what each
   its events, and the job's `loud`, which rlxd only echoes, on `job.fired` and on the
   run's `run.done` and `run.needs_you`. Events on topic `job`: `job.put`, `job.deleted`,
   `job.paused`, `job.resumed`, `job.fired {job_id, run_id, scheduled_for, fired_at,
-  cause, loud}`, `job.skipped {job_id, scheduled_for, reason, code?}` and
-  `job.watch_result`. `job.fired`
+  cause, loud}`, `job.skipped {job_id, scheduled_for, reason, code?, connector?, account?,
+  resets_at?}` and `job.watch_result`. `job.fired`
   goes out once the run has started, so its first run events may come before it. A run
   that can't start is `job.skipped {reason: "start_failed", code}`, `code` being
   `run.start`'s refusal.
+- **A routed fire** (task #15): a template with `connectors` (or `account`) routes as
+  `run.start` does. Before a pass that may fire such a job, and before `job.run_now` of
+  one, the scheduler reads the brain's usage, so the route never waits on the brain
+  under the jobs' lock. A limited sole holder is `job.skipped {reason:
+  "connector_account_limited", connector, account, resets_at?}` and starts no run; any
+  other refusal is `start_failed` with its code.
 - **Watch jobs** (`"type": "watch"`, with `connector`, `tool` and an object `input`) make
   one pinned call per tick, with no prompt of the job's; the tool must read as one of the
   connector's (`mcp__<connector as Claude Code writes it>__…`), else `invalid_params` at

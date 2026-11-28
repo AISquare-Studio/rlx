@@ -657,6 +657,38 @@ impl Connectors {
         self.known().get(&slot).cloned()
     }
 
+    /// Each account rlx knows, as a run's route sees it (#15): whether rlxd knows both
+    /// its homes, and its connectors as last read (`None` when they never were), each with
+    /// its status and identity. Lock order: the cache's, then the accounts'.
+    /// `None` too for an entry no read has filled.
+    pub fn route_view(&self) -> Vec<crate::route::Seen> {
+        let cache = self.cache();
+        let known = self.known();
+        known
+            .values()
+            .map(|account| crate::route::Seen {
+                slot: account.slot,
+                homes_known: account.homes_known(),
+                // An entry no read has filled (a failed refresh's alone) was never read.
+                connectors: cache
+                    .accounts
+                    .get(&account.slot)
+                    .filter(|entry| entry.as_of.is_some())
+                    .map(|entry| {
+                        entry
+                            .connectors
+                            .iter()
+                            .map(|c| crate::route::Held {
+                                id: c.id.clone(),
+                                state: c.status,
+                                identity: c.identity.clone(),
+                            })
+                            .collect()
+                    }),
+            })
+            .collect()
+    }
+
     /// Whether rlx has yet to say which accounts there are while it matters: the runs'
     /// environment names a `CLAUDE_CONFIG_DIR`, or a run's init waits for it.
     pub fn runs_account_unknown(&self) -> bool {
@@ -901,6 +933,19 @@ impl Connectors {
         match account {
             Some(account) => self.observe_on(&account, init, Read::Init),
             None => filed_nowhere(),
+        }
+    }
+
+    /// Takes a run's `system/init` as the connectors now of the account it ran on (`on`):
+    /// by its attempt's home ([`Connectors::observe`]), or, for a run pinned or routed to
+    /// an account (#15), that account's, when rlx still knows it; nowhere else.
+    pub fn observe_ran(&self, init: Observed<'_>, on: RanOn<'_>) {
+        match on {
+            RanOn::Home(home) => self.observe(init, home),
+            RanOn::Account(slot) => match self.account(slot) {
+                Some(account) => self.observe_on(&account, init, Read::Init),
+                None => filed_nowhere(),
+            },
         }
     }
 
@@ -1847,6 +1892,37 @@ mod tests {
             list.accounts[0].connectors[0].identity, None,
             "forgotten, not restored"
         );
+    }
+
+    #[test]
+    fn a_route_sees_an_account_only_a_failed_read_has_touched_as_never_read() {
+        let dir = Dir::new();
+        let connectors = dir.connectors();
+        connectors.set_accounts(vec![managed(2, "b")]);
+        let seen = |slot: u32| {
+            connectors
+                .route_view()
+                .into_iter()
+                .find(|seen| seen.slot == slot)
+                .unwrap()
+        };
+        assert_eq!(seen(2).connectors, None, "never read");
+        let error = ErrorBody::new(codes::SETTLE_TIMEOUT, "no server settled").unwrap();
+        connectors.refresh_failed(&managed(2, "b"), error);
+        assert_eq!(seen(2).connectors, None, "a failed read is no read");
+        assert!(seen(2).homes_known);
+        let servers = [McpServer::new("claude.ai Slack", "needs-auth")];
+        let (sources, hints) = (HashMap::new(), HashMap::new());
+        let listing = Observed {
+            servers: &servers,
+            sources: &sources,
+            tools: &[],
+            hints: &hints,
+        };
+        connectors.observe_on(&managed(2, "b"), listing, Read::Listing);
+        let rows = seen(2).connectors.expect("read now");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].state, ConnectorState::NeedsAuth);
     }
 
     #[test]

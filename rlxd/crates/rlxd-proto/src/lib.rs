@@ -207,6 +207,7 @@ mod job;
 mod marker;
 mod pty;
 mod request;
+mod route;
 mod run;
 pub mod schemas;
 mod settings;
@@ -250,14 +251,18 @@ pub use pty::{
     check_key_name as check_pty_key_name, errors as pty_errors,
 };
 pub use request::{Params, Request, RequestId, methods};
+pub use route::{
+    AccountStatus, AmbiguousAccount, Candidate, ConnectorAccountLimited, ConnectorUnavailable,
+    RouteStatus,
+};
 pub use run::{
     CallState, ConnectorStatus, DEFAULT_DEADLINE_MS, DecidedBy, Decision, FailReason, McpServer,
     Mount, NeedsYouClearedData, NeedsYouRaisedData, NeedsYouReason, NeedsYouSource, NeedsYouWhen,
-    PinnedCall, RunCall, RunCancelData, RunDecideData, RunDecideParams, RunDoneData, RunEvent,
-    RunEventsData, RunEventsParams, RunFailedData, RunGetData, RunId, RunKind, RunListData,
-    RunListParams, RunNeedsYouData, RunQueuedData, RunRateLimitedData, RunRef, RunResumeData,
-    RunResumeParams, RunStartParams, RunStartedData, RunState, RunSummary, RunTextData,
-    RunToolCallData, RunToolDecidedData, RunToolResultData, Usage, run_types,
+    PinnedCall, RouteBy, RunAccount, RunCall, RunCancelData, RunDecideData, RunDecideParams,
+    RunDoneData, RunEvent, RunEventsData, RunEventsParams, RunFailedData, RunGetData, RunId,
+    RunKind, RunListData, RunListParams, RunNeedsYouData, RunQueuedData, RunRateLimitedData,
+    RunRef, RunResumeData, RunResumeParams, RunStartParams, RunStartedData, RunState, RunSummary,
+    RunTextData, RunToolCallData, RunToolDecidedData, RunToolResultData, Usage, run_types,
 };
 pub use settings::{
     MAX_DEPTH as MAX_SETTING_DEPTH, MAX_KEY as MAX_SETTING_KEY, Setting, SettingsChanged,

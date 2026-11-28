@@ -92,6 +92,8 @@ fn check_7_a_release_build_has_no_debug_methods() {
         // The identity table's test entry (task #14, step 2): a release table holds none.
         "claude.ai Fixture",
         "mcp__claude_ai_Fixture__whoami",
+        // The route's usage fixture (task #15): a release build asks the brain.
+        "RLXD_TEST_USAGE",
     ] {
         let found = bytes
             .windows(needle.len())

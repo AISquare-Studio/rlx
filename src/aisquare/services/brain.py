@@ -53,6 +53,14 @@ Accounts (task #14)
 each one's slot, a managed slot's ``CLAUDE_CONFIG_DIR`` and ``CLAUDE_CODE_TMPDIR``, and a
 mark of who is signed in there (a SHA-256 of the account's id), never the id or email.
 
+Usage (task #15)
+----------------
+
+``usage`` gives each of those accounts' room, for rlxd's routes by connector: its fullest
+window, percent used, from the reading on record, and whether it refuses requests now, with
+when that ends. Python owns usage; rlxd only orders what this says. It asks the usage
+endpoint nothing, reads no Keychain and writes nothing.
+
 Hooks (1.5)
 -----------
 
@@ -855,8 +863,90 @@ def _accounts(params: Mapping[str, Any]) -> Result:
     return {"accounts": rows}
 
 
+def _usage(params: Mapping[str, Any]) -> Result:
+    """``usage``: each Claude Code account's room, for rlxd's routes by connector (task
+    #15). ``{accounts: [{slot, used_percent, limited, resets_at}]}``, for the accounts
+    ``accounts`` lists, in its order.
+
+    Strictly read-only: no request reaches the usage endpoint, no Keychain is read (a read
+    per routed start could ask the user), and nothing is written. Each account's reading is
+    the one ON RECORD for the login it holds now, no older than the cache's five minutes,
+    as ``services.claude_accounts._served`` serves it. Which login that is comes from no
+    Keychain item: a slot whose login is one takes it from the row a process that read the
+    item said (``_LOGIN_KEY``), as a slot whose Keychain is locked does (``_Logins.settle``
+    with nothing to say); any other from its credentials file. With no such row, it has no
+    reading. The limit marks in force are read too (``limit_marks``).
+
+    - ``used_percent``: that reading's ``headroom_percent``, its fullest window, percent
+      USED; ``None`` with no reading, which rlxd ranks last.
+    - ``limited``: whether it refuses requests now, by Python's own rule and clock: a
+      limit mark in force that every model shares (``LimitMark.blocks(None)``), or the
+      reading's limiting window spent (100 % used): a reading on record is one whose
+      windows haven't reset since. Not the fleet's ``switch_at`` line, a spawn's rule.
+    - ``resets_at``: for a limited account, when the last of what limits it ends (RFC 3339,
+      UTC), or ``None`` when none says.
+
+    The private readers it goes through are the same on rc/0.10.2 and rc/0.10.3.
+    """
+    del params
+    from datetime import UTC, timedelta
+
+    from aisquare.core import claude_accounts as core
+    from aisquare.services import claude_accounts as accounts
+
+    managed = core.managed_accounts()
+    plain = core.default_account(env={})
+    listed = [*([plain] if core.plain_home_counts(plain, managed=bool(managed)) else []), *managed]
+    # On the accounts code's own clock: the marks in force now, and each reading on record
+    # now whose windows haven't reset since it was taken (``_served``'s rule).
+    now = accounts._now()
+    marks = accounts.limit_marks(now=now)
+    keychain = core.keychain_platform()
+    tokens: dict[int, str] = {}
+    locked = []
+    for account in listed:
+        if keychain:
+            # Never the item: its login as the row a reader of the item said it.
+            if core.has_stored_login(account):
+                locked.append(account)
+            continue
+        token = accounts._token_fingerprint(account, now)
+        if token is not None:
+            tokens[account.slot] = token
+    logins = accounts._Logins(now=now, tokens=tokens, seen=[], locked=locked)
+    since = now - timedelta(seconds=accounts.USAGE_MAX_AGE_SECONDS)
+    readings = accounts._served(listed, logins, since=since, now=now)
+    rows: list[dict[str, Any]] = []
+    for account in listed:
+        reading = readings.get(account.slot)
+        ends = [mark.until for mark in marks.get(account.slot, []) if mark.blocks(None)]
+        limiting = reading.limiting if reading is not None else None
+        spent = limiting is not None and (limiting.used_percent or 0.0) >= 100.0
+        if spent and limiting is not None and limiting.resets_at is not None:
+            ends.append(limiting.resets_at)
+        resets = max(ends) if ends else None
+        rows.append(
+            {
+                "slot": account.slot,
+                "used_percent": accounts.headroom_percent(reading) if reading is not None else None,
+                "limited": spent or bool(ends),
+                "resets_at": (
+                    resets.astimezone(UTC).isoformat().replace("+00:00", "Z")
+                    if resets is not None
+                    else None
+                ),
+            }
+        )
+    return {"accounts": rows}
+
+
 #: The methods, by name.
-METHODS: dict[str, Method] = {"ping": _ping, "hook": _hook, "accounts": _accounts}
+METHODS: dict[str, Method] = {
+    "ping": _ping,
+    "hook": _hook,
+    "accounts": _accounts,
+    "usage": _usage,
+}
 
 
 def _rlx_version() -> str:
