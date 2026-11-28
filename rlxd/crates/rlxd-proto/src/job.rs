@@ -503,6 +503,11 @@ pub enum SkipReason {
     /// Its run could not be started: `code` says why (`run.start`'s refusal code, or
     /// `engine_restarted` for a start rlxd stopped in the middle of).
     StartFailed,
+    /// Its template routes by `connectors`, and every account that has them all
+    /// connected is usage-limited (#15): `connector`, `account` and `resets_at` say
+    /// which, as `run.start`'s `connector_account_limited` does. No run is started on
+    /// another account.
+    ConnectorAccountLimited,
 }
 
 impl SkipReason {
@@ -515,6 +520,7 @@ impl SkipReason {
             Self::AppAbsent => "app_absent",
             Self::Missed => "missed",
             Self::StartFailed => "start_failed",
+            Self::ConnectorAccountLimited => "connector_account_limited",
         }
     }
 }
@@ -533,6 +539,20 @@ pub struct JobSkippedData {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(transform = drop_null)]
     pub code: Option<String>,
+    /// For `connector_account_limited`: the connector its route was refused by.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(transform = drop_null)]
+    pub connector: Option<String>,
+    /// For `connector_account_limited`: the account that holds it, limited (the one whose
+    /// limit resets soonest, when several do).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(transform = drop_null, range(min = 1))]
+    pub account: Option<u32>,
+    /// For `connector_account_limited`: when that account's limit resets, if rlx knows
+    /// (RFC 3339).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(transform = drop_null, extend("format" = "date-time"))]
+    pub resets_at: Option<String>,
 }
 
 impl JobSkippedData {
@@ -543,6 +563,9 @@ impl JobSkippedData {
             scheduled_for,
             reason,
             code: None,
+            connector: None,
+            account: None,
+            resets_at: None,
         }
     }
 
@@ -550,6 +573,21 @@ impl JobSkippedData {
     #[must_use]
     pub fn with_code(mut self, code: impl Into<String>) -> Self {
         self.code = Some(code.into());
+        self
+    }
+
+    /// This skip, for `connector`, held by `account` alone while it is limited until
+    /// `resets_at`.
+    #[must_use]
+    pub fn limited(
+        mut self,
+        connector: impl Into<String>,
+        account: u32,
+        resets_at: Option<String>,
+    ) -> Self {
+        self.connector = Some(connector.into());
+        self.account = Some(account);
+        self.resets_at = resets_at;
         self
     }
 }

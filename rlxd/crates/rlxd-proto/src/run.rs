@@ -321,6 +321,24 @@ pub struct RunStartParams {
     #[serde(default)]
     #[schemars(inner(length(min = 1, max = 256)))]
     pub needs_connectors: Vec<String>,
+    /// The connectors to route the run by (#15), each a connector's id as
+    /// `connectors.list` gives it. Each must be `connected` now on the account the run
+    /// starts on, and is checked again at init as `needs_connectors` are (5.5). With no
+    /// `account`, rlxd picks one: an account where every one is connected, the one with
+    /// the most headroom. It refuses with `connector_unavailable` when none has them all,
+    /// `ambiguous_account` when two or more do and their identities on one aren't all
+    /// known and the same, and `connector_account_limited` when every one that does is
+    /// usage-limited. A `no_tools` run loads none, so it names none.
+    #[serde(default)]
+    #[schemars(inner(length(min = 1, max = 256)))]
+    pub connectors: Vec<String>,
+    /// The account to run on, pinned: its rlx slot, as `connectors.list` names it. Each
+    /// of `connectors` must be `connected` there (`connector_unavailable` otherwise); a
+    /// pin is never refused as usage-limited. Absent: rlxd routes by `connectors`, or,
+    /// with none, the run goes on the app's environment, as before routing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(transform = drop_null, range(min = 1))]
+    pub account: Option<u32>,
     /// A JSON Schema the final output must match (`--json-schema`); `run.done` then
     /// carries `structured_output`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -377,6 +395,14 @@ struct UncheckedRunStart {
     mount: Mount,
     #[serde(default)]
     needs_connectors: Vec<String>,
+    #[serde(default)]
+    connectors: Vec<String>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "present"
+    )]
+    account: Option<u32>,
     #[serde(
         default,
         skip_serializing_if = "Option::is_none",
@@ -437,6 +463,8 @@ impl RunStartParams {
             prompt: prompt.into(),
             mount: Mount::NoTools,
             needs_connectors: Vec::new(),
+            connectors: Vec::new(),
+            account: None,
             output_schema: None,
             persist_session: None,
             space: default_space(),
@@ -467,6 +495,12 @@ impl RunStartParams {
         }
         for connector in &self.needs_connectors {
             crate::connector::check_id("needs_connectors", connector)?;
+        }
+        for connector in &self.connectors {
+            crate::connector::check_id("connectors", connector)?;
+        }
+        if let Some(account) = self.account {
+            check::at_least("account", u64::from(account), 1)?;
         }
         if let Some(timeout) = self.timeout_s {
             check::at_least("timeout_s", timeout, 1)?;
@@ -631,6 +665,10 @@ pub struct RunStartedData {
     pub claude_version: String,
     /// Whether this attempt resumed the run (`run.resume`).
     pub resumed: bool,
+    /// The account the run is on, and why (#15).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(transform = drop_null)]
+    pub account: Option<RunAccount>,
 }
 
 impl RunStartedData {
@@ -648,6 +686,7 @@ impl RunStartedData {
             mcp_servers: Vec::new(),
             claude_version: claude_version.into(),
             resumed: false,
+            account: None,
         }
     }
 
@@ -664,6 +703,64 @@ impl RunStartedData {
     pub fn resumed(mut self, resumed: bool) -> Self {
         self.resumed = resumed;
         self
+    }
+
+    /// This start, on `account`.
+    #[must_use]
+    pub fn on_account(mut self, account: RunAccount) -> Self {
+        self.account = Some(account);
+        self
+    }
+}
+
+/// Why a run is on the account it is on (#15).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum RouteBy {
+    /// `run.start`'s `account` pinned it.
+    Pinned,
+    /// rlxd picked it by the run's `connectors`.
+    Connectors,
+    /// Neither was given: the run is on the app's environment, as every run was before
+    /// routing.
+    Default,
+}
+
+impl RouteBy {
+    /// Its name on the wire.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Pinned => "pinned",
+            Self::Connectors => "connectors",
+            Self::Default => "default",
+        }
+    }
+}
+
+impl fmt::Display for RouteBy {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// The account a run is on, and why (#15): kept from its start, through every try and
+/// `run.resume`. A route is never picked again.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[non_exhaustive]
+pub struct RunAccount {
+    /// Its rlx slot, as `connectors.list` names accounts. Absent only for a `default` run
+    /// whose environment is no account rlx knows.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(transform = drop_null, range(min = 1))]
+    pub slot: Option<u32>,
+    /// Why it is on that account.
+    pub by: RouteBy,
+}
+
+impl RunAccount {
+    /// On `slot`, `by` that.
+    pub fn new(slot: Option<u32>, by: RouteBy) -> Self {
+        Self { slot, by }
     }
 }
 
@@ -1429,6 +1526,10 @@ pub struct RunSummary {
     pub attempt: u64,
     /// Its space.
     pub space: String,
+    /// The account it is on, and why (#15).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(transform = drop_null)]
+    pub account: Option<RunAccount>,
 }
 
 impl RunSummary {
@@ -1451,6 +1552,7 @@ impl RunSummary {
             client: String::new(),
             attempt: 1,
             space: crate::space::DEFAULT_SPACE.to_owned(),
+            account: None,
         }
     }
 }
@@ -1579,6 +1681,10 @@ pub struct RunGetData {
     pub structured_output: Option<Value>,
     /// Every gated call's ledger record (5.1).
     pub calls: Vec<RunCall>,
+    /// The account it is on, and why (#15).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(transform = drop_null)]
+    pub account: Option<RunAccount>,
 }
 
 impl RunGetData {
@@ -1606,6 +1712,7 @@ impl RunGetData {
             session: None,
             structured_output: None,
             calls: Vec::new(),
+            account: None,
         }
     }
 }

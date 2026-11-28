@@ -4,9 +4,26 @@
   "description": "`run.start`'s params (7.5). It returns `{run_id}` (`run-ref.json`).\n\n```json\n{\"run_id\": \"0f8e2d6c-3b1a-4c5d-9e7f-1a2b3c4d5e6f\", \"kind\": \"task\", \"prompt\": \"…\",\n \"mount\": {\"kind\": \"no_tools\"}, \"persist_session\": true, \"space\": \"default\",\n \"partial\": true, \"timeout_s\": 900, \"deadline_ms\": 120000}\n```\n\nrlxd refuses, by error code:\n- `run_exists`: a `run_id` it already knows;\n- `kind_mount_mismatch`: a `check`, `parse_instruction` or `widget_author` run whose\n  mount is not `no_tools`;\n- `pinned_call_required`: a `send_executor` or `watch` run without `pinned_call`;\n- `invalid_params`: anything else these rules or the schema refuse.",
   "type": "object",
   "properties": {
+    "account": {
+      "description": "The account to run on, pinned: its rlx slot, as `connectors.list` names it. Each\nof `connectors` must be `connected` there (`connector_unavailable` otherwise); a\npin is never refused as usage-limited. Absent: rlxd routes by `connectors`, or,\nwith none, the run goes on the app's environment, as before routing.",
+      "type": "integer",
+      "format": "uint32",
+      "maximum": 4294967295,
+      "minimum": 1
+    },
     "append_system_prompt": {
       "description": "Text appended to Claude Code's system prompt (`--append-system-prompt`).",
       "type": "string"
+    },
+    "connectors": {
+      "description": "The connectors to route the run by (#15), each a connector's id as\n`connectors.list` gives it. Each must be `connected` now on the account the run\nstarts on, and is checked again at init as `needs_connectors` are (5.5). With no\n`account`, rlxd picks one: an account where every one is connected, the one with\nthe most headroom. It refuses with `connector_unavailable` when none has them all,\n`ambiguous_account` when two or more do and their identities on one aren't all\nknown and the same, and `connector_account_limited` when every one that does is\nusage-limited. A `no_tools` run loads none, so it names none.",
+      "type": "array",
+      "default": [],
+      "items": {
+        "type": "string",
+        "maxLength": 256,
+        "minLength": 1
+      }
     },
     "deadline_ms": {
       "description": "How long the gate waits for the app's answer to each tool call, in milliseconds\n(5.1). The hook's own timeout is this plus 10 s.",

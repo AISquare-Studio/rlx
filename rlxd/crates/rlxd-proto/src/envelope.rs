@@ -453,8 +453,23 @@ pub mod codes {
     /// after a restart with no brain to say them, so its connectors are not read rather
     /// than read with another account's.
     pub const ACCOUNT_UNKNOWN: &str = "account_unknown";
-    /// `connectors.list {account}`: rlx knows no Claude Code account of that slot.
+    /// `connectors.list {account}`: rlx knows no Claude Code account of that slot. Also
+    /// `run.start {account}` (and a job's fire) pinned to one (#15), and `run.resume` of a
+    /// run whose account rlx no longer knows.
     pub const NO_SUCH_ACCOUNT: &str = "no_such_account";
+    /// `run.start {connectors}` with no `account` (#15): two or more accounts hold one of
+    /// them connected, and their identities on it aren't all known and the same, so rlxd
+    /// won't pick one. `detail` is `{connector, candidates: [{account, identity}]}`
+    /// (`ambiguous-account.json`); the client asks the user once and pins `account`.
+    pub const AMBIGUOUS_ACCOUNT: &str = "ambiguous_account";
+    /// `run.start {connectors}` with no `account` (#15): every account that holds them
+    /// all connected is usage-limited, and rlxd starts the run on no other.
+    /// `detail` is `{connector, account, resets_at?}` (`connector-account-limited.json`).
+    pub const CONNECTOR_ACCOUNT_LIMITED: &str = "connector_account_limited";
+    /// `run.start {connectors}` (#15): no account rlxd may start the run on holds one of
+    /// them connected, or the pinned `account` doesn't. `detail` is `{connector,
+    /// accounts: [{account, status}]}` (`connector-unavailable.json`).
+    pub const CONNECTOR_UNAVAILABLE: &str = "connector_unavailable";
 }
 
 impl Envelope {

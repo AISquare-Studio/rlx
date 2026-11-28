@@ -435,7 +435,7 @@ struct UncheckedLogin {
 
 /// Every property required, `null` ones included: a field that may be `null` is still
 /// always there.
-fn all_required(schema: &mut Schema) {
+pub(crate) fn all_required(schema: &mut Schema) {
     let names: Vec<Value> = schema
         .get("properties")
         .and_then(Value::as_object)

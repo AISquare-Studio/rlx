@@ -1,0 +1,81 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "ConnectorUnavailable",
+  "description": "`connector_unavailable`'s detail: no account rlxd may start the run on holds\n`connector` connected (with the run's connectors before it), or the pinned account\ndoesn't. `accounts` gives its status on each account rlx knows.\n\n```json\n{\"connector\": \"claude.ai Slack\",\n \"accounts\": [{\"account\": 1, \"status\": \"needs-auth\"}, {\"account\": 2, \"status\": \"absent\"}]}\n```",
+  "type": "object",
+  "properties": {
+    "accounts": {
+      "description": "Its status on each account rlx knows, by slot.",
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/AccountStatus"
+      }
+    },
+    "connector": {
+      "description": "The connector, by its id.",
+      "type": "string"
+    }
+  },
+  "required": [
+    "connector",
+    "accounts"
+  ],
+  "$defs": {
+    "AccountStatus": {
+      "description": "One account's status for a connector, in `connector_unavailable`.",
+      "type": "object",
+      "properties": {
+        "account": {
+          "description": "The account's rlx slot.",
+          "type": "integer",
+          "format": "uint32",
+          "maximum": 4294967295,
+          "minimum": 1
+        },
+        "status": {
+          "description": "The connector's status there.",
+          "$ref": "#/$defs/RouteStatus"
+        }
+      },
+      "required": [
+        "account",
+        "status"
+      ]
+    },
+    "RouteStatus": {
+      "description": "A connector's status on one account, as a route reads it.",
+      "oneOf": [
+        {
+          "description": "Connected now.",
+          "type": "string",
+          "const": "connected"
+        },
+        {
+          "description": "Its sign-in has lapsed: `connectors.login` signs in again.",
+          "type": "string",
+          "const": "needs-auth"
+        },
+        {
+          "description": "Still connecting when it was read.",
+          "type": "string",
+          "const": "pending"
+        },
+        {
+          "description": "It could not connect.",
+          "type": "string",
+          "const": "failed"
+        },
+        {
+          "description": "The account's connectors were read, and it isn't among them.",
+          "type": "string",
+          "const": "absent"
+        },
+        {
+          "description": "rlxd hasn't read the account's connectors (`connectors.list {refresh: true}`\ndoes), or rlxd doesn't know both of its homes, so none would be read.",
+          "type": "string",
+          "const": "unread"
+        }
+      ]
+    }
+  }
+}
