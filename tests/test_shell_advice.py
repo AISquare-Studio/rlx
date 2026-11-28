@@ -342,8 +342,6 @@ ALLOWED: dict[str, str] = {
         "data: the install line remote_install_hint returns; its callers wrap it"
     ),
     "services/remote_server.py::_unlock_lockout_alert": "data: a log line",
-    "services/remote_server.py::locked_out": "phone: a 403 the Remote page shows (B.6)",
-    "services/remote_server.py::lockout_alert": "phone: the alert pushed to the phones (B.6)",
     "services/remote_server.py::remote_install_hint": (
         "data: returns the install line; its callers wrap it"
     ),

@@ -1011,8 +1011,14 @@ NODE_TIMEOUT_S = 120
 """Each harness runs in well under a second; this is the ceiling for a runner that is slow."""
 
 
-def _node_report(harness: Path, cards: list[dict[str, object]] | None = None) -> dict[str, Any]:
-    """The harness's report; ``cards``, items the server built, go to it as ``ASQ_CARDS``.
+def _node_report(
+    harness: Path,
+    cards: list[dict[str, object]] | None = None,
+    *,
+    env: dict[str, str] | None = None,
+) -> dict[str, Any]:
+    """The harness's report; ``cards``, items the server built, go to it as ``ASQ_CARDS``, and
+    ``env`` as it is (what else the server built, for a scenario to draw).
 
     node's stdin is the null device, never this process's: under pytest-xdist on Windows that
     is the worker's execnet channel, a pipe the worker keeps a blocking read on. Windows
@@ -1034,7 +1040,7 @@ def _node_report(harness: Path, cards: list[dict[str, object]] | None = None) ->
             encoding="utf-8",
             timeout=NODE_TIMEOUT_S,
             check=False,
-            env=None if cards is None else {**os.environ, "ASQ_CARDS": json.dumps(cards)},
+            env=_node_env(cards, env),
         )
     except subprocess.TimeoutExpired as exc:  # what it said before it stopped, if anything
         said = exc.stderr if isinstance(exc.stderr, str) else (exc.stderr or b"").decode()
@@ -1042,6 +1048,19 @@ def _node_report(harness: Path, cards: list[dict[str, object]] | None = None) ->
     assert result.returncode == 0, result.stderr
     report: dict[str, Any] = json.loads(result.stdout)
     return report
+
+
+def _node_env(
+    cards: list[dict[str, object]] | None, env: dict[str, str] | None
+) -> dict[str, str] | None:
+    """node's environment: this process's, with ``ASQ_CARDS`` and ``env`` added; ``None``, this
+    process's as it is, when neither is sent."""
+    if cards is None and env is None:
+        return None
+    added = dict(env or {})
+    if cards is not None:
+        added["ASQ_CARDS"] = json.dumps(cards)
+    return {**os.environ, **added}
 
 
 @pytest.fixture(scope="module")
@@ -1415,16 +1434,47 @@ def test_every_agent_state_has_its_own_badge_and_sentence(node_report: dict[str,
     assert badges["paused"] == ["paused ⏸", "s-paused"]
     assert STATE_CHIP["paused"][0] == "⏸", "the sidebar's own paused mark"
     assert "⏯" not in _text("app.js")
-    assert sentences["paused"].startswith("paused") and "fleet resume" in sentences["paused"]
+    # A person's page names no command (R13, finding 3 of #4295): it was "… wait for fleet
+    # resume", the shell's words; it is rlx's Resume, where a person finds it.
+    assert sentences["paused"].startswith("paused") and "Resume in rlx" in sentences["paused"]
     assert ".s-paused" in _text("app.css")
 
 
 # --- the page booted in a fake browser (node) ----------------------------------------------
 
 
+def _paused_fleet() -> dict[str, object]:
+    """``GET api/fleet``'s body as the server builds it (``cli.fleet.agents_json``, which it
+    serves verbatim), for a paused coder, its detail the fleet's ``PAUSED_DETAIL``, and an
+    exited one: the boot harness's ``pausedRows`` draws it."""
+    from datetime import UTC, datetime
+
+    from aisquare.cli.fleet import agents_json
+    from aisquare.models import FleetAgent, FleetAgentStatus, ProjectInfo
+    from aisquare.services import fleet as fleet_service
+
+    def row(label: str, exit_status: int | None = None) -> FleetAgent:
+        return FleetAgent(
+            id=f"agt_{label}",
+            project_id="prj_x",  # the harness's project
+            label=label,
+            role="coder",
+            pane_id="%1",
+            cwd=Path("work"),
+            created_at=datetime(2026, 11, 28, tzinfo=UTC),
+            exit_status=exit_status,
+        )
+
+    statuses = [
+        FleetAgentStatus(agent=row("coder-1"), state="paused", detail=fleet_service.PAUSED_DETAIL),
+        FleetAgentStatus(agent=row("coder-2", 0), state="exited", detail="exit 0"),
+    ]
+    return agents_json(ProjectInfo(id="prj_x", root=Path("work")), statuses)
+
+
 @pytest.fixture(scope="module")
 def boot_report() -> dict[str, Any]:
-    return _node_report(BOOT_HARNESS)
+    return _node_report(BOOT_HARNESS, env={"ASQ_PAUSED_FLEET": json.dumps(_paused_fleet())})
 
 
 def test_a_page_opened_at_unlock_without_a_sign_in_draws_the_unlock_form(
@@ -1961,6 +2011,26 @@ def test_a_usage_limits_reset_is_told_by_the_phones_own_clock(
     assert rows[0] == "coder", "a row that is not limited keeps the detail it was sent"
     assert rows[1].startswith("coder · limit resets in 3 h (") and "06:10" in rows[1]
     assert "13:10" not in rows[1]
+
+
+def test_the_fleet_tab_says_a_paused_row_in_the_persons_words_not_the_machines_detail(
+    boot_report: dict[str, Any],
+) -> None:
+    """R13 on the phone (reviewer #4318, manager #4320 on #71): the Fleet tab drew a paused
+    row's detail as the machine sent it, ``fleet.PAUSED_DETAIL``, "… wait for fleet resume",
+    the shell's command. Drawn from the server's own ``agents_json``, a paused row says the
+    page's own sentence for it, as rlx's agent view says its own (``views.agent``'s
+    ``PAUSED_WORDS``): Resume in rlx brings it back. Every other row keeps the detail it was
+    sent. (The page's whole budget left room for these words alone, not a sentence more.)"""
+    from aisquare.services import fleet as fleet_service
+
+    rows = boot_report["pausedRows"]
+    assert rows == [
+        "coder · paused: Resume in rlx brings it back",
+        "coder · exit 0",
+    ]
+    assert "fleet resume" in fleet_service.PAUSED_DETAIL, "the premise: what the machine sends"
+    assert fleet_service.PAUSED_DETAIL not in rows[0]
 
 
 def test_the_board_tab_leaves_out_a_limits_reset_the_machines_clock_told(

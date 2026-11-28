@@ -52,6 +52,7 @@ from aisquare.cli.ui.views.app_settings import (
     UPDATES_CHECK,
     AppSettingsView,
     UiSettingsChanged,
+    account_options,
     display_label,
 )
 from aisquare.core import paths
@@ -264,8 +265,8 @@ def test_settings_binds_an_account_per_role_and_a_cleared_one_leaves_no_empty_pr
 
     labels, notices = drive(scenario)
     assert any(m.startswith("Saved ") for m, _ in notices), notices
-    assert labels[0] == "(no account binding)"
-    assert any(label.startswith("2 · account 2") for label in labels), labels
+    assert labels[0] == "(no preset account)"
+    assert "2 · not signed in" in labels, labels  # by who it is (Q1), never "account 2"
     assert load_config().team.profiles["coder"].account == "2"  # the binding's one home
     assert _config_toml()["team"]["profiles"]["coder"]["account"] == "2"  # the bytes
     assert "manager" not in load_config().team.profiles  # an untouched role gains no profile
@@ -392,8 +393,8 @@ def test_the_settings_form_reads_its_file_once_and_the_slots_off_the_ui_thread(
 
     labels, value = drive(scenario)
     assert listed and threading.main_thread().name not in listed
-    assert any(label.startswith("2 · account 2") for label in labels), labels
-    assert value == "2"  # the binding, shown before the slots arrived and after
+    assert "2 · not signed in" in labels, labels  # the slots, named by who (Q1)
+    assert value == "2"  # the preset's, shown before the slots arrived and after
     assert form.accounts.pick == "headroom" and form.fleet.escape_key == "f12"
 
 
@@ -419,7 +420,7 @@ def test_a_slot_removed_between_two_reads_falls_back_to_the_binding_on_the_form(
         return str(select.value), [str(value) for _label, value in select._options]
 
     value, offered = drive(scenario)
-    assert value == ""  # nothing bound: "no account binding"
+    assert value == ""  # nothing set: "no preset account"
     assert "3" not in offered and "2" in offered
 
 
@@ -874,7 +875,7 @@ def test_role_names_modes_and_bindings_written_by_hand_are_shown_as_text_not_mar
     names, prompts = drive(scenario)
 
     assert "a[/b]c" in names and "qa[x]" in names, names
-    assert "x[/y] (custom)" in prompts and "w[/z] (as bound)" in prompts, prompts
+    assert "x[/y] (custom)" in prompts and "w[/z] (as written)" in prompts, prompts
     saved = load_config()
     assert saved.fleet.max_agents_per_project == 5
     assert saved.fleet.roles["a[/b]c"].permission_mode == "x[/y]", "the hand edit stands"
@@ -1076,13 +1077,52 @@ def test_role_bindings_list_each_binding_with_its_claude_dirs_called_out() -> No
     assert "args --model opus" in shown
 
 
-def test_no_binding_shows_how_to_make_one() -> None:
-    async def scenario(pilot: Pilot[None], host: AppHost) -> str:
-        await settle(pilot)
-        return str(host.query_one("#bindings-empty", Static).render())
+def test_a_roles_account_select_names_each_account_by_who_it_is() -> None:
+    """Q1 (the test of #676, #4324): the select beside each role listed ``2 · account 2 ·
+    two@example.com``. It names an account as the Spawn dialog and the Accounts page do: the
+    slot, its alias if it has one, then its email; and its first row and a value written by
+    hand in preset words (Q15), never "binding" or "bound"."""
+    from aisquare.core import claude_accounts as accounts_core
+    from aisquare.services import claude_accounts as accounts_service
+    from tests.test_claude_accounts import _sign_in
 
-    said = drive(scenario)
-    assert said == "no role bindings — + New bind makes one", "the button, never a command (R13)"
+    two, three, four = (accounts_core.create_account() for _ in range(3))
+    _sign_in(two, "two@example.com")
+    _sign_in(three, "w@example.com")
+    accounts_service.set_alias(str(three.slot), "work")
+    listed = [account for account in accounts_service.list_accounts() if account.slot > 1]
+
+    labels = [str(label) for label, _ in account_options(listed, "laptop")]
+    assert labels == [
+        "(no preset account)",
+        f"{two.slot} · two@example.com",
+        f"{three.slot} · work · w@example.com",
+        f"{four.slot} · not signed in",
+        "laptop (as written)",
+    ]
+
+
+def test_no_binding_shows_how_to_make_one() -> None:
+    """Q15, finding 6 of the 0.10.2 gate (#4295): a role's binding is a *preset*, as the
+    Spawn dialog's Preset row and its picker's *+ New preset* say; here *+ New bind* opened a
+    form headed *New preset*. The section, its button, its empty line and the note that
+    points to it say preset too."""
+
+    async def scenario(pilot: Pilot[None], host: AppHost) -> list[str]:
+        await settle(pilot)
+        return [
+            str(host.query_one("#bindings-empty", Static).render()),
+            str(host.query_one("#bindings-new", Button).label),
+            str(host.query_one("#agent-settings-note", Static).render()),
+        ]
+
+    said, button, pointer = drive(scenario)
+    assert said == "no presets — + New preset makes one", "the button, never a command (R13)"
+    assert button == "+ New preset"
+    assert AppSettingsView.bindings_section()[0] == "Presets"
+    assert "is under Presets below" in pointer, pointer
+    for shown in (said, button, pointer):
+        assert "bind" not in shown, shown
 
 
 def test_edit_opens_the_bind_form_on_the_binding_and_writes_what_team_bind_writes(
@@ -1203,7 +1243,7 @@ def test_unset_key_and_clear_write_what_team_bind_writes() -> None:
     assert seen["asked"] is True and seen["unset"] == after_unset
     assert seen["armed"] == (True, "Clear? click again", 1), "no dialog"
     shown, said = cast(tuple[bool, str], seen["note"])
-    assert shown is True and said.startswith("The whole binding of tester goes"), said
+    assert shown is True and said.startswith("The whole preset of tester goes"), said
     assert seen["after_one"] == after_unset, "one press writes nothing"
     assert seen["disarmed"] == (False, "Clear", True), "the note line has its own text back"
     assert seen["cleared"] == seen["after_clear"]

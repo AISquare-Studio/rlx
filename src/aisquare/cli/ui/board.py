@@ -2,7 +2,7 @@
 
 ``BoardPanel`` is the sessions block, the task table, the live feed and the
 detail pane of the board TUI, with the behaviours they had as ``BoardApp``:
-click or Enter on a task or a feed line shows its full content below; ``d``
+click or Enter on a task opens its reader, on a feed line shows it in full below; ``d``
 flips the table to the done archive; ``o`` opens the author session's
 transcript at the selected moment; ``v`` freezes the feed into selectable text;
 ``a`` toggles autoscroll; ``b`` hides the board column; ``r`` refreshes now.
@@ -160,7 +160,7 @@ DEFAULT_FOLDS: frozenset[str] = frozenset({"done"})
 OWNER_CELLS = 14
 """The widest the owner column grows; a longer name ends in ``…``."""
 BOARD_KEYS: tuple[tuple[str, str], ...] = (
-    ("click", "a task or stream line: its full content below"),
+    ("click", "a task: its reader · a stream line: in full below"),
     ("d", "unfold the done archive · fold it again"),
     ("f", "fold or unfold the group at the cursor"),
     ("o", "the author's transcript at that moment"),
@@ -907,9 +907,7 @@ class BoardPanel(Vertical):
         feed = self.query_one("#feed", OptionList)
         feed.border_title = self._feed_title()
         self.watch(feed, "scroll_y", self._feed_scrolled, init=False)
-        self.query_one(
-            "#detailwrap", VerticalScroll
-        ).border_title = "detail — click a task or feed line"
+        self.query_one("#detailwrap", VerticalScroll).border_title = "detail — click a stream line"
         self._restore_view()
         self.refresh_data()
         self.set_interval(self.interval, self._tick)
@@ -1095,7 +1093,10 @@ class BoardPanel(Vertical):
             return
         self._labels_asked_at = now
         self.run_worker(
-            accounts_service.slot_labels,
+            # By email, as the Accounts page and the agent header name them (Q1; finding 7 of
+            # #4295: this block still said "account 2"). A person's board only: the text board
+            # hooks inject into agents keeps ``slot_labels``, no person's address in a prompt.
+            accounts_service.display_labels,
             name=LABELS_WORKER,
             group=LABELS_WORKER,
             exclusive=True,
