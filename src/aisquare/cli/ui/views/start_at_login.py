@@ -140,7 +140,9 @@ class StartAtLogin(Vertical):
         return True
 
     @on(Worker.StateChanged)
-    def _answered(self, event: Worker.StateChanged) -> None:
+    def _start_at_login_answered(self, event: Worker.StateChanged) -> None:
+        # Its own name, as its siblings have: the config-write guard resolves calls by name,
+        # and ``receiver._answered`` is another's (the rc merge, #33).
         worker = event.worker
         if worker.group != WORKER:
             return
