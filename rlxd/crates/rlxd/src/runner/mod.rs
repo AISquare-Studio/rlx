@@ -322,8 +322,13 @@ struct RunInner {
     /// The `needs_you.raised` the run has out, to clear when it goes on or ends.
     needs_you: Option<String>,
     /// The connectors its `needs_you {reason: "auth"}` waits on (5.5): it is cleared,
-    /// too, once each is `connected` again. Empty when it has none out.
+    /// too, once each is `connected` again on the account [`RunInner::home`] is. Empty
+    /// when it has none out.
     auth: Vec<String>,
+    /// The `CLAUDE_CONFIG_DIR` the app's values gave its latest attempt when it started
+    /// (4.3), `None` when they gave none: then it ran on rlxd's own. Whose sign-in its
+    /// `auth` waits on.
+    home: Option<String>,
     /// Events appended to the log since its last fsync.
     unsynced: u32,
     /// The last `run_seq` in the run's log: an event whose append failed is not counted,
@@ -478,11 +483,13 @@ impl Runner {
         });
         runner.load();
         let told = Arc::downgrade(&runner);
-        runner.connectors.on_connected(Box::new(move |connected| {
-            if let Some(runner) = told.upgrade() {
-                runner.signed_in(connected);
-            }
-        }));
+        runner
+            .connectors
+            .on_connected(Box::new(move |slot, connected| {
+                if let Some(runner) = told.upgrade() {
+                    runner.signed_in(slot, connected);
+                }
+            }));
         runner
     }
 
@@ -622,6 +629,7 @@ impl Runner {
                     reply: None,
                     needs_you,
                     auth,
+                    home: record.home.clone(),
                     unsynced: 0,
                     logged: tail.last_run_seq,
                     // A call still executing when its rlxd stopped may have run: unknown.
@@ -849,6 +857,7 @@ impl Runner {
                 reply: None,
                 needs_you: None,
                 auth: Vec::new(),
+                home: None,
                 unsynced: 0,
                 logged: 0,
                 session_started: false,
@@ -1700,11 +1709,28 @@ impl Runner {
     }
 
     /// Clears each failed run's `needs_you {reason: "auth"}` whose connectors are all
-    /// among `connected` (5.5): their sign-in is back. Called with no run's lock held.
-    fn signed_in(&self, connected: &[String]) {
+    /// among `connected` on account `slot` (5.5), when its own attempt ran on that account
+    /// ([`RunInner::home`]): their sign-in is back there. A run on another home keeps its
+    /// needs-you. Called with no run's lock held.
+    fn signed_in(&self, slot: u32, connected: &[String]) {
+        let waits = |inner: &RunInner| {
+            !inner.auth.is_empty() && inner.auth.iter().all(|id| connected.contains(id))
+        };
         for run in self.snapshot() {
+            let home = {
+                let inner = run.inner();
+                if !waits(&inner) {
+                    continue;
+                }
+                inner.home.clone()
+            };
+            // Only a sign-in on the account its own attempt ran on (4.3), worked out with no
+            // run's lock held.
+            if self.connectors.slot_of_home(home.as_deref()) != Some(slot) {
+                continue;
+            }
             let mut inner = run.inner();
-            if inner.auth.is_empty() || !inner.auth.iter().all(|id| connected.contains(id)) {
+            if !waits(&inner) || inner.home != home {
                 continue;
             }
             info!(
@@ -1790,6 +1816,7 @@ impl Runner {
         // never a lookup now (4.3), read with the values it goes with. Refused at run.start
         // when there was none; this is for an environment changed since.
         let (values, resolved) = self.env.snapshot();
+        run.inner().home.clone_from(&values.claude_config_dir);
         let program = match claude_from(resolved) {
             Ok(program) => program,
             Err(refused) => return failed(refused.message),
@@ -2678,6 +2705,7 @@ impl Run {
             calls: inner.calls.clone(),
             pinned_call_used: inner.pinned_call_used,
             auth: inner.auth.clone(),
+            home: inner.home.clone(),
             connectors_call: self.call.is_some(),
         }
     }

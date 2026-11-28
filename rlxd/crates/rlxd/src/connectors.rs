@@ -82,9 +82,9 @@ impl Default for GateTimes {
     }
 }
 
-/// Told every connector the default account holds `connected`, after a change left one
-/// so.
-pub type OnConnected = Box<dyn Fn(&[String]) + Send + Sync>;
+/// Told an account's slot and every connector it holds `connected`, after a change left
+/// one so.
+pub type OnConnected = Box<dyn Fn(u32, &[String]) + Send + Sync>;
 
 /// One Claude Code account rlx knows: its slot, and the environment Claude Code runs on
 /// there. The brain says which there are (`accounts`); with no brain, only the default.
@@ -527,10 +527,28 @@ impl Connectors {
     }
 
     /// Tells [`Connectors::on_connected`]'s callee who is connected now.
-    fn tell_connected(&self, connected: &[String]) {
+    fn tell_connected(&self, slot: u32, connected: &[String]) {
         if let Some(told) = self.on_connected.get() {
-            told(connected);
+            told(slot, connected);
         }
+    }
+
+    /// The account a run, call or login ran on, whose attempt started with `home`, the
+    /// `CLAUDE_CONFIG_DIR` its snapshot of the app's values gave (`None`: rlxd's own), by
+    /// the rules a run's init is filed by ([`Connectors::observe`]): `None` while rlx has
+    /// yet to say which accounts there are, and when that home is none of theirs. What it
+    /// found is filed there, or nowhere. Takes no lock of the runs'.
+    pub fn slot_of_home(&self, home: Option<&str>) -> Option<u32> {
+        let home = runs_home(home, self.rlxd_dir.as_deref());
+        let known = self.known().clone();
+        let listed = self.cache().listed;
+        runs_of(
+            home.as_deref(),
+            &known,
+            self.told.load(Ordering::SeqCst),
+            listed,
+        )
+        .slot()
     }
 
     fn cache(&self) -> MutexGuard<'_, Saved> {
@@ -556,10 +574,17 @@ impl Connectors {
         self.no_turn
     }
 
-    /// What the runs' account's cache says of `connector`'s `tool`: its
-    /// `read_only_hint`, or `None` when it doesn't list that tool of that connector.
-    pub fn read_only_hint(&self, connector: &str, tool: &str) -> Option<Option<bool>> {
-        let slot = self.runs_slot()?;
+    /// What the cache of the account a call runs on says of `connector`'s `tool`: its
+    /// `read_only_hint`, or `None` when it doesn't list that tool of that connector, or
+    /// that account is not known ([`Connectors::slot_of_home`]). `home` is the
+    /// `CLAUDE_CONFIG_DIR` the call's own snapshot of the app's values gave.
+    pub fn read_only_hint(
+        &self,
+        connector: &str,
+        tool: &str,
+        home: Option<&str>,
+    ) -> Option<Option<bool>> {
+        let slot = self.slot_of_home(home)?;
         let cache = self.cache();
         cache
             .accounts
@@ -614,10 +639,6 @@ impl Connectors {
 
     fn runs_now(&self) -> Runs {
         *self.runs.lock().unwrap_or_else(|p| p.into_inner())
-    }
-
-    fn runs_slot(&self) -> Option<u32> {
-        self.runs_now().slot()
     }
 
     /// Notes that rlx couldn't say which accounts there are: the accounts stay as they
@@ -882,7 +903,6 @@ impl Connectors {
             .checked_at(at.clone());
             now.insert(server.name.clone(), connector);
         }
-        let runs = self.runs_slot();
         let mut cache = self.cache();
         let entry = cache.entry(slot);
         if now.is_empty() && !entry.connectors.is_empty() {
@@ -930,7 +950,7 @@ impl Connectors {
             Read::Listing => ListedFrom::Listing,
         };
         entry.keep(account);
-        let connected = (connected_now && Some(slot) == runs).then(|| connected_in(entry));
+        let connected = connected_now.then(|| connected_in(entry));
         // Kept, then published, both under the cache's lock: two reads' changes are
         // written and published in their order, and none is published before it is
         // kept.
@@ -940,7 +960,7 @@ impl Connectors {
         }
         drop(cache);
         if let Some(connected) = connected {
-            self.tell_connected(&connected);
+            self.tell_connected(slot, &connected);
         }
     }
 
@@ -955,10 +975,17 @@ impl Connectors {
         self.save(&cache);
     }
 
-    /// Sets the runs' account's `id`'s status, when it has it: a login's end, or a
-    /// call's `mcp_status` that found it `needs-auth` or `failed`.
-    pub fn set_status(&self, id: &str, status: ConnectorState) {
-        let Some(slot) = self.runs_slot() else {
+    /// Sets `id`'s status in the account a login or call ran on, when it has it: a
+    /// login's end, or a call's `mcp_status` that found it `needs-auth` or `failed`.
+    /// `home` is the `CLAUDE_CONFIG_DIR` that login's or call's own snapshot of the app's
+    /// values gave (4.3): the account is the one a run's init on that home is filed under
+    /// ([`Connectors::slot_of_home`]), and none when that is not known. Never the runs'
+    /// account now, which an `env.set` may have changed since it started.
+    pub fn set_status(&self, id: &str, status: ConnectorState, home: Option<&str>) {
+        let Some(slot) = self.slot_of_home(home) else {
+            info!(
+                "connectors: {id}'s status is filed under no account: its home is none rlx knows"
+            );
             return;
         };
         let mut cache = self.cache();
@@ -981,7 +1008,7 @@ impl Connectors {
         );
         drop(cache);
         if let Some(connected) = connected {
-            self.tell_connected(&connected);
+            self.tell_connected(slot, &connected);
         }
     }
 
@@ -1134,7 +1161,8 @@ impl Connectors {
                 connector_types::LOGIN_DONE,
                 json_of(&ConnectorLoginDone::new(login_id, id, status)),
             );
-            self.set_status(id, status);
+            // On the account this login ran on: its own snapshot's home.
+            self.set_status(id, status, values.claude_config_dir.as_deref());
         }
     }
 
@@ -1499,7 +1527,10 @@ mod tests {
         let told = Arc::new(Mutex::new(Vec::new()));
         connectors.on_connected(Box::new({
             let told = Arc::clone(&told);
-            move |ids| told.lock().unwrap().push(ids.to_vec())
+            move |slot, ids: &[String]| {
+                assert_eq!(slot, DEFAULT_ACCOUNT, "the account it changed in");
+                told.lock().unwrap().push(ids.to_vec());
+            }
         }));
         let none = (HashMap::new(), HashMap::new());
         let slack = |status| McpServer::new("claude.ai Slack", status);
@@ -1513,8 +1544,8 @@ mod tests {
             *told.lock().unwrap(),
             [vec!["local".to_owned()], both.clone()]
         );
-        connectors.set_status("claude.ai Slack", ConnectorState::NeedsAuth);
-        connectors.set_status("claude.ai Slack", ConnectorState::Connected);
+        connectors.set_status("claude.ai Slack", ConnectorState::NeedsAuth, None);
+        connectors.set_status("claude.ai Slack", ConnectorState::Connected, None);
         assert_eq!(told.lock().unwrap().len(), 3);
         assert_eq!(told.lock().unwrap()[2], both);
     }
@@ -1617,7 +1648,10 @@ mod tests {
             list.connectors.is_empty(),
             "the top level is the plain account's"
         );
-        assert_eq!(connectors.read_only_hint("claude.ai Slack", "x"), None);
+        assert_eq!(
+            connectors.read_only_hint("claude.ai Slack", "x", None),
+            None
+        );
     }
 
     fn row_of(list: &ConnectorsList, slot: u32) -> AccountConnectors {

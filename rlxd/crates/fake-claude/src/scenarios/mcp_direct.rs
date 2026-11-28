@@ -85,6 +85,9 @@ pub const SLOW_REPLY_MS: u64 = 9000;
 /// How long `-slow-ask` waits before it asks `can_use_tool`.
 pub const SLOW_ASK_MS: u64 = 3000;
 
+/// How long `mcp-direct-needs-auth-slow` lists its connectors `pending`.
+pub const SLOW_NEEDS_AUTH_MS: u64 = 3000;
+
 /// The line `-huge` writes: past rlxd's 4 MiB for a control line.
 pub const HUGE_BYTES: usize = 5 << 20;
 
@@ -107,6 +110,8 @@ pub enum Variant {
     Respelled,
     /// It lists the connector `needs-auth`.
     NeedsAuth,
+    /// It lists the connector `pending` for [`SLOW_NEEDS_AUTH_MS`], then `needs-auth`.
+    NeedsAuthSlow,
     /// It never answers the allowed call.
     Hang,
     /// It plants an allow rule in its cwd's project settings after `initialize`.
@@ -201,7 +206,15 @@ pub fn play(fake: &mut Fake, variant: Variant) -> i32 {
             }
             "mcp_status" => {
                 let early = started.elapsed() < Duration::from_millis(EARLY_MS);
-                let servers = if early { json!([]) } else { servers(variant) };
+                let servers = if early {
+                    json!([])
+                } else if variant == Variant::NeedsAuthSlow
+                    && started.elapsed() < Duration::from_millis(SLOW_NEEDS_AUTH_MS)
+                {
+                    pending(servers(variant))
+                } else {
+                    servers(variant)
+                };
                 success(fake, &id, json!({"mcpServers": servers}));
             }
             "mcp_call" => {
@@ -221,9 +234,17 @@ pub fn play(fake: &mut Fake, variant: Variant) -> i32 {
     }
 }
 
+/// `servers`, each one `pending`.
+fn pending(mut servers: Value) -> Value {
+    for server in servers.as_array_mut().into_iter().flatten() {
+        server["status"] = Value::from("pending");
+    }
+    servers
+}
+
 /// The servers `mcp_status` lists once the claude.ai list is fetched.
 fn servers(variant: Variant) -> Value {
-    let status = if variant == Variant::NeedsAuth {
+    let status = if matches!(variant, Variant::NeedsAuth | Variant::NeedsAuthSlow) {
         "needs-auth"
     } else {
         "connected"
@@ -293,7 +314,9 @@ fn ask(
 fn call(fake: &mut Fake, id: &Value, request: &Value, variant: Variant, n: u32) -> bool {
     let tool = request["tool"].as_str().unwrap_or_default().to_owned();
     let arguments = request["arguments"].clone();
-    if variant == Variant::NeedsAuth || ![READ, WRITE, SLACK_READ].contains(&tool.as_str()) {
+    if matches!(variant, Variant::NeedsAuth | Variant::NeedsAuthSlow)
+        || ![READ, WRITE, SLACK_READ].contains(&tool.as_str())
+    {
         fake.emit(
             &json!({"type": "control_response", "response": {"subtype": "error",
             "request_id": id, "error": "MCP server not connected: claude_ai_GitHub"}}),

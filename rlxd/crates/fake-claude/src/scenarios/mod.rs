@@ -84,6 +84,9 @@ pub const ALL: &[(&str, Scenario)] = &[
     ("mcp-direct-needs-auth", |fake| {
         mcp_direct::play(fake, Variant::NeedsAuth)
     }),
+    ("mcp-direct-needs-auth-slow", |fake| {
+        mcp_direct::play(fake, Variant::NeedsAuthSlow)
+    }),
     ("mcp-direct-old", |fake| {
         mcp_direct::play(fake, Variant::Old)
     }),

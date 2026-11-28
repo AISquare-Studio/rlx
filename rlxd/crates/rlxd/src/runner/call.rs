@@ -338,6 +338,7 @@ impl Runner {
         // A run's `claude` and environment (4.3), read together: refused at the start when
         // there was none, so this is for an environment changed since.
         let (values, resolved) = self.env.snapshot();
+        run.inner().home.clone_from(&values.claude_config_dir);
         let program = match claude_from(resolved) {
             Ok(program) => program,
             Err(refused) => return failed(refused.message),
@@ -361,7 +362,12 @@ impl Runner {
         if let (Some(pinned), Mount::Connectors { connectors }) =
             (&params.pinned_call, &params.mount)
             && connectors.iter().any(|connector| {
-                self.connectors.read_only_hint(connector, &pinned.tool) == Some(Some(false))
+                // The account this call runs on: its own snapshot's home (4.3).
+                self.connectors.read_only_hint(
+                    connector,
+                    &pinned.tool,
+                    values.claude_config_dir.as_deref(),
+                ) == Some(Some(false))
             })
         {
             let reason = format!(
@@ -432,7 +438,8 @@ impl Runner {
             line: Vec::new(),
             deadline,
         };
-        let driven = self.drive(run, call, &mut channel, &cwd, times).await;
+        let home = values.claude_config_dir.as_deref();
+        let driven = self.drive(run, call, &mut channel, &cwd, times, home).await;
         drop(channel);
         match &driven {
             Driven::Ran
@@ -535,6 +542,7 @@ impl Runner {
         channel: &mut Channel<'_, R>,
         cwd: &std::path::Path,
         times: Times,
+        home: Option<&str>,
     ) -> Driven {
         let Some(pinned) = run.params.pinned_call.clone() else {
             return Driven::Broken("the call's run has no pinned call".to_owned());
@@ -610,13 +618,14 @@ impl Runner {
                 Verdict::Connected => break (listed_of(&rows), servers),
                 Verdict::Stopped(connectors) => {
                     // A connector the call found signed out or failing is so in the map
-                    // too, with no refresh (task #14).
+                    // too, with no refresh (task #14): in the account the call ran on,
+                    // by its own snapshot's home.
                     blocking(|| {
                         for connector in &connectors {
                             let status = ConnectorState::of(&connector.status);
                             if matches!(status, ConnectorState::NeedsAuth | ConnectorState::Failed)
                             {
-                                self.connectors.set_status(&connector.id, status);
+                                self.connectors.set_status(&connector.id, status, home);
                             }
                         }
                     });

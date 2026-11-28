@@ -492,9 +492,10 @@ listing, 5.5 and 7.7): `crate::connectors`, and the gate in `crate::runner::conn
   states before it sends the prompt. A `needs-auth` or `failed` connector stops the gate
   at once. When it gives up, the run ends `run.failed {reason: "connectors", connectors:
   [{id, status}]}`, after `needs_you.raised {reason: "auth"}` when a connector's sign-in
-  lapsed. That needs-you is kept in the run's record, and cleared once rlxd sees each
-  connector it names `connected` again (a login's end, or any later `system/init`), or
-  by a resume or the space's erase. A run that never reached `run.started` has no
+  lapsed. That needs-you is kept in the run's record, with the home the run's attempt
+  ran on, and cleared once rlxd sees each connector it names `connected` again on that
+  home's account (a login's end, or any later `system/init`), never another's, or by a
+  resume or the space's erase. A run that never reached `run.started` has no
   session to resume (`no_session`): a new run is the way on.
 - **What a missed try leaves.** Nothing of a try ended unconfirmed stays in the run's
   session: a miss, or any other end before its connectors are confirmed (a cancel, the
@@ -531,7 +532,11 @@ listing, 5.5 and 7.7): `crate::connectors`, and the gate in `crate::runner::conn
   with that home and files it by it then; one that is no account rlx knows is filed
   nowhere, never under a guess. That is an ungated run's (not `no_tools`, which lists none), a gated run's once
   confirmed, the last try's of one that failed, and a one-turn probe's. So does a
-  `connectors.call` that finds its connector `needs-auth` or `failed`. A read that lists
+  `connectors.call` that finds its connector `needs-auth` or `failed`, and a login's
+  end: each in the account of the home its own start read (the app's `CLAUDE_CONFIG_DIR`
+  then, else rlxd's own), and nowhere when that is no account rlx knows. The runs'
+  account now only says what a run, call or login started now runs on; it never files
+  a result. A read that lists
   no server at all empties nothing, since a Claude Code that loaded none (E9's stdin at
   EOF) says the same. A server's `source` is its kind (`claude.ai`, or `mcp` for a local
   one), init's where it gives one (`claudeai` is a claude.ai connector), and its tools
@@ -596,7 +601,8 @@ listing, 5.5 and 7.7): `crate::connectors`, and the gate in `crate::runner::conn
   the login's exit 0 is `connector.login.done {status: "connected"}`; anything else is
   `connector.login.error {code}` (`not_https`, `no_url`, `failed`, `timed_out`,
   `claude_not_found`, `claude_not_runnable`). Its `claude` and environment are a run's:
-  the app's (4.3), on top of rlxd's own. No URL's query, where a login's secrets are, is
+  the app's (4.3), on top of rlxd's own, and its sign-in is filed in the account of the
+  home it started on. No URL's query, where a login's secrets are, is
   ever in rlxd's log. The PTY is killed when the login ends.
 - **`connectors.call {run_id, connector, tool, input}`** (5.3 phase 2; spike #5, route a)
   makes exactly one call of the connector's tool through Claude Code's own MCP client,
