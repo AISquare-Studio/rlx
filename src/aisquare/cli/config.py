@@ -85,7 +85,7 @@ def _stdin_is_a_terminal() -> bool:
 
 
 @app.command("reset")
-def reset(
+def config_reset(
     yes: Annotated[
         bool, typer.Option("--yes", "-y", help="Reset without asking; required off a terminal.")
     ] = False,

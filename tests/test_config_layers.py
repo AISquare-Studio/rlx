@@ -271,6 +271,8 @@ def test_the_v1_snapshot_differs_from_today_only_by_the_headroom_defaults_and_th
             "import": {"engine": "auto", "api_model": "claude-opus-5"},
         },
         "experimental": {"captain": False},
+        # The rlx service's start at login (S2, #33): absent until a choice is made.
+        "service": {},
         # The rlx service's tray icon (#34): on, rlx's backslash, the person's own terminal.
         "tray": {"enabled": True, "icon": "backslash", "terminal": ""},
         # asq's daily release check (services.updates).
@@ -366,6 +368,8 @@ def test_the_v1_snapshot_differs_from_today_only_by_the_headroom_defaults_and_th
             "auto_stop": True,
             "sources": {},
         },
+        # `rlx tidy`'s idle live coders' build output (the owner's disk tidy, #58).
+        "tidy": {"idle_build_hours": 24.0},
         # Opt-in usage sharing (docs/usage-telemetry.md): off, the default. The daily active
         # ping beside it (0.10.2, its own switch): on unless turned off.
         "sharing": {"enabled": False, "active_ping": True},

@@ -584,6 +584,23 @@ def no_look_at_the_machines_processes(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(instance_scan, "_ps", lambda: "")
 
 
+@pytest.fixture(autouse=True)
+def no_tidy_of_the_machine(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """``rlx tidy`` (``services.tidy``, #58) never reads this machine's per-user temp directory
+    nor its process table under the suite: the system temp it would free stale locks in is a
+    folder of the test's own, and no process runs (tester #3507: a guard that ran a real
+    ``rlx tidy`` scanned the real temp dir, where a free lock older than a day would have gone).
+    Its own tests hand it command lines of their own; the home is the sandbox's already. The
+    folder is named, not made: a test that reads what its ``tmp_path`` holds sees nothing new,
+    and a folder that is not there holds no lock."""
+    from aisquare.services import tidy
+
+    system = tmp_path / "system-temp"
+    monkeypatch.setattr(tidy, "_system_temp_dirs", lambda: [system])
+    monkeypatch.setattr(tidy, "_command_lines", lambda: [])
+    return system
+
+
 _uid = private_fleets.uid
 
 
@@ -1035,6 +1052,61 @@ def real_service(monkeypatch: pytest.MonkeyPatch) -> Iterator[list[Any]]:
         except Exception:
             child.kill()
     assert not left, f"the test left rlx services running: pids {[c.pid for c in left]}"
+
+
+class LoginOs:
+    """The OS's login tools as a test sees them (``service_login._service_manager``): every call
+    kept in :attr:`calls`, each answered by the last :meth:`reply` its words start with, else
+    exit 0 with nothing said."""
+
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, ...]] = []
+        self._replies: list[tuple[tuple[str, ...], int, str]] = []
+
+    def reply(self, *words: str, code: int = 0, said: str = "") -> None:
+        self._replies.insert(0, (words, code, said))
+
+    def run(self, argv: Any) -> Any:
+        """``service_login._service_manager``'s stand-in: a method, so the seam guard can read
+        its source (``tests/test_spawn_seams.py``)."""
+        from aisquare.services.service_login import OsReply
+
+        call = tuple(str(word) for word in argv)
+        self.calls.append(call)
+        for words, code, said in self._replies:
+            if call[: len(words)] == words:
+                return OsReply(code, said)
+        return OsReply(0, "")
+
+    def changes(self) -> list[tuple[str, ...]]:
+        """The calls that change something: every one but the reads."""
+        reads = {("launchctl", "print"), ("launchctl", "print-disabled")}
+        return [
+            call
+            for call in self.calls
+            if call[:2] not in reads and "is-enabled" not in call and "show-user" not in call
+        ]
+
+
+@pytest.fixture(autouse=True)
+def no_real_login_item(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> LoginOs:
+    """No test runs the real ``launchctl``, ``systemctl`` or ``loginctl``, or writes the real
+    ``~/Library/LaunchAgents`` or ``~/.config/systemd/user`` (#33's boundary): the suite does not
+    scope HOME. Each test has its own folders for them, an installed ``rlx`` to name (the suite
+    runs from a checkout, which a login item refuses), and macOS's way (launchd, uid 501) on
+    every OS, so a test reads the same everywhere; a test of Linux's sets
+    ``service_login._platform``. Asked for by name, this is the recorder of the calls."""
+    from aisquare.services import service_login
+
+    login_os = LoginOs()
+    folder = tmp_path / "os-login"
+    monkeypatch.setattr(service_login, "_service_manager", login_os.run)
+    monkeypatch.setattr(service_login, "launch_agents_dir", lambda: folder / "LaunchAgents")
+    monkeypatch.setattr(service_login, "systemd_user_dir", lambda: folder / "systemd" / "user")
+    monkeypatch.setattr(service_login, "entry_point", lambda: folder / "bin" / "rlx")
+    monkeypatch.setattr(service_login, "_platform", lambda: "darwin")
+    monkeypatch.setattr(service_login, "_uid", lambda: 501)
+    return login_os
 
 
 @pytest.fixture
