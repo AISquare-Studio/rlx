@@ -878,3 +878,84 @@ fn once_the_brain_has_listed_slot_1_alone_an_unknown_homes_init_never_flips_it()
     assert!(connector_events(&home, since).is_empty());
     assert_eq!(saved(&home)["1"]["login"], MARK_1);
 }
+
+// --- 4.3: the app's environment ---------------------------------------------------------
+
+/// `env.set` from the app of a `CLAUDE_CONFIG_DIR` of its own and a `PATH`: the values a
+/// run's Claude Code gets. Their `(CLAUDE_CONFIG_DIR, PATH)`.
+fn app_sets_its_own_home(home: &TestHome) -> (String, String) {
+    let config = home.root().join("cc-app");
+    std::fs::create_dir_all(&config).unwrap();
+    let mut dirs = vec![home.root().join("app-bin")];
+    dirs.extend(home.path_without_real_claude());
+    let path = std::env::join_paths(dirs).unwrap();
+    let (config, path) = (
+        config.to_str().unwrap().to_owned(),
+        path.to_str().unwrap().to_owned(),
+    );
+    let change = json!({"CLAUDE_CONFIG_DIR": config, "PATH": path});
+    let set = home.rlxd(&["call", "--as-app", "env.set", &change.to_string()]);
+    assert_eq!(set.code(), Some(0), "{set:?}");
+    (config, path)
+}
+
+/// Each start's environment holds the app's `PATH`, and its account's homes alone: the
+/// default account's neither `CLAUDE_CONFIG_DIR` nor `CLAUDE_CODE_TMPDIR`, though the app
+/// set a `CLAUDE_CONFIG_DIR`; a managed one's its own two.
+fn assert_each_on_its_account(start: &Value, slot: u32, accounts: &Accounts, path: &str) {
+    let env = &start["env"];
+    assert_eq!(env["PATH"], path, "the app's PATH: {start:#}");
+    if slot == 1 {
+        assert_eq!(env.get("CLAUDE_CONFIG_DIR"), None, "{start:#}");
+        assert_eq!(env.get("CLAUDE_CODE_TMPDIR"), None, "{start:#}");
+    } else {
+        assert_eq!(
+            env["CLAUDE_CONFIG_DIR"],
+            accounts.managed.to_str().unwrap(),
+            "{start:#}"
+        );
+        assert_eq!(
+            env["CLAUDE_CODE_TMPDIR"],
+            accounts.managed_tmp.to_str().unwrap(),
+            "{start:#}"
+        );
+    }
+}
+
+#[test]
+fn with_the_apps_environment_each_read_keeps_to_its_accounts_homes() {
+    let (home, accounts) = map_home(true, &[]);
+    let (config, path) = app_sets_its_own_home(&home);
+    let data = list(&home, &json!({"refresh": true}));
+    assert_eq!(data["model_turns"], 0, "{data:#}");
+    assert_eq!(row(&data, 1)["connectors"][0]["status"], "connected");
+    assert_eq!(row(&data, 2)["connectors"][0]["status"], "needs-auth");
+    let starts = starts(&home);
+    assert_eq!(starts.len(), 2, "{starts:#?}");
+    assert_each_on_its_account(&starts[0], 1, &accounts, &path);
+    assert_each_on_its_account(&starts[1], 2, &accounts, &path);
+    for start in &starts {
+        assert_ne!(
+            start["env"]["CLAUDE_CONFIG_DIR"],
+            config.as_str(),
+            "{start:#}"
+        );
+    }
+}
+
+#[test]
+fn with_the_apps_environment_each_one_turn_probe_keeps_to_its_accounts_homes() {
+    let (home, accounts) = map_home(false, &[]);
+    let (_, path) = app_sets_its_own_home(&home);
+    std::fs::write(home.root().join("scenario"), "init-connectors").unwrap();
+    for slot in [1, 2] {
+        let data = list(
+            &home,
+            &json!({"refresh": true, "allow_turn": true, "account": slot}),
+        );
+        assert_eq!(data["model_turns"], 1, "{data:#}");
+        let starts = starts(&home);
+        assert_eq!(starts.len(), slot as usize, "{starts:#?}");
+        assert_each_on_its_account(starts.last().unwrap(), slot, &accounts, &path);
+    }
+}
