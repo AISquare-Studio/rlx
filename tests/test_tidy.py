@@ -1554,6 +1554,37 @@ def test_a_git_bundle_is_a_repository_tidy_never_deletes(tmp_path: Path, repo: P
     assert bundle.is_file() and inside.is_file() and not lookalike.exists()
 
 
+@pytest.mark.skipif(
+    sys.platform == "win32" or not hasattr(os, "getuid") or os.getuid() == 0,
+    reason="needs a mode that denies reading: not as root, nor on Windows",
+)
+def test_a_cache_kept_for_what_tidy_cannot_read_is_named(tmp_path: Path) -> None:
+    """Tester #3875 (d): a session's cache holding a file tidy cannot read (#3804) stays, and the
+    plan says why, the outermost only, with its size; a cache beside it goes."""
+    recent = session_dir()
+    cache = tag(recent / "scratchpad" / "target")
+    inner = tag(cache / "deep" / "target")
+    shut = inner / "unreadable.bin"
+    shut.write_bytes(b"x" * 4096)
+    plain = tag(recent / "scratchpad" / "plain")
+    aged(recent, 3 * HOUR)
+    shut.chmod(0)
+    try:
+        made = planned(tmp_path)
+        unsized = tidy.plan(size_kept=False)
+        tidy.apply(made)
+    finally:
+        shut.chmod(0o600)
+
+    assert rules(made) == {plain: tidy.SESSION_CACHE}
+    named = [(k.rule, k.path, k.why) for k in made.kept if k.path.is_relative_to(cache)]
+    assert named == [(tidy.SESSION_CACHE, cache, tidy.UNREAD_INSIDE)]
+    [size] = [k.bytes for k in made.kept if k.path == cache]
+    assert size is not None and size >= 4096
+    assert [k.bytes for k in unsized.kept if k.path == cache] == [None]
+    assert shut.is_file() and not plain.exists()
+
+
 def test_a_plan_without_kept_sizes_walks_no_kept_repository(tmp_path: Path, repo: Path) -> None:
     """#59's periodic job plans without them: a repository tidy never deletes is never walked
     again each pass. A person's dry run still shows them."""

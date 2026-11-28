@@ -129,6 +129,9 @@ ROOT_TAG = (
 NEVER_A_REPOSITORY = "rlx won't delete a repository: remove it by hand if you don't need it"
 """Why every repository in a session's temp is kept (manager #3585: ``rlx tidy`` never deletes
 a git repository in 0.10.2)."""
+UNREAD_INSIDE = "it holds a file or folder tidy cannot read, or a mount: kept"
+"""Why a session's tagged cache stays when it holds no repository tidy can name (tester #3875
+(d)): something in it could not be read (#3804) or is another filesystem (M3)."""
 DELETES = sys.platform != "win32"
 """Whether tidy deletes here. Not on native Windows in 0.10.2 (manager #3647): it reports and
 lists, and removes nothing; the fleet there runs in WSL, where tidy deletes."""
@@ -766,6 +769,7 @@ def _session_caches(directory: Path, result: Plan) -> list[Path]:
     every folder but a bare repository and a mount, checkouts included: their ignored or
     untracked build output is most of the space (the brief). Ignored roots are said."""
     found: list[Path] = []
+    unread: list[Path] = []
     pending = [directory]
     device = cachedir._device(directory)
     if device is None:
@@ -778,6 +782,10 @@ def _session_caches(directory: Path, result: Plan) -> list[Path]:
         elif _session_cache(here, directory):
             found.append(here)
             continue
+        elif _kept_unread(here, unread):
+            unread.append(here)
+            size = cachedir.allocated_bytes(here) if result.size_kept else None
+            result.kept.append(Kept(SESSION_CACHE, here, UNREAD_INSIDE, size))
         if cachedir._is_bare_repository(here):
             continue
         for inner in _subdirs(here):
@@ -785,6 +793,14 @@ def _session_caches(directory: Path, result: Plan) -> list[Path]:
                 continue  # a mount (or unreadable): not walked, not freed (review of #58, M3)
             pending.append(inner)
     return sorted(found)
+
+
+def _kept_unread(tagged: Path, named: list[Path]) -> bool:
+    """Whether a tagged folder stays only for what tidy cannot read or a mount in it (tester
+    #3875 (d)): no repository in it to name, so it is named itself, the outermost only."""
+    if not cachedir.is_cache_dir(tagged) or any(tagged.is_relative_to(at) for at in named):
+        return False
+    return cachedir.holds_repository(tagged) and not _repositories(tagged)
 
 
 def _one_session(
@@ -1088,10 +1104,30 @@ def stamp_path() -> Path:
     return paths.watch_dir() / "tidy.json"
 
 
+_STAMP_READ = os.O_RDONLY | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_BINARY", 0)
+"""How the stamp is opened: never blocking, so a FIFO at its path is never waited on (tester
+#3875 (a): the tick hung opening one); it is no file, so it is unreadable, and due."""
+
+
 def read_stamp() -> dict[str, Any]:
+    """The stamp's record, or ``{}`` where there is none, or none that can be read: anything
+    but a regular file (a FIFO, a folder), a torn or unreadable one. ``{}`` is due."""
     try:
-        data = json.loads(stamp_path().read_text(encoding="utf-8"))
-    except (OSError, ValueError):
+        fd = os.open(stamp_path(), _STAMP_READ)
+    except OSError:
+        return {}
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            return {}
+        with open(fd, "rb", closefd=False) as opened:
+            body = opened.read()
+    except OSError:
+        return {}
+    finally:
+        os.close(fd)
+    try:
+        data = json.loads(body.decode("utf-8"))
+    except ValueError:
         return {}
     return data if isinstance(data, dict) else {}
 
@@ -1152,11 +1188,13 @@ def periodic_pass(now: datetime | None = None) -> PassReport | None:
             # No lock to be had (the temp dir unwritable): said once per interval, not per tick.
             _write_stamp({"last_pass_at": at.isoformat(timespec="seconds"), "failed": True})
             raise
-        if not is_due(at, every):
-            return None  # one ran between the first look and the lock
-        if a_home_move_runs():
-            return None  # never during a move of the home: it stays due (manager #3815)
+        # Whatever raises once the lock is held writes the stamp, the looks before the plan too
+        # (tester #3875 (c)): a pass that cannot be asked is tried once per interval.
         try:
+            if not is_due(at, every):
+                return None  # one ran between the first look and the lock
+            if a_home_move_runs():
+                return None  # never during a move of the home: it stays due (manager #3815)
             made = plan(now=at, size_kept=False)
             done = apply(made)
         except BaseException:

@@ -12,6 +12,7 @@ files are in ``tmp_path`` and whose sizes are said, not written; ``tidy.apply`` 
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import sys
@@ -367,6 +368,33 @@ def test_a_stamp_that_cannot_be_read_is_due_and_written_again(plans: Plans) -> N
     assert tidy.read_stamp()["last_pass_at"] == (T0 + timedelta(minutes=1)).isoformat()
 
 
+def test_a_fifo_at_the_stamp_is_never_waited_on_and_is_due(plans: Plans) -> None:
+    """Tester #3875 (a): opening a FIFO to read waits for a writer, so the tick hung. The stamp
+    is opened without waiting: a FIFO is no file, so it is due, set aside and written anew."""
+    if sys.platform == "win32":
+        pytest.skip("a FIFO is POSIX's")
+    stamp = tidy.stamp_path()
+    stamp.parent.mkdir(parents=True, exist_ok=True)
+    os.mkfifo(stamp)
+    found: list[Any] = []
+    reader = threading.Thread(target=lambda: found.append(tidy.periodic_pass(T0)), daemon=True)
+
+    reader.start()
+    reader.join(timeout=10)
+    waited = reader.is_alive()
+    for _ in range(20):  # a reader waits on it: a writer lets each wait go, leaving nothing
+        if not reader.is_alive():
+            break
+        with contextlib.suppress(OSError):
+            os.close(os.open(stamp, os.O_WRONLY | os.O_NONBLOCK))
+        reader.join(timeout=1)
+    assert not waited, "the pass waited on a FIFO at its stamp"
+    assert found and found[0] is not None and plans.calls == [T0]
+    assert stamp.is_file() and tidy.read_stamp()["last_pass_at"] == T0.isoformat()
+    [aside] = [p for p in stamp.parent.iterdir() if p.name.startswith("tidy.json.unreadable-")]
+    assert aside.is_fifo()
+
+
 # --- quiet, and its one line ---------------------------------------------------------------
 
 
@@ -463,6 +491,40 @@ def test_a_pass_that_raises_is_one_note_and_is_tried_again_an_interval_on(
     assert looked.tidied is None
     assert looked.notes == ["the tidy pass failed: RuntimeError: the store is busy"]
     assert again.notes == [] and plans.calls == [T0]
+    assert tidy.read_stamp() == {"last_pass_at": T0.isoformat(), "failed": True}
+
+
+@posix_only
+@pytest.mark.parametrize("where", ["the move's probe", "the second look"])
+def test_a_raise_before_the_plan_is_tried_again_an_interval_on(
+    plans: Plans, monkeypatch: pytest.MonkeyPatch, where: str
+) -> None:
+    """Tester #3875 (c): once the lock is held, whatever raises writes the stamp, the looks
+    before the plan too, so it is one note per interval, never one per tick."""
+    asked: list[datetime] = []
+    if where == "the move's probe":
+
+        def probe() -> bool:
+            asked.append(T0)
+            raise PermissionError("the folder beside the home")
+
+        monkeypatch.setattr(tidy, "a_home_move_runs", probe)
+    else:
+        real = tidy.is_due
+
+        def is_due(at: datetime, every_minutes: float) -> bool:
+            asked.append(at)
+            if len(asked) == 2:  # the first look passes, the second, under the lock, raises
+                raise PermissionError("the watch folder")
+            return real(at, every_minutes)
+
+        monkeypatch.setattr(tidy, "is_due", is_due)
+
+    looked = _watcher().tick(T0)
+    again = _watcher().tick(T0 + timedelta(minutes=5))
+
+    assert len(looked.notes) == 1 and looked.notes[0].startswith("the tidy pass failed")
+    assert again.notes == [] and plans.calls == []
     assert tidy.read_stamp() == {"last_pass_at": T0.isoformat(), "failed": True}
 
 
