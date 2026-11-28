@@ -214,7 +214,8 @@ impl Runner {
         }
     }
 
-    fn app_present(&self) -> bool {
+    /// Whether an app gate client is connected now.
+    pub fn app_present(&self) -> bool {
         self.apps.get().is_some_and(|apps| *apps.borrow() > 0)
     }
 

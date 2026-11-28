@@ -84,6 +84,9 @@ fn check_7_a_release_build_has_no_debug_methods() {
         "RLXD_TEST_ACCOUNTS",
         "RLXD_TEST_CONNECTOR_MAP_MS",
         "RLXD_TEST_CONNECTORS_SETTLE_MS",
+        // The identity table's test entry (task #14, step 2): a release table holds none.
+        "claude.ai Fixture",
+        "mcp__claude_ai_Fixture__whoami",
     ] {
         let found = bytes
             .windows(needle.len())

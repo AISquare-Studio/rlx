@@ -29,11 +29,11 @@ use std::time::{Duration, Instant};
 
 use rlxd_client::Home;
 use rlxd_proto::{
-    AccountConnectors, Connector, ConnectorChanged, ConnectorId, ConnectorLoginDone,
-    ConnectorLoginError, ConnectorLoginOpenUrl, ConnectorLoginWaiting, ConnectorState,
-    ConnectorTool, ConnectorsList, ConnectorsLoginData, DEFAULT_ACCOUNT, ErrorBody, ListedFrom,
-    LoginErrorCode, McpServer, PtyKillParams, PtyScreenParams, PtySpawnParams, capabilities,
-    connector_types, topics,
+    AccountConnectors, Connector, ConnectorChanged, ConnectorId, ConnectorIdentity,
+    ConnectorLoginDone, ConnectorLoginError, ConnectorLoginOpenUrl, ConnectorLoginWaiting,
+    ConnectorState, ConnectorTool, ConnectorsList, ConnectorsLoginData, DEFAULT_ACCOUNT, ErrorBody,
+    ListedFrom, LoginErrorCode, McpServer, PtyKillParams, PtyScreenParams, PtySpawnParams,
+    capabilities, connector_types, topics,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -801,6 +801,17 @@ impl Connectors {
             connector.status == ConnectorState::Connected
                 && before.get(id.as_str()) != Some(&ConnectorState::Connected)
         });
+        // Who the account is on each connector stays as last read, until it is signed in
+        // as someone else.
+        if !account.signed_in_again(entry) {
+            for connector in now.values_mut() {
+                connector.identity = entry
+                    .connectors
+                    .iter()
+                    .find(|c| c.id == connector.id)
+                    .and_then(|c| c.identity.clone());
+            }
+        }
         entry.connectors = now.into_values().collect();
         entry.error = None;
         entry.tried_at = Some(at.clone());
@@ -822,6 +833,42 @@ impl Connectors {
         if let Some(connected) = connected {
             self.tell_connected(&connected);
         }
+    }
+
+    /// The connectors whose identity a call may read for `slot` now: each `connected` one
+    /// the identity table has an entry for, whose tool that account's own listing holds
+    /// with `read_only_hint: true`.
+    pub fn identity_sources(&self, slot: u32) -> Vec<crate::identity::Source> {
+        let cache = self.cache();
+        let Some(entry) = cache.accounts.get(&slot) else {
+            return Vec::new();
+        };
+        entry
+            .connectors
+            .iter()
+            .filter(|c| c.status == ConnectorState::Connected)
+            .filter_map(|c| {
+                let source = crate::identity::source_of(&c.id)?;
+                c.tools
+                    .iter()
+                    .any(|tool| tool.name == source.tool && tool.read_only_hint == Some(true))
+                    .then_some(source)
+            })
+            .collect()
+    }
+
+    /// Takes `identity` as who `slot`'s account is on `id`, when it still lists `id`.
+    pub fn set_identity(&self, slot: u32, id: &str, identity: ConnectorIdentity) {
+        let mut cache = self.cache();
+        let Some(connector) = cache
+            .accounts
+            .get_mut(&slot)
+            .and_then(|entry| entry.connectors.iter_mut().find(|c| c.id == id))
+        else {
+            return;
+        };
+        connector.identity = Some(identity);
+        self.save(&cache);
     }
 
     /// Notes that a refresh of `account` failed with `error`: its connectors stay as they
