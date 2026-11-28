@@ -2949,7 +2949,11 @@ pub(crate) fn run_env(values: &EnvValues) -> Vec<(OsString, OsString)> {
 /// app's values), then the account's. A managed slot's `CLAUDE_CONFIG_DIR` and
 /// `CLAUDE_CODE_TMPDIR` are those of its record, in place of the app's. The plain account
 /// gets neither, even when the app's values carry `CLAUDE_CONFIG_DIR`: both are left out
-/// and taken away from rlxd's own ([`Account::env`], [`Account::unset`]).
+/// and taken away from rlxd's own. No account gets `CLAUDE_SECURESTORAGE_CONFIG_DIR`,
+/// the app's or rlxd's, which picks whose Keychain login Claude Code reads: Claude Code
+/// then keys on the account's own `CLAUDE_CONFIG_DIR`, or the default item for the plain
+/// account. Only a managed slot rlx gave one gets its own ([`Account::env`],
+/// [`Account::unset`]). A run keeps the app's values as they are.
 pub(crate) fn account_env(
     values: &EnvValues,
     account: &Account,
@@ -3130,6 +3134,99 @@ fn blocking<T>(work: impl FnOnce() -> T) -> T {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_accounts_read_keeps_to_its_own_homes_and_keychain_login() {
+        let mut values = EnvValues::default();
+        values.path = Some("/app/bin".to_owned());
+        values.claude_config_dir = Some("/app/claude".to_owned());
+        values.claude_securestorage_config_dir = Some("/app/secure".to_owned());
+        let named = |env: &[(OsString, OsString)], name: &str| {
+            env.iter()
+                .find(|(each, _)| each == name)
+                .map(|(_, value)| value.to_str().unwrap().to_owned())
+        };
+        let homes = [
+            "CLAUDE_CONFIG_DIR",
+            "CLAUDE_CODE_TMPDIR",
+            "CLAUDE_SECURESTORAGE_CONFIG_DIR",
+        ];
+        // A run keeps the app's values as they are.
+        let run = run_env(&values);
+        assert_eq!(
+            named(&run, "CLAUDE_CONFIG_DIR").as_deref(),
+            Some("/app/claude")
+        );
+        assert_eq!(
+            named(&run, "CLAUDE_SECURESTORAGE_CONFIG_DIR").as_deref(),
+            Some("/app/secure")
+        );
+
+        // The plain account: the app's PATH, and none of the three, here or inherited.
+        let (env, unset) = account_env(&values, &Account::default_one());
+        assert_eq!(named(&env, "PATH").as_deref(), Some("/app/bin"));
+        for name in homes {
+            assert_eq!(named(&env, name), None, "{name}: {env:?}");
+            assert!(unset.iter().any(|each| each == name), "{name}: {unset:?}");
+        }
+
+        // A managed slot: its own two homes, never the app's, and no Keychain login dir.
+        let mut managed = Account {
+            slot: 2,
+            label: None,
+            config_dir: Some(PathBuf::from("/accounts/2")),
+            tmp_dir: Some(PathBuf::from("/accounts/2-tmp")),
+            secure_storage_dir: None,
+            login: None,
+        };
+        let (env, unset) = account_env(&values, &managed);
+        assert_eq!(named(&env, "PATH").as_deref(), Some("/app/bin"));
+        assert_eq!(
+            named(&env, "CLAUDE_CONFIG_DIR").as_deref(),
+            Some("/accounts/2")
+        );
+        assert_eq!(
+            named(&env, "CLAUDE_CODE_TMPDIR").as_deref(),
+            Some("/accounts/2-tmp")
+        );
+        assert_eq!(
+            named(&env, "CLAUDE_SECURESTORAGE_CONFIG_DIR"),
+            None,
+            "{env:?}"
+        );
+        assert_eq!(unset, ["CLAUDE_SECURESTORAGE_CONFIG_DIR"]);
+        for name in homes {
+            let set = env.iter().filter(|(each, _)| each == name).count();
+            assert!(set <= 1, "{name} set once at most: {env:?}");
+        }
+
+        // The seam: a managed slot rlx gave its own Keychain login dir reads with it.
+        managed.secure_storage_dir = Some(PathBuf::from("/accounts/2-secure"));
+        let (env, unset) = account_env(&values, &managed);
+        assert_eq!(
+            named(&env, "CLAUDE_SECURESTORAGE_CONFIG_DIR").as_deref(),
+            Some("/accounts/2-secure")
+        );
+        assert_eq!(
+            env.iter()
+                .filter(|(each, _)| each == "CLAUDE_SECURESTORAGE_CONFIG_DIR")
+                .count(),
+            1,
+            "{env:?}"
+        );
+        assert!(unset.is_empty(), "{unset:?}");
+        // The plain account never takes one.
+        let plain = Account {
+            secure_storage_dir: Some(PathBuf::from("/accounts/1-secure")),
+            ..Account::default_one()
+        };
+        let (env, _) = account_env(&values, &plain);
+        assert_eq!(
+            named(&env, "CLAUDE_SECURESTORAGE_CONFIG_DIR"),
+            None,
+            "{env:?}"
+        );
+    }
 
     #[test]
     fn partial_text_keeps_the_last_mebibyte_on_a_character_boundary() {
