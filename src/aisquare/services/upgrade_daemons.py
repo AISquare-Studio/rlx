@@ -792,8 +792,10 @@ def _rlx_verb(kind: str, verb: Sequence[str]) -> bool:
 
 
 def _as_path(text: str) -> str:
-    """``text`` as the OS compares paths: on Windows, case and ``/`` or ``\\`` alike."""
-    return os.path.normcase(os.path.normpath(text))
+    """``text`` as the OS compares paths: on Windows, case and ``/`` or ``\\`` alike; on
+    POSIX, the very string. Never ``normpath``, which folds ``..`` as text where the
+    kernel folds it after a linked folder: ``<link>/../bin/python`` is not ``bin/python``."""
+    return os.path.normcase(text)
 
 
 def _same_program(given: str, expected: str, *, kind: str) -> str | None:
@@ -807,6 +809,8 @@ def _same_program(given: str, expected: str, *, kind: str) -> str | None:
     - **rlxd:** the same file, by the same name, in the same folder, resolved, as the rlxd
       beside rlx: rlxd runs the ``rlx`` and ``rlxd-hook`` beside the path it was started
       by. A resolved folder keeps Linux's ``current_exe`` (``/proc/self/exe``, resolved)."""
+    if any(part in (".", "..") for part in re.split(r"[/\\]", given)):
+        return f"its program's path {given} has a '.' or '..' in it"
     program = Path(given)
     if not program.is_absolute() or not program.is_file():
         return f"its program {given} is not a file"

@@ -1595,3 +1595,32 @@ def test_a_record_with_no_command_is_refused_by_name(kind: str) -> None:
     not an IndexError."""
     said = upgrade_daemons.restart_refusal(_record(kind=kind, argv=()))
     assert said == "its record names no command"
+
+
+@posix_only
+def test_a_path_through_a_linked_folder_and_dot_dot_is_not_the_interpreter(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Re #3644: `<linked folder>/../bin/python` reads, as text, as `bin/python` beside the
+    link, but the kernel follows the link first and runs the other folder's. The compare is
+    the string itself, and a '.' or '..' in argv[0] is refused by name."""
+    root = tmp_path / "tool"
+    (root / "bin").mkdir(parents=True)
+    interpreter = root / "bin" / "python"
+    interpreter.write_text("", encoding="utf-8")
+    elsewhere = tmp_path / "elsewhere" / "inner"
+    (elsewhere.parent / "bin").mkdir(parents=True)
+    elsewhere.mkdir()
+    (elsewhere.parent / "bin" / "python").write_text("", encoding="utf-8")  # another file
+    (root / "link").symlink_to(elsewhere, target_is_directory=True)
+    monkeypatch.setattr(
+        upgrade_daemons, "python_command", lambda: (str(interpreter), "-P", "-m", "aisquare")
+    )
+    daemons_core.registry_dir().mkdir(parents=True, exist_ok=True, mode=0o700)
+    through = f"{root}/link/../bin/python"
+    assert os.path.normpath(through) == str(interpreter), "as text, the interpreter"
+    assert not os.path.samefile(through, interpreter), "to the kernel, another file"
+    for given in (through, f"{root}/./bin/python"):
+        record = _record(kind="watch", argv=(given, "-P", "-m", "aisquare", "watch", "--detach"))
+        said = upgrade_daemons.restart_refusal(record)
+        assert said == f"its program's path {given} has a '.' or '..' in it", said
