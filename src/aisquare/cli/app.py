@@ -45,6 +45,7 @@ from aisquare.cli import config as config_cli
 from aisquare.cli import instances as instances_cli
 from aisquare.cli import metrics as metrics_cli
 from aisquare.cli import outcomes as outcomes_cli
+from aisquare.cli import tidy as tidy_cli
 from aisquare.cli.common import fail
 from aisquare.cli.global_flags import DISPATCHED_WORDS, GlobalFlagsGroup
 from aisquare.core import feature_use, sharing
@@ -345,6 +346,7 @@ app.add_typer(persona.app, name="persona")
 app.add_typer(captain.app, name="captain", hidden=True)
 app.command("ui")(fleet.ui)
 app.command("instances")(instances_cli.instances)
+app.command("tidy")(tidy_cli.tidy)
 app.add_typer(hook.app, name="hook", hidden=True)
 # `rlx upgrade` moves a home from before 0.10.2, in the new install, by this (#31). Not a
 # `home` group: "the rlx home" in prose would then read as a command (test_program_name).
