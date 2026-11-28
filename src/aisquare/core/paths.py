@@ -18,6 +18,7 @@ A home from before it (``~/.aisquare``) keeps the layout it was made in until H2
 
 WHERE the home is: ``$RLX_HOME``, else ``$AISQUARE_HOME`` (the name before it, still honoured),
 else ``~/.rlx`` if it exists, else ``~/.aisquare`` if it exists, else ``~/.rlx`` (a new user).
+A variable naming ``~/.aisquare`` itself, by any spelling, is read as no variable (#31).
 HOW it is laid out: a home a variable names is laid out by what is in it (``rlx.db``: the new
 layout; ``context.db``, ``launch-seals/``, ``instances/``, ``log/``, an agent's ``*-accounts/`` and
 the old layout's other top-level names: the old one;
@@ -432,9 +433,18 @@ def home_of(
     it is laid out (the module's docstring has the rule). ``user_home`` is that process's home
     directory, when it is not this one's (``core.instance_scan``)."""
     named = named_home(environment)
-    if named is not None:
-        return named, layout_of(named)
     base = Path.home() if user_home is None else user_home
+    if named is not None and not _names_the_old_default(named, base):
+        return named, layout_of(named)
+    # No variable, or one naming ~/.aisquare itself by any spelling (a link to it, a trailing
+    # slash, resolved): the default home, read exactly as a process without the variable reads
+    # it (#31; the fleet hands its windows the home by both names, and a shell rc may keep the
+    # old one). Once the move made ~/.rlx it is that home, every path spelled from it, so each
+    # slot's Keychain item is named as the move copied it (the tester's blocker 1, round 4).
+    # Read by its own rule instead, such a variable made a NEW-layout ~/.aisquare on a fresh
+    # machine, which a plain process then read as OLD (a split store), and once `uninstall
+    # --purge` left ~/.aisquare a link to nothing it refused the default home as in the way
+    # (the reviewer's MAJOR 1, round 4).
     new = base / HOME_NAME
     if new.exists():
         return new, NEW
@@ -442,6 +452,19 @@ def home_of(
     if old.exists():
         return old, OLD
     return new, NEW
+
+
+def _names_the_old_default(named: Path, base: Path) -> bool:
+    """Whether ``named`` is ``base``'s ``~/.aisquare``: the same folder (two stats, links
+    followed, so a link to it, an alias or a trailing slash is it, and so is ``~/.rlx`` once
+    ``~/.aisquare`` links to it), or, when either is not there, the same spelling resolved
+    (``os.path.realpath``: each link that is there followed, the rest as spelled)."""
+    old = base / OLD_HOME_NAME
+    try:
+        one, other = os.stat(named), os.stat(old)
+    except OSError:
+        return os.path.realpath(named) == os.path.realpath(old)
+    return (one.st_dev, one.st_ino) == (other.st_dev, other.st_ino)
 
 
 def layout_of(root: Path) -> Layout:
@@ -1044,6 +1067,151 @@ def ngrok_token_path() -> Path:
 def ngrok_config_path(name: str) -> Path:
     """Our ngrok config of one ngrok version (``services.ngrok_tunnel``)."""
     return _in_layout(("remote", name), (name,))
+
+
+# --- from the old layout to the new (#31, H2) ------------------------------------------------
+
+OLD_STORE = "context.db"
+"""The store's name at an old home's top (``rlx.db`` in the new layout)."""
+
+MOVES: tuple[tuple[str, tuple[str, ...]], ...] = (
+    (OLD_STORE, ("rlx.db",)),
+    (f"{OLD_STORE}-wal", ("rlx.db-wal",)),
+    (f"{OLD_STORE}-shm", ("rlx.db-shm",)),
+    ("log", ("logs",)),
+    ("credentials", ("accounts", "aisquare", "credentials")),
+    ("launch-seals", ("fleet", "launch-seals")),
+    ("fleet-tmux.conf", ("fleet", "tmux.conf")),
+    ("instances", ("run", "instances")),
+    ("usage-sweep.lock", ("run", "locks", "usage-sweep.lock")),
+    ("usage-share.lock", ("run", "locks", "usage-share.lock")),
+    ("active-ping.lock", ("run", "locks", "active-ping.lock")),
+    ("remote.json", ("remote", "remote.json")),
+    ("remote-audit.log", ("remote", "audit.log")),
+    ("remote-dist", ("remote", "dist")),
+    ("remote-needs.json", ("remote", "needs.json")),
+    ("remote-push.json", ("remote", "push.json")),
+    ("ngrok-authtoken", ("remote", "ngrok-authtoken")),
+)
+"""Each name at an old home's top that the new layout keeps elsewhere, and where, as the
+helpers above place it (docs/home-layout.md's table): what the home's move renames
+(``services.home_migration``). An agent's accounts folder and each ngrok config of ours are
+moved too, by their shape (:func:`new_place`). The store's sidecars go with it, though a
+move checkpoints the store first and leaves none."""
+
+_NGROK_CONFIG_PREFIX = "remote-ngrok-v"
+"""How our ngrok configs are named at either layout's place for them
+(``services.ngrok_tunnel._our_config_name``)."""
+
+
+def new_place(name: str) -> tuple[str, ...] | None:
+    """Where the new layout keeps what an old home has at its top as ``name``, below the home;
+    ``None`` for a name both layouts keep at the top (``config.toml``, ``projects``, ``cache``,
+    ``run`` and the rest)."""
+    for old, new in MOVES:
+        if name == old:
+            return new
+    agent = name.removesuffix(OLD_ACCOUNTS_SUFFIX)
+    if agent != name and agent:
+        return ("accounts", agent)
+    if name.startswith(_NGROK_CONFIG_PREFIX) and name.endswith(".yml"):
+        return ("remote", name)
+    return None
+
+
+MOVE_JOURNAL: tuple[str, ...] = ("backups", "home-migration", "journal.json")
+"""Where the home's move keeps its journal, under the home in either layout
+(``services.home_migration``): it goes with the home's last rename."""
+
+
+def unfinished_home_move() -> Path | None:
+    """The journal of a move of this process's home that has not finished, or ``None``: what
+    every command but the move asks first, so none writes into a home half moved (the reviewer's
+    M3 on #31). A stat, and a read of a small file only while one is there. A variable that
+    names ``~/.aisquare`` itself is the default home, as the move reads it."""
+    return unfinished_home_move_at(home_of(_default_home_environment())[0])
+
+
+def unfinished_home_move_at(root: Path) -> Path | None:
+    """:func:`unfinished_home_move` of the home at ``root``: the journal there unless it says
+    the move is done. One that cannot be read is unfinished: a crash cannot be ruled out, and
+    the move says the way out (``services.home_migration.journal_refusal``).
+
+    Anything at the journal's path that cannot be read as a journal is unfinished (the
+    manager's ruling on N2, #2948): bytes that are not UTF-8 (``UnicodeDecodeError``, a
+    ``ValueError``), nesting too deep for the parser (``RecursionError``), a folder, a link to
+    nothing, a file that cannot be opened (mode 000, an I/O error). Let out of here, the first
+    two were a traceback from every command and the hook (round 4's tester). So is a folder on
+    the way inside the home that cannot be looked into (:func:`_maybe_a_journal`). Nothing
+    there is no move, and so is anything in a home whose root cannot be looked at, behind a
+    folder this user cannot enter: read as unfinished, it refused every command on such a home,
+    ``uninstall`` too, which keeps it and must never raise (round 19 of #257).
+    """
+    journal = root.joinpath(*MOVE_JOURNAL)
+    try:
+        text = read_regular_text(journal)
+    except ValueError:
+        return journal  # a journal that cannot be read is one that has not finished
+    except OSError:
+        return journal if _maybe_a_journal(root, journal) else None
+    import json
+
+    try:
+        data = json.loads(text)
+    except (ValueError, RecursionError):
+        return journal
+    steps = data.get("steps") if isinstance(data, dict) else None
+    return None if isinstance(steps, list) and "done" in steps else journal
+
+
+def read_regular_text(path: Path) -> str:
+    """``path``'s text, read only when it is a regular file: never through a link, and never a
+    FIFO, a device or a socket, whose open or read can block for good (the tester's NB1 on
+    #31: a FIFO at the move's journal hung every command and the hook). Opened without
+    blocking and without following a link, then asked by ``fstat``, so nothing can change in
+    between. ``OSError`` when it is not one or cannot be read; ``ValueError`` (a
+    ``UnicodeDecodeError``) for bytes that are not UTF-8."""
+    flags = os.O_RDONLY
+    for name in ("O_NONBLOCK", "O_NOFOLLOW", "O_BINARY"):
+        flags |= getattr(os, name, 0)
+    fd = os.open(path, flags)
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            raise OSError(errno.EINVAL, "not a regular file", str(path))
+        chunks: list[bytes] = []
+        while chunk := os.read(fd, 1 << 16):
+            chunks.append(chunk)
+    finally:
+        os.close(fd)
+    return b"".join(chunks).decode("utf-8")
+
+
+def _maybe_a_journal(root: Path, journal: Path) -> bool:
+    """Whether a journal may be at ``journal``, which could not be read: something ``lstat``
+    finds there (a link to nothing included), or a folder on the way inside the home that
+    cannot be looked into. Not there, or under a file, is no journal; and so is any path of a
+    home whose ROOT cannot be looked at (round 19 of #257; the manager's narrowing, #31 round
+    6: a backups/ at mode 000 hid a half-moved home)."""
+    try:
+        os.lstat(journal)
+    except (FileNotFoundError, NotADirectoryError):
+        return False
+    except OSError:
+        try:
+            os.lstat(root)
+        except OSError:
+            return False
+        return True
+    return True
+
+
+def _default_home_environment() -> dict[str, str] | None:
+    """This process's environment without the home variables when they name ``~/.aisquare``
+    itself (the fleet hands its windows the home by both names, resolved); ``None`` otherwise."""
+    named = named_home()
+    if named is None or not _names_the_old_default(named, Path.home()):
+        return None
+    return {k: v for k, v in os.environ.items() if k not in (RLX_HOME_ENV, HOME_ENV_VAR)}
 
 
 NEW_LAYOUT_FOLDERS: tuple[tuple[str, ...], ...] = (

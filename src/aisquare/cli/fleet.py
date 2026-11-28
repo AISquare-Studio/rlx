@@ -433,6 +433,64 @@ def spawn(
         console.print(f"  {'✓' if note in receipt.shared else '⚠'} {note}")
 
 
+@app.command("manager-policy")
+def manager_policy(
+    key: Annotated[str | None, typer.Argument(help="manager_wake or manager_pass_minutes.")] = None,
+    value: Annotated[str | None, typer.Argument(help="The value to set.")] = None,
+    project: Annotated[str | None, typer.Option("--project", help="Fleet project or ID.")] = None,
+    clear: Annotated[bool, typer.Option("--clear", help="Restore the key's default.")] = False,
+) -> None:
+    """Read, set or clear how the fleet's manager is woken (#551): on every board write that
+    concerns it (manager_wake every_write, the default), or urgent news at once and routine
+    news at most every manager_pass_minutes minutes (schedule; 15 unless set)."""
+    from aisquare.core.store import store_session
+    from aisquare.services import manager_seat
+
+    target = _project(project)
+    if key is not None and key not in manager_seat.KEYS:
+        raise typer.BadParameter(f"unknown key {key!r}: manager_wake or manager_pass_minutes")
+    if key is None and (clear or value is not None):
+        raise typer.BadParameter("name the key to set or clear")
+    if clear and value is not None:
+        raise typer.BadParameter("--clear takes no value")
+    validated: str | None = None
+    if key is not None and value is not None:
+        try:
+            validated = manager_seat.validate(key, value)
+        except ValueError as exc:
+            raise typer.BadParameter(str(exc)) from exc
+    with store_session() as store:
+        if key is not None and clear:
+            store.clear_project_setting(target.id, key)
+        elif key is not None and validated is not None:
+            store.set_project_setting(target.id, key, validated)
+        policy = manager_seat.policy(store, target.id)
+    if get_state().json_output:
+        typer.echo(
+            json.dumps(
+                {
+                    "project_id": target.id,
+                    manager_seat.WAKE: policy.wake,
+                    manager_seat.PASS_MINUTES: policy.minutes,
+                    "invalid": list(policy.invalid),
+                }
+            )
+        )
+        return
+    typer.echo(
+        f"{_display_name(target)}: {manager_seat.WAKE}={policy.wake} "
+        f"{manager_seat.PASS_MINUTES}={policy.minutes}"
+    )
+    if policy.invalid:
+        typer.echo(f"Using the defaults of invalid settings: {', '.join(policy.invalid)}", err=True)
+    if policy.scheduled and policy.minutes == 0:
+        typer.echo(
+            f"{manager_seat.PASS_MINUTES} is 0: routine news waits for an urgent wake or the "
+            "person's next prompt.",
+            err=True,
+        )
+
+
 @app.command("ls")
 def ls(
     project: ProjectRef = None,

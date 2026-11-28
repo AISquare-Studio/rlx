@@ -74,6 +74,25 @@ accepts a backslash followed by `Enter`. `Shift+Enter` works when your terminal
 reports it through the kitty keyboard protocol. In Terminal.app, `Shift+Enter`
 and `Option+Enter` with *Use Option as Meta key* can submit the prompt.
 
+### Manager wake schedule
+
+By default a fleet's manager is woken by every board write that concerns it. A busy
+fleet can wake it for urgent news only, and for routine news at most every N minutes:
+
+```sh
+rlx fleet manager-policy manager_wake schedule --project <project>
+rlx fleet manager-policy manager_pass_minutes 15 --project <project>
+```
+
+Urgent news wakes it at once: a question to it, a note to it from you, an agent's usage
+limit, a hand-over that failed, a first prompt not taken, an exit that needs it, and
+watch's urgent lines (a dialog, a crash). Routine news (results, task moves, agents'
+notes) waits until N minutes after its last prompt; it then reads it all in one turn.
+N is 15 unless set; 0 means routine news waits for an urgent wake or your next prompt.
+`team standby` holds until you speak again, with tasks in flight or not. Run
+`rlx fleet manager-policy --project <project>` to read the policy, and `--clear` with a
+key to restore its default.
+
 ## Accounts
 
 Each account signs in through its agent's own login, and *⚙ Settings ▸

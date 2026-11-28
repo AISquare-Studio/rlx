@@ -77,9 +77,13 @@ class CommitInput(Input):
     """A text field that keeps its value on Enter or on leaving it, once per change.
 
     :attr:`kept` is the value on disk; a commit with the same value posts nothing, so Enter and
-    then leaving the field keep it once. The page answers a :class:`Committed` by saving the
-    value (and calling :meth:`keep`), or by refusing it (:meth:`SavesAsYouGo.refuse`), which
-    leaves :attr:`kept` as it was."""
+    then leaving the field keep it once. Nor does one with the value already posted and not
+    answered yet (:attr:`in_flight`): a page that saves off the UI thread hears its save after
+    the person may have left the field, and that second commit saved the value again, with a
+    second, no-op Undo (#53). The page answers a :class:`Committed` by saving the value (and
+    calling :meth:`keep`), by refusing it (:meth:`SavesAsYouGo.refuse`), which leaves
+    :attr:`kept` as it was, or, when the save failed and the typed value stays to try again,
+    by :meth:`release`; each lets the next commit of that value go again."""
 
     class Committed(Message):
         """The field's value, on Enter or on leaving it, and the one it replaces on disk."""
@@ -96,8 +100,11 @@ class CommitInput(Input):
 
     def __init__(self, value: str = "", **kwargs: object) -> None:
         super().__init__(value, **kwargs)  # type: ignore[arg-type]
+        self.in_flight: str | None = None
+        """The value a :class:`Committed` went to the page with, not answered yet: committed
+        again, it posts nothing. Set by :meth:`commit`, cleared by every answer (:attr:`kept`
+        set, :meth:`keep`, :meth:`SavesAsYouGo.refuse`, :meth:`release`)."""
         self.kept = value
-        """The value on disk: what Undo, or a refusal, comes back to."""
         self.leaving: Callable[[CommitInput], object] | None = None
         """The owner's writer for a value typed and not left when the page goes (rlx quitting,
         its screen closed): called on the field's own last message, synchronously, to write
@@ -105,6 +112,22 @@ class CommitInput(Input):
         refuse it does not write. The owner sets it as it mounts, never where the field is
         composed: a name as common as ``compose`` is one tests/test_config_writes_stay_in_the_cli
         sees the hooks reach, and a writer handed on there reads as a hook's config write."""
+
+    @property
+    def kept(self) -> str:
+        """The value on disk: what Undo, or a refusal, comes back to. Set, it answers the value
+        in flight too (:attr:`in_flight`): a page's re-read says what is on disk now."""
+        return self._kept
+
+    @kept.setter
+    def kept(self, value: str) -> None:
+        self._kept = value
+        self.in_flight = None
+
+    def release(self) -> None:
+        """The page's save of the value in flight ended without keeping it, and the typed value
+        stays to try again (the store or the file said no): its next commit goes again."""
+        self.in_flight = None
 
     def keep(self, value: str) -> None:
         """``value`` is on disk now (saved, or put back by Undo): shown, and not committed
@@ -128,7 +151,9 @@ class CommitInput(Input):
                 self.leaving(self)
             return
         if self.value != self.kept:
-            self.post_message(self.Committed(self, self.value, self.kept))
+            if self.value != self.in_flight:
+                self.in_flight = self.value
+                self.post_message(self.Committed(self, self.value, self.kept))
             return
         page = page_of(self)
         if page is not None:
@@ -222,7 +247,9 @@ class SavesAsYouGo:
     def refuse(self, field: Widget, why: str) -> None:
         """``field``'s value is refused: said in a line under it (under its row, when it sits
         in one beside its label), and nothing is written. The field keeps what the person
-        typed, to correct."""
+        typed, to correct, and to commit again (:meth:`CommitInput.release`)."""
+        if isinstance(field, CommitInput):
+            field.release()
         problem = self._problem_of(field)
         if problem is None:
             problem = Static("", classes=PROBLEM_CLASS, id=f"{field.id}-problem")

@@ -1890,6 +1890,45 @@ def test_the_page_holds_no_save_reload_apply_or_cancel_button() -> None:
     assert drive(scenario) == []
 
 
+def test_a_field_whose_config_write_failed_is_written_again_on_enter(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#53: the config could not be written (the filesystem said no), so the text field keeps
+    what was typed to try again (``_show_file_value``), and Enter with it unchanged writes again:
+    the value in flight is released."""
+    from aisquare.cli.ui.views import app_settings as settings_view
+
+    real_save = save_config  # the one writer, which the view calls by this name
+    calls: list[str] = []
+
+    def once_refused(config: AppConfig) -> None:
+        calls.append(config.fleet.escape_key)
+        if len(calls) == 1:
+            raise OSError("read-only file system")
+        real_save(config)
+
+    monkeypatch.setattr(settings_view, "save_config", once_refused)
+
+    async def scenario(pilot: Pilot[None], host: AppHost) -> tuple[list[str], str, bool]:
+        await settle(pilot)
+        host.query_one(f"#{AGENT_ADVANCED}", Collapsible).collapsed = False
+        await settle(pilot)
+        escape = host.query_one("#escape-key", Input)
+        escape.focus()
+        await settle(pilot)
+        escape.value = "f11"
+        await pilot.press("enter")
+        await settle(pilot)
+        failed = any("could not write the config" in m for m, _ in host.notices)
+        await pilot.press("enter")  # the same value, again
+        await settle(pilot)
+        return list(calls), load_config().fleet.escape_key, failed
+
+    calls_seen, on_disk, failed = drive(scenario)
+    assert failed, "the premise: the first write failed"
+    assert calls_seen == ["f11", "f11"] and on_disk == "f11"
+
+
 def test_a_field_typed_and_not_left_is_kept_when_rlx_quits() -> None:
     """Reviewer of #24: on quit, the field's last message (its blur) posted a Committed into
     ancestors whose loops had ended, and the typed value was lost. It is written as rlx goes;

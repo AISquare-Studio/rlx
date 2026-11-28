@@ -162,6 +162,7 @@ from aisquare.services import (
     explainability_ops,
     handoff,
     install_route,
+    manager_seat,
     model_memory,
     pane_idle,
 )
@@ -221,8 +222,10 @@ sandbox, :func:`nudge_manager`). Its value is when; :func:`deliver_owed_nudge` t
 
 NUDGE_DEFERRED = "nudge_deferred:"
 """The ``team_meta`` prefix of a nudge a draft held back (P0-W2), or a dialog on the manager's
-screen (R25): ``nudge_deferred:<session>`` → when it was held back. :func:`retry_deferred_nudges`
-sends it once the box is clear and no dialog is open."""
+screen (R25), or a scheduled manager's routine news not due yet (#41,
+``team.pending_wake``): ``nudge_deferred:<session>`` → when it was held back.
+:func:`retry_deferred_nudges` sends it once the box is clear, no dialog is open and the news is
+due."""
 
 _NUDGE_RE_PRESS: tuple[float, ...] = (2.0,)
 _NUDGE_LAST_WAIT = 2.0
@@ -9646,6 +9649,7 @@ def _first_prompt_unsent(agent: FleetAgent, why: str) -> bool:
                 "prompt_unsent",
                 f"{agent.label}: first prompt not taken — {why}",
                 session_id=agent.session_id,
+                meta={manager_seat.EVENT_PROJECT: agent.project_id},
             )
     except Exception:
         return False
@@ -18709,6 +18713,7 @@ def _emit_exit(
         "force": force,
         "released": released,
         "why": why,
+        manager_seat.EVENT_PROJECT: agent.project_id,
     }
     if reason is not None:
         meta["reason"] = reason
@@ -19650,16 +19655,22 @@ def _nudge(project_id: str, *, owe: bool, board: str | None = None) -> bool:
             session = store.get_session(row.session_id)
             if session is None or session.ended_at is not None:
                 return False
-            # Due only for news it wakes for, unread (``team.wake_pending``, R12): its own
+            # Due only for news it wakes for, unread (``team.pending_wake``, R12): its own
             # result, an echo of news it has read, or a line its standby holds wakes nobody,
             # whichever write asked. An owed one was always asked this; now every one is.
-            if not _team().wake_pending(store, session):
+            # A scheduled manager's routine news not due yet is held for the tickers (#41).
+            pending = _team().pending_wake(store, session)
+            now = _now()
+            if pending.now is None:
+                if pending.held:
+                    _hold(store, session, now)
                 return False
             key = f"nudge:{session.id}"
-            now = _now()
             last = store.get_meta(key)
             if last is not None and now - datetime.fromisoformat(last) < NUDGE_DEBOUNCE:
                 return False
+            if pending.scheduled and not _claim(store, key, last, now):
+                return False  # another process took this wake: the rlx service, asq or watch
             try:
                 facts = pane.facts_or_raise()
             except TmuxError:
@@ -19709,7 +19720,28 @@ def _nudge(project_id: str, *, owe: bool, board: str | None = None) -> bool:
         return False
 
 
-def retry_deferred_nudges() -> int:
+def _hold(store: ContextStore, session: TeamSession, now: datetime) -> None:
+    """Hold back a scheduled manager's nudge for routine news that is not due yet
+    (:data:`NUDGE_DEFERRED`), for :func:`retry_deferred_nudges` to send once it is. Written
+    when no mark is there, or the one there predates its last prompt, which read the news it
+    was for: a tick that finds it held still writes nothing."""
+    key = f"{NUDGE_DEFERRED}{session.id}"
+    since = store.get_meta(key)
+    prompted = session.prompted_at
+    if not since or (prompted is not None and datetime.fromisoformat(since) <= prompted):
+        store.set_meta(key, now.isoformat())
+
+
+def _claim(store: ContextStore, key: str, last: str | None, now: datetime) -> bool:
+    """Take a scheduled manager's nudge (its debounce ``key``) before typing it, by compare and
+    set: of the tickers that send a held one (the rlx service, ``asq``, ``rlx watch``), the
+    one that takes it types it, and the others see it taken (#41)."""
+    if last is None:
+        return store.set_meta_once(key, now.isoformat())
+    return store.compare_meta(key, last, now.isoformat())
+
+
+def retry_deferred_nudges(*, scheduled_only: bool = False) -> int:
     """Send each manager nudge a draft or a dialog held back (:data:`NUDGE_DEFERRED`), now that
     its input box may be clear and the dialog closed: ``asq``'s refresh asks every frame. How
     many were sent.
@@ -19724,16 +19756,19 @@ def retry_deferred_nudges() -> int:
     per read (P2-W3, #83)."""
     try:
         with store_session() as store:
-            targets = deferred_nudge_targets(store)
+            targets = deferred_nudge_targets(store, scheduled_only=scheduled_only)
     except Exception:
         return 0
     return send_deferred_nudges(targets)
 
 
-def deferred_nudge_targets(store: ContextStore) -> list[FleetAgent]:
+def deferred_nudge_targets(
+    store: ContextStore, *, scheduled_only: bool = False
+) -> list[FleetAgent]:
     """The managers whose held-back nudge is still owed, read in ``store``; one owed no
     more (its manager prompted since, or its row ended) is dropped there. One indexed read
-    when nothing is held back."""
+    when nothing is held back. ``scheduled_only``: those of fleets whose policy is
+    ``schedule`` alone (``rlx watch``'s, #41), the others left as they were."""
     held = {
         key.removeprefix(NUDGE_DEFERRED): since
         for key, since in store.list_meta(NUDGE_DEFERRED).items()
@@ -19742,6 +19777,10 @@ def deferred_nudge_targets(store: ContextStore) -> list[FleetAgent]:
     targets: list[FleetAgent] = []
     for session_id, since in held.items():
         row = store.fleet_agent_for_session(session_id)
+        if scheduled_only and (
+            row is None or not manager_seat.policy(store, row.project_id).scheduled
+        ):
+            continue
         session = store.get_session(session_id)
         prompted = session.prompted_at if session is not None else None
         gone = row is None or row.ended_at is not None or row.label != MANAGER_LABEL

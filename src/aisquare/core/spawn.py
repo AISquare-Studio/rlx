@@ -66,6 +66,9 @@ narrowing their environment would be change without a reason:
   * ``core/claude_accounts.py::_ask_keychain`` — ``/usr/bin/security
     find-generic-password`` on macOS: the Claude Code login an account's
     Keychain item holds, read for its usage. No model.
+  * ``core/claude_accounts.py::_run_security`` — ``/usr/bin/security`` on macOS, for the
+    home's move (#31): an account's Keychain item read, copied to its new name through
+    ``security -i`` on stdin, and the old one deleted. No model.
   * ``core/agents.py::hook_binary_version`` — ``<hook's aisquare> --version``,
     a string: doctor asking another install of this CLI what version it is,
     so hooks that name a stale binary stop grading as healthy (#84).
@@ -343,6 +346,12 @@ SEAMS: dict[str, Seam] = {
         EXCLUDED,
         "`/usr/bin/security find-generic-password` on macOS — reads the login Claude Code keeps "
         "in an account's Keychain item, for its usage; a string, no model",
+    ),
+    "aisquare/core/claude_accounts.py::_run_security": Seam(
+        EXCLUDED,
+        "`/usr/bin/security` on macOS, for the home's move (#31): an account's Keychain item "
+        "read, copied to the name its new place hashes to through `security -i` on stdin, and "
+        "the old one deleted; strings, no model",
     ),
     "aisquare/core/agents.py::hook_binary_version": Seam(
         EXCLUDED,
