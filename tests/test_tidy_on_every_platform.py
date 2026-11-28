@@ -95,6 +95,7 @@ def test_no_walk_and_no_delete_crosses_a_mount(
     (mounted / "deep").mkdir(parents=True)
     (mounted / cachedir.TAG).write_bytes(TAG)
     (mounted / "deep" / cachedir.TAG).write_bytes(TAG)
+    (mounted / "deep" / "big.bin").write_bytes(b"x" * 2_000_000)
     inside = tree / "build" / "cache"
     inside.mkdir()
     (inside / cachedir.TAG).write_bytes(TAG)
@@ -113,6 +114,7 @@ def test_no_walk_and_no_delete_crosses_a_mount(
     assert cachedir.newest_mtime(tree / "build") is not None
     assert not cachedir.same_filesystem(mounted, tree)
     assert not cachedir.only_caches(tree)
+    assert cachedir.allocated_bytes(tree) < 1_000_000, "a mount's content is not this disk's"
     with pytest.raises(ValueError):
         cachedir.remove_within(mounted, tree)
     with pytest.raises(ValueError):

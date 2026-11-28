@@ -1272,11 +1272,21 @@ def test_no_session_rule_crosses_a_mount(tmp_path: Path, monkeypatch: pytest.Mon
     old = session_dir(ended=week)
     (old / "scratchpad" / "mnt").mkdir()
     aged(old, week)
-    _mounted_at(monkeypatch, mounted, under.parent, old / "scratchpad" / "mnt")
+    mounts = (mounted, under.parent, old / "scratchpad" / "mnt")
+    _mounted_at(monkeypatch, *mounts)
+    listed: list[Path] = []
+    real_subdirs = tidy._subdirs
+
+    def subdirs(path: Path) -> list[Path]:
+        listed.append(path)
+        return real_subdirs(path)
+
+    monkeypatch.setattr(tidy, "_subdirs", subdirs)
 
     made = planned(tmp_path)
 
     assert rules(made) == {ours: tidy.SESSION_CACHE}
+    assert not [p for p in listed if any(p == m or p.is_relative_to(m) for m in mounts)]
     tidy.apply(made)
     assert (mounted / cachedir.TAG).is_file() and (under / cachedir.TAG).is_file()
     assert old.is_dir()

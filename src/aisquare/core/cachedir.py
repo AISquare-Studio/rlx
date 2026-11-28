@@ -330,7 +330,8 @@ def remove_within(path: Path, root: Path, *, allows: Callable[[Path], bool] | No
 def allocated_bytes(root: Path) -> int:
     """What ``root`` takes on disk: each file, link and directory under it once, by inode, as
     the blocks it holds (its size where the system says no blocks, as Windows does). Links are
-    counted as links, never followed; what cannot be read counts nothing."""
+    counted as links, never followed; a mount is not walked (it is not this disk's, M3); what
+    cannot be read counts nothing."""
     seen: set[tuple[int, int]] = set()
 
     def counted(info: os.stat_result) -> int:
@@ -357,6 +358,6 @@ def allocated_bytes(root: Path) -> int:
             except OSError:
                 continue
             total += counted(info)
-            if stat.S_ISDIR(info.st_mode):
+            if stat.S_ISDIR(info.st_mode) and _device(entry.path) == top.st_dev:
                 pending.append(Path(entry.path))
     return total
