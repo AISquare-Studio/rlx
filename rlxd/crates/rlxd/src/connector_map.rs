@@ -11,10 +11,12 @@
 //!   time. A read that fails keeps the account's connectors as read before, with its
 //!   error. Without the route (capability `connectors.no_turn`), `allow_turn: true` runs
 //!   the one-turn probe instead, of one account.
-//! - **At rlxd's start**, when its environment names a `CLAUDE_CONFIG_DIR`, the brain is
-//!   asked once, so rlxd knows which account its own runs use (with none named, it is the
+//! - **At rlxd's start**, when its runs' `CLAUDE_CONFIG_DIR` names one (the app's when it
+//!   set one, as a run's Claude Code gets it, 4.3; else rlxd's own), the brain is asked
+//!   once, so rlxd knows which account its own runs use (with none named, it is the
 //!   default account): a run's `system/init` updates that account's connectors as it
-//!   comes, so a connector a run finds failing needs no refresh.
+//!   comes, so a connector a run finds failing needs no refresh. Each change to the app's
+//!   values settles that account again, asking the brain when it must.
 //! - **In the background**, only on the no-turn route, so no turn is ever spent unasked:
 //!   every [`TICK`], the brain is asked again, and each account that is new or signed in
 //!   again (another [`Account::login`] mark) is read at once; so is each one whose last
@@ -223,15 +225,14 @@ impl ConnectorMap {
         ))
     }
 
-    /// The background, for as long as rlxd runs. When rlxd's environment names a
-    /// `CLAUDE_CONFIG_DIR`, it asks the brain for the accounts at its start, so rlxd knows
-    /// which account its own runs use; then, on the no-turn route only, it ticks.
+    /// The background, for as long as rlxd runs. When its runs' `CLAUDE_CONFIG_DIR` (the
+    /// app's, else rlxd's own) names one, it asks the brain for the accounts at its start,
+    /// so rlxd knows which account its own runs use, and follows each change to the app's
+    /// values ([`ConnectorMap::follow_env`]); then, on the no-turn route only, it ticks.
     pub async fn run(self: Arc<Self>) {
+        tokio::spawn(Arc::clone(&self).follow_env());
         let ticks = test_times().unwrap_or(Some((TICK, STALE)));
         if !self.connectors.no_turn() || ticks.is_none() {
-            if self.connectors.runs_account_unknown() {
-                self.learn_accounts().await;
-            }
             return;
         }
         let Some((tick, stale)) = ticks else {
@@ -240,6 +241,23 @@ impl ConnectorMap {
         loop {
             self.tick(stale).await;
             tokio::time::sleep(tick).await;
+        }
+    }
+
+    /// Settles which account rlxd's runs use again on each change to the app's values,
+    /// as runs take the app's `CLAUDE_CONFIG_DIR` (4.3), and asks the brain for the
+    /// accounts when that leaves it unknown. Once at its start too, for a change made
+    /// before it listened.
+    async fn follow_env(self: Arc<Self>) {
+        let mut changes = self.connectors.env_changes();
+        loop {
+            off_worker(|| self.connectors.env_changed());
+            if self.connectors.runs_account_unknown() {
+                self.learn_accounts().await;
+            }
+            if changes.changed().await.is_err() {
+                return;
+            }
         }
     }
 

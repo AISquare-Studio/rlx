@@ -881,8 +881,12 @@ fn once_the_brain_has_listed_slot_1_alone_an_unknown_homes_init_never_flips_it()
 
 // --- 4.3: the app's environment ---------------------------------------------------------
 
-/// `env.set` from the app of a `CLAUDE_CONFIG_DIR` of its own and a `PATH`: the values a
-/// run's Claude Code gets. Their `(CLAUDE_CONFIG_DIR, PATH)`.
+/// rlxd's own `CLAUDE_SECURESTORAGE_CONFIG_DIR`, which no account's read may take.
+const RLXD_SECURE: (&str, &str) = ("CLAUDE_SECURESTORAGE_CONFIG_DIR", "/rlxd/own-secure");
+
+/// `env.set` from the app of a `CLAUDE_CONFIG_DIR` of its own, a
+/// `CLAUDE_SECURESTORAGE_CONFIG_DIR` and a `PATH`: the values a run's Claude Code gets.
+/// Their `(CLAUDE_CONFIG_DIR, PATH)`.
 fn app_sets_its_own_home(home: &TestHome) -> (String, String) {
     let config = home.root().join("cc-app");
     std::fs::create_dir_all(&config).unwrap();
@@ -893,7 +897,9 @@ fn app_sets_its_own_home(home: &TestHome) -> (String, String) {
         config.to_str().unwrap().to_owned(),
         path.to_str().unwrap().to_owned(),
     );
-    let change = json!({"CLAUDE_CONFIG_DIR": config, "PATH": path});
+    let secure = home.root().join("app-secure").to_str().unwrap().to_owned();
+    let change = json!({"CLAUDE_CONFIG_DIR": config, "CLAUDE_SECURESTORAGE_CONFIG_DIR": secure,
+        "PATH": path});
     let set = home.rlxd(&["call", "--as-app", "env.set", &change.to_string()]);
     assert_eq!(set.code(), Some(0), "{set:?}");
     (config, path)
@@ -901,10 +907,17 @@ fn app_sets_its_own_home(home: &TestHome) -> (String, String) {
 
 /// Each start's environment holds the app's `PATH`, and its account's homes alone: the
 /// default account's neither `CLAUDE_CONFIG_DIR` nor `CLAUDE_CODE_TMPDIR`, though the app
-/// set a `CLAUDE_CONFIG_DIR`; a managed one's its own two.
+/// set a `CLAUDE_CONFIG_DIR`; a managed one's its own two. And no account's holds a
+/// `CLAUDE_SECURESTORAGE_CONFIG_DIR`, the app's or rlxd's: it picks whose Keychain login
+/// Claude Code reads.
 fn assert_each_on_its_account(start: &Value, slot: u32, accounts: &Accounts, path: &str) {
     let env = &start["env"];
     assert_eq!(env["PATH"], path, "the app's PATH: {start:#}");
+    assert_eq!(
+        env.get("CLAUDE_SECURESTORAGE_CONFIG_DIR"),
+        None,
+        "{start:#}"
+    );
     if slot == 1 {
         assert_eq!(env.get("CLAUDE_CONFIG_DIR"), None, "{start:#}");
         assert_eq!(env.get("CLAUDE_CODE_TMPDIR"), None, "{start:#}");
@@ -924,7 +937,7 @@ fn assert_each_on_its_account(start: &Value, slot: u32, accounts: &Accounts, pat
 
 #[test]
 fn with_the_apps_environment_each_read_keeps_to_its_accounts_homes() {
-    let (home, accounts) = map_home(true, &[]);
+    let (home, accounts) = map_home(true, &[RLXD_SECURE]);
     let (config, path) = app_sets_its_own_home(&home);
     let data = list(&home, &json!({"refresh": true}));
     assert_eq!(data["model_turns"], 0, "{data:#}");
@@ -945,7 +958,7 @@ fn with_the_apps_environment_each_read_keeps_to_its_accounts_homes() {
 
 #[test]
 fn with_the_apps_environment_each_one_turn_probe_keeps_to_its_accounts_homes() {
-    let (home, accounts) = map_home(false, &[]);
+    let (home, accounts) = map_home(false, &[RLXD_SECURE]);
     let (_, path) = app_sets_its_own_home(&home);
     std::fs::write(home.root().join("scenario"), "init-connectors").unwrap();
     for slot in [1, 2] {
@@ -958,4 +971,60 @@ fn with_the_apps_environment_each_one_turn_probe_keeps_to_its_accounts_homes() {
         assert_eq!(starts.len(), slot as usize, "{starts:#?}");
         assert_each_on_its_account(starts.last().unwrap(), slot, &accounts, &path);
     }
+}
+
+#[test]
+fn a_runs_init_is_filed_under_the_account_whose_home_the_app_set() {
+    // rlxd itself on the plain account (no CLAUDE_CONFIG_DIR); the route off, so nothing
+    // is read but what runs find.
+    let (home, accounts) = map_home(false, &[]);
+    let widget = json!({"kind": "widget_refresh", "prompt": "digest",
+        "mount": {"kind": "connectors", "connectors": [SLACK]}, "space": "default"});
+    let set = |change: Value| {
+        let run = home.rlxd(&["call", "--as-app", "env.set", &change.to_string()]);
+        assert_eq!(run.code(), Some(0), "{run:?}");
+    };
+    let status_of =
+        |slot: u32| row(&list(&home, &json!({})), slot)["connectors"][0]["status"].clone();
+
+    // The app's CLAUDE_CONFIG_DIR is slot 2's home: runs run there, and file there.
+    set(json!({"CLAUDE_CONFIG_DIR": accounts.managed.to_str().unwrap()}));
+    std::fs::write(home.root().join("scenario"), "init-connectors").unwrap();
+    let id = run_id();
+    start(&home, &widget, &id);
+    ended(&home, &id);
+    eventually("the run's connectors are slot 2's", || {
+        status_of(2) == "connected"
+    });
+    let data = list(&home, &json!({}));
+    assert_eq!(row(&data, 2)["from"], "init", "{data:#}");
+    assert_eq!(row(&data, 1)["connectors"], json!([]), "{data:#}");
+    assert_eq!(saved(&home)["2"]["login"], MARK, "the brain's own entry");
+    let started = starts(&home);
+    assert_eq!(
+        started.last().unwrap()["env"]["CLAUDE_CONFIG_DIR"],
+        accounts.managed.to_str().unwrap(),
+        "{started:#?}"
+    );
+
+    // Taken back: runs are the plain account's again, and file there.
+    set(json!({"CLAUDE_CONFIG_DIR": ""}));
+    std::fs::write(home.root().join("scenario"), "connectors-needs-auth").unwrap();
+    let id = run_id();
+    start(&home, &widget, &id);
+    ended(&home, &id);
+    eventually("the run's connectors are slot 1's", || {
+        status_of(1) == "needs-auth"
+    });
+    let data = list(&home, &json!({}));
+    assert_eq!(row(&data, 1)["from"], "init", "{data:#}");
+    assert_eq!(
+        status_of(2),
+        "connected",
+        "slot 2 as the first run left it: {data:#}"
+    );
+    // rlxd's own, which map_home leaves empty: no home named.
+    let started = starts(&home);
+    let named = started.last().unwrap()["env"]["CLAUDE_CONFIG_DIR"].clone();
+    assert!(named.is_null() || named == "", "{started:#?}");
 }

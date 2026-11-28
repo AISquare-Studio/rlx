@@ -9,7 +9,8 @@
 //! environment resolved to, on the account's environment ([`super::account_env`], 4.3):
 //! a run's (rlxd's own, the app's values on top), then a managed slot's own
 //! `CLAUDE_CONFIG_DIR` and `CLAUDE_CODE_TMPDIR`, or neither for the default account,
-//! even when the app's values carry one.
+//! even when the app's values carry one; and no `CLAUDE_SECURESTORAGE_CONFIG_DIR` but a
+//! managed slot's own.
 //!
 //! - **`initialize`**, then **`mcp_status`** every [`STATUS_EVERY`], until it lists a
 //!   server and none of them is `pending`: that listing is the account's connectors now.
