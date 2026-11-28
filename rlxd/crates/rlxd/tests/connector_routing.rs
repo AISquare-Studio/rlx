@@ -45,6 +45,9 @@ struct Accounts {
     plain: PathBuf,
     managed: PathBuf,
     managed_tmp: PathBuf,
+    /// Slot 3's homes, for the tests that list a third account.
+    third: PathBuf,
+    third_tmp: PathBuf,
     usage: PathBuf,
     listed: PathBuf,
 }
@@ -55,6 +58,8 @@ impl Accounts {
             plain: root.join("user-home").join(".claude"),
             managed: root.join("account-2"),
             managed_tmp: root.join("account-2-tmp"),
+            third: root.join("account-3"),
+            third_tmp: root.join("account-3-tmp"),
             usage: root.join("usage.json"),
             listed: root.join("accounts.json"),
         }
@@ -62,10 +67,10 @@ impl Accounts {
 
     /// Writes `rows` as `slot`'s connectors.
     fn set(&self, slot: u32, rows: &Value) {
-        let dir = if slot == 1 {
-            &self.plain
-        } else {
-            &self.managed
+        let dir = match slot {
+            1 => &self.plain,
+            2 => &self.managed,
+            _ => &self.third,
         };
         std::fs::create_dir_all(dir).unwrap();
         std::fs::write(dir.join("fake-connectors.json"), rows.to_string()).unwrap();
@@ -73,11 +78,22 @@ impl Accounts {
 
     /// The brain's list: slot 1, and slot 2 when `two`.
     fn list(&self, two: bool) {
-        let mut listed = vec![json!({"slot": 1, "label": "main", "login": MARK_1})];
-        if two {
-            listed.push(json!({"slot": 2, "label": "work",
-                "config_dir": self.managed, "tmp_dir": self.managed_tmp, "login": MARK_2}));
-        }
+        self.list_slots(if two { &[1, 2] } else { &[1] });
+    }
+
+    /// The brain's list: each of `slots` (of 1, 2 and 3).
+    fn list_slots(&self, slots: &[u32]) {
+        let listed: Vec<Value> = slots
+            .iter()
+            .map(|slot| match slot {
+                1 => json!({"slot": 1, "label": "main", "login": MARK_1}),
+                2 => json!({"slot": 2, "label": "work",
+                    "config_dir": self.managed, "tmp_dir": self.managed_tmp, "login": MARK_2}),
+                _ => json!({"slot": 3, "label": "side",
+                    "config_dir": self.third, "tmp_dir": self.third_tmp,
+                    "login": "mark-of-slot-3"}),
+            })
+            .collect();
         std::fs::write(&self.listed, Value::Array(listed).to_string()).unwrap();
     }
 
@@ -95,6 +111,17 @@ fn routing_home(
     two: Option<&str>,
     who: Option<(Option<&str>, Option<&str>)>,
 ) -> (TestHome, Accounts) {
+    routing_home_with(one, two, who, false)
+}
+
+/// [`routing_home`]; with `own_config`, rlxd itself runs under a `CLAUDE_CONFIG_DIR` of its
+/// own, `<home>/claude-config`, which is no account's.
+fn routing_home_with(
+    one: Option<&str>,
+    two: Option<&str>,
+    who: Option<(Option<&str>, Option<&str>)>,
+    own_config: bool,
+) -> (TestHome, Accounts) {
     let root = TestHome::new();
     let accounts = Accounts::of(root.root());
     accounts.set(1, &one.map_or_else(no_slack, slack));
@@ -106,19 +133,19 @@ fn routing_home(
     }
     let listed = accounts.listed.to_str().unwrap().to_owned();
     let usage = accounts.usage.to_str().unwrap().to_owned();
-    let home = home_with_scenario_file_in(
-        root,
-        "mcp-accounts",
-        &[
-            ("RLXD_TEST_ACCOUNTS", listed.as_str()),
-            ("RLXD_TEST_USAGE", usage.as_str()),
-            ("RLXD_TEST_CONNECTOR_MAP_MS", "off"),
-            ("RLXD_TEST_CONNECTORS_NO_TURN", "1"),
-            // Route 1: a try whose init shows Slack connected sends its prompt at once.
-            ("RLXD_TEST_CONNECTOR_ROUTE", "1"),
-            ("CLAUDE_CONFIG_DIR", ""),
-        ],
-    );
+    let mut envs = vec![
+        ("RLXD_TEST_ACCOUNTS", listed.as_str()),
+        ("RLXD_TEST_USAGE", usage.as_str()),
+        ("RLXD_TEST_CONNECTOR_MAP_MS", "off"),
+        ("RLXD_TEST_CONNECTORS_NO_TURN", "1"),
+        // Route 1: a try whose init shows Slack connected sends its prompt at once.
+        ("RLXD_TEST_CONNECTOR_ROUTE", "1"),
+    ];
+    if !own_config {
+        // rlxd, and so its default runs, on the plain account.
+        envs.push(("CLAUDE_CONFIG_DIR", ""));
+    }
+    let home = home_with_scenario_file_in(root, "mcp-accounts", &envs);
     read_map(&home);
     std::fs::write(home.root().join("scenario"), "init-connectors").unwrap();
     (home, accounts)
@@ -564,13 +591,11 @@ fn a_routed_runs_connectors_are_checked_again_at_its_init() {
     eventually("the init is filed on slot 2", || {
         slack_on(&home, 2) == "needs-auth"
     });
-    // Its needs-you for the sign-in is out, and Slack signed in again on slot 2, its own
-    // account, clears it. (The runs' own home is slot 1's: that is not where it ran.)
-    let since = seq(&home);
+    // Its needs-you for the sign-in is out. Slack signed in on slot 1, the app's and the
+    // runs' own home, where it did not run, clears nothing; on slot 2, its own account, it
+    // clears it.
     std::fs::write(home.root().join("scenario"), "mcp-accounts").unwrap();
-    accounts.set(2, &slack("connected"));
-    read_map(&home);
-    eventually("the run's needs-you is cleared", || {
+    let cleared = |since: u64| {
         home.rlxd(&[
             "events",
             "--topics",
@@ -581,29 +606,329 @@ fn a_routed_runs_connectors_are_checked_again_at_its_init() {
         .lines()
         .iter()
         .any(|e| e["type"] == "needs_you.cleared" && e["data"]["id"] == format!("run:{id}:1"))
-    });
+    };
+    let since = seq(&home);
+    accounts.set(1, &slack("connected"));
+    let run = home.rlxd(&[
+        "call",
+        "connectors.list",
+        r#"{"refresh": true, "account": 1}"#,
+    ]);
+    assert_eq!(run.code(), Some(0), "{run:?}");
+    assert_eq!(slack_on(&home, 1), "connected");
+    assert!(
+        !cleared(since),
+        "slot 1's sign-in cleared a run that ran on slot 2"
+    );
+    let since = seq(&home);
+    accounts.set(2, &slack("connected"));
+    read_map(&home);
+    eventually("the run's needs-you is cleared", || cleared(since));
+}
+
+/// Run `id`'s transcript under `home`: `projects/<the space's folder>/<id>.jsonl`, each
+/// that is there (a file or a link).
+fn transcripts(home: &Path, id: &str) -> Vec<PathBuf> {
+    std::fs::read_dir(home.join("projects"))
+        .into_iter()
+        .flatten()
+        .filter_map(|entry| Some(entry.ok()?.path().join(format!("{id}.jsonl"))))
+        .filter(|path| path.symlink_metadata().is_ok())
+        .collect()
+}
+
+/// A run routed to slot 2 by Slack, done: its id and its transcript there.
+fn routed_and_done(home: &TestHome, accounts: &Accounts) -> (String, PathBuf) {
+    let id = run_id();
+    assert_eq!(start(home, &task(&[SLACK], None), &id).code(), Some(0));
+    ended(home, &id, "done");
+    let found = transcripts(&accounts.managed, &id);
+    assert_eq!(found.len(), 1, "no transcript on slot 2: {found:?}");
+    (id, found[0].clone())
+}
+
+fn erase(home: &TestHome) -> common::Run {
+    home.rlxd(&["call", "space.erase", r#"{"name": "default"}"#])
 }
 
 #[test]
-fn erasing_a_space_takes_a_routed_runs_session_from_its_accounts_home() {
+fn erasing_a_space_takes_a_routed_runs_transcript_from_its_own_accounts_home_alone() {
     let (home, accounts) = routing_home(Some("needs-auth"), Some("connected"), None);
-    let id = run_id();
-    assert_eq!(start(&home, &task(&[SLACK], None), &id).code(), Some(0));
-    ended(&home, &id, "done");
-    let sessions = |dir: &Path| -> Vec<PathBuf> {
-        std::fs::read_dir(dir.join("projects"))
-            .into_iter()
-            .flatten()
-            .filter_map(|entry| Some(entry.ok()?.path().join(format!("{id}.jsonl"))))
-            .filter(|path| path.is_file())
-            .collect()
-    };
-    assert_eq!(sessions(&accounts.managed).len(), 1, "no session on slot 2");
-    let erased = home.rlxd(&["call", "space.erase", r#"{"name": "default"}"#]);
+    let (id, ours) = routed_and_done(&home, &accounts);
+    // A default run of the space too, on rlxd's own home (slot 1's here), so that home is
+    // gone into: its transcript goes, and nothing of the routed run's is looked for there.
+    let plain = run_id();
+    let default = json!({"kind": "task", "prompt": "digest", "mount": {"kind": "no_tools"}});
+    assert_eq!(start(&home, &default, &plain).code(), Some(0));
+    ended(&home, &plain, "done");
+    let plain_transcript = transcripts(&accounts.plain, &plain);
+    assert_eq!(plain_transcript.len(), 1, "{plain_transcript:?}");
+    // The same name as the routed run's under slot 1's home: not that run's, which ran on
+    // slot 2.
+    let folder = ours.parent().unwrap().file_name().unwrap();
+    let theirs = accounts.plain.join("projects").join(folder);
+    std::fs::create_dir_all(&theirs).unwrap();
+    let theirs = theirs.join(format!("{id}.jsonl"));
+    std::fs::write(&theirs, "{}\n").unwrap();
+    let erased = erase(&home);
     assert_eq!(erased.code(), Some(0), "{erased:?}");
+    assert!(!ours.exists(), "slot 2's transcript is left");
     assert!(
-        sessions(&accounts.managed).is_empty(),
-        "the session is left"
+        !plain_transcript[0].exists(),
+        "the default run's transcript is left"
+    );
+    assert!(theirs.exists(), "slot 1's file of the same name went");
+    assert_eq!(
+        home.rlxd(&["call", "run.get", &json!({"run_id": id}).to_string()])
+            .error_code(),
+        "unknown_run"
+    );
+}
+
+#[test]
+fn erasing_a_space_whose_runs_home_is_gone_removes_the_rest() {
+    let (home, accounts) = routing_home(Some("needs-auth"), Some("connected"), None);
+    let (id, _) = routed_and_done(&home, &accounts);
+    std::fs::remove_dir_all(&accounts.managed).unwrap();
+    let erased = erase(&home);
+    assert_eq!(erased.code(), Some(0), "{erased:?}");
+    assert_eq!(
+        home.rlxd(&["call", "run.get", &json!({"run_id": id}).to_string()])
+            .error_code(),
+        "unknown_run"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn erasing_a_space_follows_no_link_planted_in_a_runs_home() {
+    // The space's project folder in slot 2's home, swapped for a link out of it: refused,
+    // nothing removed, and what the link names left.
+    let (home, accounts) = routing_home(Some("needs-auth"), Some("connected"), None);
+    let (id, ours) = routed_and_done(&home, &accounts);
+    let project = ours.parent().unwrap().to_path_buf();
+    let outside = home.root().join("outside-project");
+    std::fs::rename(&project, &outside).unwrap();
+    std::os::unix::fs::symlink(&outside, &project).unwrap();
+    let refused = erase(&home);
+    assert_eq!(refused.error_code(), "link_refused", "{refused:?}");
+    assert!(outside.join(format!("{id}.jsonl")).exists());
+    assert_eq!(
+        home.rlxd(&["call", "run.get", &json!({"run_id": id}).to_string()])
+            .data()["state"],
+        "done"
+    );
+    // The transcript itself a link to a file elsewhere: the link goes, its target stays.
+    std::fs::remove_file(&project).unwrap();
+    std::fs::rename(&outside, &project).unwrap();
+    let elsewhere = home.root().join("elsewhere.jsonl");
+    std::fs::write(&elsewhere, "keep\n").unwrap();
+    std::fs::remove_file(&ours).unwrap();
+    std::os::unix::fs::symlink(&elsewhere, &ours).unwrap();
+    let erased = erase(&home);
+    assert_eq!(erased.code(), Some(0), "{erased:?}");
+    assert!(ours.symlink_metadata().is_err(), "the link is left");
+    assert_eq!(std::fs::read_to_string(&elsewhere).unwrap(), "keep\n");
+}
+
+#[cfg(unix)]
+#[test]
+fn a_link_in_an_account_no_run_of_the_space_ran_on_never_stops_its_erase() {
+    // Slot 1's home holds a projects/ that is a link, but no run of the space ran there:
+    // it is never gone into.
+    let (home, accounts) = routing_home(Some("needs-auth"), Some("connected"), None);
+    let (_, ours) = routed_and_done(&home, &accounts);
+    let outside = home.root().join("outside-projects");
+    std::fs::create_dir_all(outside.join("anything")).unwrap();
+    std::fs::write(outside.join("anything").join("keep"), "x").unwrap();
+    std::os::unix::fs::symlink(&outside, accounts.plain.join("projects")).unwrap();
+    let erased = erase(&home);
+    assert_eq!(erased.code(), Some(0), "{erased:?}");
+    assert!(!ours.exists());
+    assert!(outside.join("anything").join("keep").exists());
+}
+
+/// What `run.json` records of run `id`: its `home`.
+fn recorded_home(home: &TestHome, id: &str) -> Value {
+    let record = home
+        .root()
+        .join("rlxd")
+        .join("runs")
+        .join(id)
+        .join("run.json");
+    let record: Value = serde_json::from_str(&std::fs::read_to_string(record).unwrap()).unwrap();
+    record["home"].clone()
+}
+
+#[test]
+fn a_run_pinned_to_the_plain_account_records_and_is_erased_from_its_default_home() {
+    // rlxd itself runs under a CLAUDE_CONFIG_DIR of its own, no account's. A run pinned to
+    // the plain account has that variable taken away: Claude Code keeps its transcript in
+    // ~/.claude, which is the home its run.json records, and where it is erased.
+    let (home, accounts) = routing_home_with(Some("connected"), Some("connected"), None, true);
+    let id = run_id();
+    let pinned = json!({"kind": "task", "prompt": "digest", "mount": {"kind": "no_tools"},
+        "account": 1});
+    assert_eq!(start(&home, &pinned, &id).code(), Some(0));
+    ended(&home, &id, "done");
+    on_slot_1(&starts_of(&home, &id)[0]);
+    assert_eq!(recorded_home(&home, &id), accounts.plain.to_str().unwrap());
+    let ours = transcripts(&accounts.plain, &id);
+    assert_eq!(ours.len(), 1, "{ours:?}");
+    // The same name under rlxd's own home: not this run's.
+    let own = home.root().join("claude-config").join("projects");
+    let theirs = own.join(ours[0].parent().unwrap().file_name().unwrap());
+    std::fs::create_dir_all(&theirs).unwrap();
+    let theirs = theirs.join(format!("{id}.jsonl"));
+    std::fs::write(&theirs, "{}\n").unwrap();
+    assert_eq!(erase(&home).code(), Some(0));
+    assert!(!ours[0].exists(), "the plain account's transcript is left");
+    assert!(theirs.exists(), "rlxd's own home's file went");
+}
+
+#[test]
+fn a_routed_attempt_takes_none_of_the_apps_homes_and_records_its_accounts() {
+    let (home, accounts) = routing_home(Some("needs-auth"), Some("connected"), None);
+    let app_home = home.root().join("app-claude");
+    let app_secure = home.root().join("app-secure");
+    let change =
+        json!({"CLAUDE_CONFIG_DIR": app_home, "CLAUDE_SECURESTORAGE_CONFIG_DIR": app_secure});
+    let set = home.rlxd(&["call", "--as-app", "env.set", &change.to_string()]);
+    assert_eq!(set.code(), Some(0), "{set:?}");
+    let (id, _) = routed_and_done(&home, &accounts);
+    let started = &starts_of(&home, &id)[0];
+    on_slot_2(started, &accounts);
+    assert_eq!(
+        started["env"].get("CLAUDE_SECURESTORAGE_CONFIG_DIR"),
+        None,
+        "{started:#}"
+    );
+    assert_eq!(
+        recorded_home(&home, &id),
+        accounts.managed.to_str().unwrap()
+    );
+}
+
+/// #4291's setup: slot 1 (the plain account) and slot 3 (B) without Slack, slot 2 (A)
+/// with it connected; a run routed by Slack in the space `sx`, its session kept, done.
+/// Its id, and its transcript in A's home.
+fn three_accounts_and_a_routed_run_in_sx() -> (TestHome, Accounts, String, PathBuf) {
+    let root = TestHome::new();
+    let accounts = Accounts::of(root.root());
+    accounts.set(1, &slack("needs-auth"));
+    accounts.set(2, &slack("connected"));
+    accounts.set(3, &no_slack());
+    accounts.list_slots(&[1, 2, 3]);
+    accounts.usage(&json!([]));
+    let listed = accounts.listed.to_str().unwrap().to_owned();
+    let usage = accounts.usage.to_str().unwrap().to_owned();
+    let home = home_with_scenario_file_in(
+        root,
+        "mcp-accounts",
+        &[
+            ("RLXD_TEST_ACCOUNTS", listed.as_str()),
+            ("RLXD_TEST_USAGE", usage.as_str()),
+            ("RLXD_TEST_CONNECTOR_MAP_MS", "off"),
+            ("RLXD_TEST_CONNECTORS_NO_TURN", "1"),
+            ("RLXD_TEST_CONNECTOR_ROUTE", "1"),
+            ("CLAUDE_CONFIG_DIR", ""),
+        ],
+    );
+    read_map(&home);
+    std::fs::write(home.root().join("scenario"), "init-connectors").unwrap();
+    let id = run_id();
+    let mut params = task(&[SLACK], None);
+    params["space"] = json!("sx");
+    params["persist_session"] = json!(true);
+    assert_eq!(start(&home, &params, &id).code(), Some(0));
+    ended(&home, &id, "done");
+    assert_eq!(
+        recorded_home(&home, &id),
+        accounts.managed.to_str().unwrap()
+    );
+    let found = transcripts(&accounts.managed, &id);
+    assert_eq!(found.len(), 1, "no transcript in A's home: {found:?}");
+    (home, accounts, id, found[0].clone())
+}
+
+/// The same name as `ours` (A's transcript), planted under `home`'s own projects/.
+fn plant_beside(home: &Path, ours: &Path) -> PathBuf {
+    let folder = home
+        .join("projects")
+        .join(ours.parent().unwrap().file_name().unwrap());
+    std::fs::create_dir_all(&folder).unwrap();
+    let planted = folder.join(ours.file_name().unwrap());
+    std::fs::write(&planted, "not this run's\n").unwrap();
+    planted
+}
+
+fn erase_sx(home: &TestHome) -> common::Run {
+    home.rlxd(&["call", "space.erase", r#"{"name": "sx"}"#])
+}
+
+#[test]
+fn erasing_sx_removes_the_routed_runs_transcript_in_a_and_no_same_named_file_in_b_or_the_plain_home()
+ {
+    // #4291 (a).
+    let (home, accounts, id, ours) = three_accounts_and_a_routed_run_in_sx();
+    let in_b = plant_beside(&accounts.third, &ours);
+    let in_plain = plant_beside(&accounts.plain, &ours);
+    let erased = erase_sx(&home);
+    assert_eq!(erased.code(), Some(0), "{erased:?}");
+    assert!(!ours.exists(), "A's transcript is left");
+    assert!(in_b.exists(), "B's file of the same name went");
+    assert!(
+        in_plain.exists(),
+        "the plain home's file of the same name went"
+    );
+    let removed = erased.data()["removed"].to_string();
+    assert!(!removed.contains("account-3"), "{removed}");
+    assert!(!removed.contains("user-home"), "{removed}");
+    assert!(removed.contains(&format!("{id}.jsonl")), "{removed}");
+}
+
+#[cfg(unix)]
+#[test]
+fn a_symlinked_projects_in_b_never_blocks_the_erase_of_as_run() {
+    // #4291 (b).
+    let (home, accounts, _id, ours) = three_accounts_and_a_routed_run_in_sx();
+    let outside = home.root().join("outside-b-projects");
+    let victim = outside.join(ours.parent().unwrap().file_name().unwrap());
+    std::fs::create_dir_all(&victim).unwrap();
+    let victim = victim.join(ours.file_name().unwrap());
+    std::fs::write(&victim, "keep\n").unwrap();
+    std::os::unix::fs::symlink(&outside, accounts.third.join("projects")).unwrap();
+    let erased = erase_sx(&home);
+    assert_eq!(erased.code(), Some(0), "{erased:?}");
+    assert!(!ours.exists(), "A's transcript is left");
+    assert_eq!(std::fs::read_to_string(&victim).unwrap(), "keep\n");
+}
+
+#[test]
+fn a_routed_runs_transcript_is_erased_from_its_recorded_home_after_its_account_is_dropped() {
+    // #4291 (c): A is no longer rlx's, its home still on disk. The run's own record names
+    // that home, so the erase finds the transcript there.
+    let (home, accounts, id, ours) = three_accounts_and_a_routed_run_in_sx();
+    std::fs::write(home.root().join("scenario"), "mcp-accounts").unwrap();
+    accounts.list_slots(&[1, 3]);
+    read_map(&home);
+    let listed = home.rlxd(&["call", "connectors.list"]).data();
+    assert!(
+        listed["accounts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|row| row["account"] != 2),
+        "{listed:#}"
+    );
+    assert!(accounts.managed.exists());
+    let erased = erase_sx(&home);
+    assert_eq!(erased.code(), Some(0), "{erased:?}");
+    assert!(!ours.exists(), "A's transcript is left");
+    assert_eq!(
+        home.rlxd(&["call", "run.get", &json!({"run_id": id}).to_string()])
+            .error_code(),
+        "unknown_run"
     );
 }
 

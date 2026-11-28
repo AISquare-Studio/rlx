@@ -44,8 +44,8 @@
 //!
 //! Locks: the runner's (its runs and pools), then a run's, never the other way round.
 
-use std::collections::{HashMap, VecDeque};
-use std::ffi::OsString;
+use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::ffi::{OsStr, OsString};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -336,9 +336,11 @@ struct RunInner {
     /// too, once each is `connected` again on the account [`RunInner::home`] is. Empty
     /// when it has none out.
     auth: Vec<String>,
-    /// The `CLAUDE_CONFIG_DIR` the app's values gave its latest attempt when it started
-    /// (4.3), `None` when they gave none: then it ran on rlxd's own. Whose sign-in its
-    /// `auth` waits on.
+    /// The `CLAUDE_CONFIG_DIR` its latest attempt ran on: for a `default` run, the one the
+    /// app's values gave when it started (4.3), `None` when they gave none (then it ran
+    /// on rlxd's own: [`own_config_dir`]), whose sign-in its `auth` waits on; for a
+    /// pinned or routed run (#15), its account's, the plain account's `~/.claude`.
+    /// `space.erase` takes the run's transcript from there alone.
     home: Option<String>,
     /// The account the run is on, and why (#15): its route, decided at `run.start` and
     /// kept by every attempt. A `default` run's slot is worked out again at each attempt,
@@ -1365,10 +1367,11 @@ impl Runner {
     ///   is on the way: `<home>/spaces`, the space itself, a config directory, its
     ///   `projects`, or the space's project folder there.
     /// - A link inside the space goes as a link, never followed, and is named in `links`.
-    /// - Session files are `projects/<encoded space dir>/<run_id>.jsonl` under each config
-    ///   directory rlx knows ([`config_dirs`]), the space dir encoded as Claude Code does
-    ///   ([`project_folder`]), for its resolved path and the path as given. No other
-    ///   project folder is touched.
+    /// - A run's session file is `projects/<encoded space dir>/<run_id>.jsonl` (2.5's
+    ///   alone), the space dir encoded as Claude Code does ([`project_folder`]), for its
+    ///   resolved path and the path as given, under the one home that run recorded
+    ///   ([`transcript_home`], contract #4276), and under no other. No other project folder
+    ///   is touched, and a home that is gone has nothing of the run's.
     /// - A run whose files can't all be removed keeps its record, and the erase fails
     ///   `erase_incomplete` with `detail {removed, failed}`; erasing again finishes it.
     /// - The runner's lock is held only to decide; every removal happens outside it, while
@@ -1449,10 +1452,10 @@ impl Runner {
     /// The removals of `space.erase`, with no lock held: what it removed, the links inside
     /// the space it removed as links, what failed, and the runs now gone. Every folder on
     /// the way is opened once without following a link, and checked and removed through
-    /// what was opened ([`remove`]): `<home>` and each config directory are roots, taken
-    /// as they resolve; `spaces/`, the space, `projects/` and the space's project folder
-    /// must not be links. The config directories are only gone into when the space has
-    /// runs, whose sessions there are removed.
+    /// what was opened ([`remove`]): `<home>` and each run's home are roots, taken as they
+    /// resolve; `spaces/`, the space, `projects/` and the space's project folder must not
+    /// be links. Each run's home is gone into once, for the runs that recorded it, and
+    /// only their session files are removed there; one that is a link goes as a link.
     #[allow(clippy::type_complexity)]
     fn erase_files(
         &self,
@@ -1460,7 +1463,6 @@ impl Runner {
         space: &std::path::Path,
         ours: &[Arc<Run>],
     ) -> Result<(Vec<String>, Vec<String>, Vec<Value>, Vec<Arc<Run>>), ErrorBody> {
-        use std::ffi::OsStr;
         let name = remove::name_of(space).to_owned();
         // The space as Claude Code saw it: resolved, before anything is removed.
         let resolved = spaces::resolved(space)
@@ -1496,30 +1498,33 @@ impl Runner {
         {
             linked.push(spaces_dir.path().join(&name).display().to_string());
         }
-        // The space's project folder in each config directory, held: only when the space
-        // has runs, whose session files are there.
-        let mut projects_held: Vec<Vec<remove::Dir>> = Vec::new();
-        if !ours.is_empty() {
-            // A pinned or routed run's sessions are in its account's home (#15).
-            let mut configs = config_dirs();
-            for dir in self
-                .connectors
-                .accounts()
-                .into_iter()
-                .filter_map(|account| account.config_dir)
-            {
-                if !configs.contains(&dir) {
-                    configs.push(dir);
-                }
+        // Each run's transcript is under the home that run recorded, else rlxd's own (2.5,
+        // contract #4276), and nowhere else: the space's project folder there, held, for
+        // each such home once. A home is a root, resolved once (a relative one against the
+        // space Claude Code ran in); below it, nothing follows a link, and what is joined
+        // is one plain name each, never `..`.
+        let mut homes: BTreeMap<PathBuf, Vec<usize>> = BTreeMap::new();
+        for (i, run) in ours.iter().enumerate() {
+            let recorded = run.inner().home.clone();
+            if let Some(home) = transcript_home(recorded.as_deref(), &resolved) {
+                homes.entry(home).or_default().push(i);
             }
-            for config in configs {
-                for folder in &folders {
-                    match remove::walk(&config, &[OsStr::new("projects"), OsStr::new(folder)]) {
-                        Ok(Ok(Some(held))) => projects_held.push(held),
-                        Ok(Ok(None)) => {}
-                        Ok(Err(link)) => linked.push(link.display().to_string()),
-                        Err(e) => return Err(internal(e)),
-                    }
+        }
+        if folders.iter().any(|folder| !plain_name(OsStr::new(folder))) {
+            return Err(internal(std::io::Error::other(
+                "the space's project folder is not one plain name",
+            )));
+        }
+        let mut projects_held: Vec<(Vec<usize>, Vec<remove::Dir>)> = Vec::new();
+        for (home, runs) in &homes {
+            for folder in &folders {
+                match remove::walk(home, &[OsStr::new("projects"), OsStr::new(folder)]) {
+                    Ok(Ok(Some(held))) => projects_held.push((runs.clone(), held)),
+                    // The home, its projects/ or the space's folder there is gone: nothing
+                    // of the run's to remove there.
+                    Ok(Ok(None)) => {}
+                    Ok(Err(link)) => linked.push(link.display().to_string()),
+                    Err(e) => return Err(internal(e)),
                 }
             }
         }
@@ -1542,12 +1547,18 @@ impl Runner {
         let fail = |failed: &mut Vec<Value>, path: &std::path::Path, e: &std::io::Error| {
             failed.push(json!({"path": path.display().to_string(), "error": e.to_string()}));
         };
-        // Each run's session files, through the held project folders.
+        // Each run's transcript, through the project folders held under its own home.
         let mut kept: Vec<&Arc<Run>> = Vec::new();
-        for run in ours {
+        for (i, run) in ours.iter().enumerate() {
             let file = std::ffi::OsString::from(format!("{}.jsonl", run.params.run_id));
+            if !plain_name(&file) {
+                continue;
+            }
             let before = failed.len();
-            for held in &projects_held {
+            for (runs, held) in &projects_held {
+                if !runs.contains(&i) {
+                    continue;
+                }
                 let Some(project) = held.last() else {
                     continue;
                 };
@@ -1973,6 +1984,10 @@ impl Runner {
             Ok(on) => on,
             Err(message) => return failed(message),
         };
+        if let Some(account) = &on {
+            // The home it really runs on, where its transcript is: its account's.
+            run.inner().home = account_home(account).map(|dir| dir.display().to_string());
+        }
         let ran = match &on {
             Some(account) => RanOn::Account(account.slot),
             None => RanOn::Home(values.claude_config_dir.as_deref()),
@@ -3047,11 +3062,10 @@ struct Kept {
     files: Vec<(PathBuf, Option<u64>)>,
 }
 
-/// The Claude Code config directories whose sessions `space.erase` deletes and a gated
-/// try takes back: `CLAUDE_CONFIG_DIR` from rlxd's environment, and the default
-/// `~/.claude`. `space.erase` adds every managed account's that rlx lists (the brain's
-/// `accounts`), where pinned and routed runs keep theirs (#15), and a try its own
-/// account's.
+/// The Claude Code config directories a gated try takes its session back from:
+/// `CLAUDE_CONFIG_DIR` from rlxd's environment, and the default `~/.claude`, and a pinned
+/// or routed try's account's own (#15). (`space.erase` takes each run's transcript from
+/// the one home that run recorded: [`transcript_home`].)
 fn config_dirs() -> Vec<PathBuf> {
     let mut dirs: Vec<PathBuf> = Vec::new();
     if let Some(dir) = std::env::var_os("CLAUDE_CONFIG_DIR").filter(|v| !v.is_empty()) {
@@ -3064,6 +3078,44 @@ fn config_dirs() -> Vec<PathBuf> {
         }
     }
     dirs
+}
+
+/// The `CLAUDE_CONFIG_DIR` Claude Code takes on rlxd's own environment: rlxd's
+/// `CLAUDE_CONFIG_DIR`, else the default `~/.claude`.
+fn own_config_dir() -> Option<PathBuf> {
+    std::env::var_os("CLAUDE_CONFIG_DIR")
+        .filter(|dir| !dir.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| std::env::home_dir().map(|home| home.join(".claude")))
+}
+
+/// The `CLAUDE_CONFIG_DIR` an account's runs take (#15): a managed one's own, the plain
+/// account's default `~/.claude` (its runs have the variable taken away).
+fn account_home(account: &Account) -> Option<PathBuf> {
+    if account.slot == rlxd_proto::DEFAULT_ACCOUNT {
+        return std::env::home_dir().map(|home| home.join(".claude"));
+    }
+    account.config_dir.clone()
+}
+
+/// Where `space.erase` takes a run's transcript from: the home it `recorded`
+/// ([`RunInner::home`]), else rlxd's own; a relative one as Claude Code took it, in the
+/// space it ran in (`space`, resolved).
+fn transcript_home(recorded: Option<&str>, space: &std::path::Path) -> Option<PathBuf> {
+    match recorded.filter(|home| !home.is_empty()).map(PathBuf::from) {
+        Some(home) if home.is_relative() => Some(space.join(home)),
+        Some(home) => Some(home),
+        None => own_config_dir(),
+    }
+}
+
+/// Whether `name` is one plain name: no separator, and not `.` or `..`.
+fn plain_name(name: &OsStr) -> bool {
+    let mut parts = std::path::Path::new(name).components();
+    matches!(
+        (parts.next(), parts.next()),
+        (Some(std::path::Component::Normal(part)), None) if part == name
+    )
 }
 
 /// How Claude Code ended, for `run.failed`'s message: as its guard wrote it to its pipe
@@ -3421,6 +3473,48 @@ fn blocking<T>(work: impl FnOnce() -> T) -> T {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_one_plain_name_is_joined_below_a_home() {
+        assert!(plain_name(OsStr::new(
+            "0f8e2d6c-3b1a-4c5d-9e7f-1a2b3c4d5e6f.jsonl"
+        )));
+        assert!(plain_name(OsStr::new("-private-tmp-home-spaces-default")));
+        for bad in ["", ".", "..", "a/b", "../x", "/abs", "x/.."] {
+            assert!(!plain_name(OsStr::new(bad)), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn a_runs_transcript_is_under_the_home_it_recorded_else_rlxds_own() {
+        let space = std::path::Path::new("/spaces/default");
+        assert_eq!(
+            transcript_home(Some("/accounts/2"), space),
+            Some(PathBuf::from("/accounts/2"))
+        );
+        // A relative one as Claude Code took it: in the space it ran in.
+        assert_eq!(
+            transcript_home(Some("cc"), space),
+            Some(PathBuf::from("/spaces/default/cc"))
+        );
+        assert_eq!(transcript_home(None, space), own_config_dir());
+        assert_eq!(transcript_home(Some(""), space), own_config_dir());
+    }
+
+    #[test]
+    fn an_accounts_runs_take_its_own_home_and_the_plain_ones_the_default() {
+        let mut managed = Account::default_one();
+        managed.slot = 2;
+        managed.config_dir = Some(PathBuf::from("/accounts/2"));
+        assert_eq!(account_home(&managed), Some(PathBuf::from("/accounts/2")));
+        let mut plain = Account::default_one();
+        // Whatever rlxd's own CLAUDE_CONFIG_DIR: the plain account's runs have it taken away.
+        plain.config_dir = Some(PathBuf::from("/never"));
+        assert_eq!(
+            account_home(&plain),
+            std::env::home_dir().map(|home| home.join(".claude"))
+        );
+    }
 
     #[test]
     fn an_accounts_read_keeps_to_its_own_homes_and_keychain_login() {

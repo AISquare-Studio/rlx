@@ -2672,8 +2672,9 @@ fn a_structured_output_too_large_for_run_done_still_ends_the_run() {
 #[cfg(unix)]
 #[test]
 fn a_config_dir_that_is_a_link_is_taken_as_it_resolves() {
-    // A dotfiles setup: ~/.claude is a link. It is a root, so it is followed, and only
-    // links below it are refused.
+    // A dotfiles setup: the run's own config dir (rlxd's CLAUDE_CONFIG_DIR here, the home
+    // its run.json names) is a link. It is a root, so it is followed, and only links
+    // below it are refused.
     let home = home("persist");
     let p = call(&home, "space.ensure", &json!({"name": "default"}))["path"]
         .as_str()
@@ -2682,17 +2683,19 @@ fn a_config_dir_that_is_a_link_is_taken_as_it_resolves() {
     let mut params = task("hi");
     params["persist_session"] = json!(true);
     let (r, _, _) = gated_start(&home, &params).wait();
+    let config = home.root().join("claude-config");
     let dotfiles = home.root().join("dotfiles-claude");
-    let folder: String = p
-        .chars()
-        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
-        .collect();
-    let planted = dotfiles.join("projects").join(&folder);
-    std::fs::create_dir_all(&planted).unwrap();
-    std::fs::write(planted.join(format!("{r}.jsonl")), "{}\n").unwrap();
-    std::os::unix::fs::symlink(&dotfiles, home.root().join("user-home").join(".claude")).unwrap();
+    std::fs::rename(&config, &dotfiles).unwrap();
+    std::os::unix::fs::symlink(&dotfiles, &config).unwrap();
+    let ours = project_of(&home, &p).join(format!("{r}.jsonl"));
+    assert!(ours.exists(), "{}", ours.display());
+    let planted = dotfiles
+        .join("projects")
+        .join(ours.parent().unwrap().file_name().unwrap())
+        .join(format!("{r}.jsonl"));
+    assert!(planted.exists(), "the transcript is in what the link names");
     let erased = call(&home, "space.erase", &json!({"name": "default"}));
-    assert!(!planted.join(format!("{r}.jsonl")).exists(), "{erased:#}");
+    assert!(!planted.exists(), "{erased:#}");
     // An empty space erases too.
     call(&home, "space.ensure", &json!({"name": "empty"}));
     call(&home, "space.erase", &json!({"name": "empty"}));

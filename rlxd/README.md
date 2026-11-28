@@ -410,8 +410,9 @@ rlxd runs Claude Code headless, with no tmux and no PTY (handoff 0.10.3, 2.1, 2.
     `CLAUDE_CONFIG_DIR` and `CLAUDE_CODE_TMPDIR`, or both taken away for the plain
     account, and no `CLAUDE_SECURESTORAGE_CONFIG_DIR` but the account's own. Its init is
     filed under that account, and a sign-in there clears its `needs_you {reason:
-    "auth"}`. Its sessions are in that account's `CLAUDE_CONFIG_DIR`, which a gated try's
-    take-back and `space.erase` reach too. Its `connectors` are checked at init as
+    "auth"}`. Its sessions are in that account's `CLAUDE_CONFIG_DIR`, the home its `run.json`
+    records, which a gated try's take-back reaches too, and `space.erase` takes its
+    transcript from (below). Its `connectors` are checked at init as
     `needs_connectors` are (5.5). It is gated like any other run (5.1). An attempt whose
     account rlx no longer knows fails, and `run.resume` of its run is refused
     `no_such_account` (or `account_unknown`). rlxd's log names the slot and why (`run …:
@@ -500,16 +501,23 @@ rlxd runs Claude Code headless, with no tmux and no PTY (handoff 0.10.3, 2.1, 2.
   `.claude/settings.json`, and returns its resolved path. It is not a project: no `.git`,
   not onboarded. Names are 1 to 64 lower-case letters, digits, `-`, `_` and `.`, with no
   separator, no `..` and no leading dot. `space.erase {name}` deletes the folder, the
-  Claude Code session files of its runs, and rlxd's records of them. Session files are
-  `projects/<encoded space dir>/<run_id>.jsonl` under `CLAUDE_CONFIG_DIR` and `~/.claude`
-  (every account's config directory once the brain serves rlx's list), the space dir
-  encoded as Claude Code does: no other project folder is touched.
+  Claude Code session files of its runs, and rlxd's records of them. A run's session
+  file (2.5's alone: hub #2519 on other kinds is open) is
+  `projects/<encoded space dir>/<run_id>.jsonl`, the space dir encoded as Claude Code
+  does, under the one home that run recorded in `run.json` (contract #4276): the
+  `CLAUDE_CONFIG_DIR` its latest attempt ran on, a pinned or routed run's account's (the
+  plain account's `~/.claude`), or, with none recorded, rlxd's own (its
+  `CLAUDE_CONFIG_DIR`, else `~/.claude`). A relative one is taken in the space, as Claude
+  Code took it. No other home and no other project folder is touched, and a home that
+  is gone has nothing of the run's to remove. What is joined below the home is one plain
+  name each, never `..`.
   It refuses `runs_live` while a run in the space is queued, running, being started or
   being resumed, and `link_refused` (`detail.paths`) when a link, a junction or a mount
-  point is below a root on the way: `spaces/`, the space itself, a config directory's
+  point is below a root on the way: `spaces/`, the space itself, a run's home's
   `projects/`, or the space's folder there; nothing is removed then. `<home>` and each
-  config directory are roots, taken as they resolve once (a `~/.claude` kept in dotfiles
-  is fine), and the config directories are only gone into when the space has runs. Every folder on the way is
+  run's home are roots, taken as they resolve once (a `~/.claude` kept in dotfiles is
+  fine), and a home is only gone into for a run of the space. A run's session file that
+  is a link goes as a link, its target left. Every folder on the way is
   opened once without following a link, and checked and removed through what was opened
   (`openat` and `unlinkat` on macOS and Linux; on Windows, handles that keep the folders
   from being renamed meanwhile), so a link put there after the check is never followed.
