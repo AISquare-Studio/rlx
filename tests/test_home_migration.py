@@ -19,6 +19,7 @@ import shutil
 import sqlite3
 import subprocess
 import sys
+import tempfile
 import uuid
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
@@ -40,6 +41,7 @@ from aisquare.services import diagnostics, home_migration, install_route, lifecy
 from aisquare.services import fleet as fleet_service
 from aisquare.services.install_route import Captured, Facts, InstallRoute, LatestRelease
 from aisquare.services.lifecycle import UpgradePlan
+from tests.fsperms import can_deny_writes, unwritable
 from tests.installer_seams import no_real_installer  # noqa: F401 — autouse, applied by import
 from tests.old_home import OLD_FILES, make_old_home
 from tests.test_claude_accounts import _sign_in
@@ -2749,3 +2751,171 @@ def test_mid_move_help_and_uninstall_s_dry_run_still_answer_and_a_dry_run_says_p
     assert "part-way through its move" not in runner.invoke(app, ["uninstall", "--dry-run"]).output
     dry = runner.invoke(app, ["move-home", "--dry-run"])
     assert dry.exit_code == 0 and "the home's move is part-way (a run stopped)" in dry.output
+
+
+# --- #62: the move lock, beside the home and gone after it --------------------------------------
+
+
+@pytest.fixture
+def own_tmp(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """A temp folder of the test's own, where the lock lived before #62 (one was left in the
+    system's for every home a suite ever moved): nothing of a move lands there now."""
+    folder = tmp_path / "tmp"
+    folder.mkdir()
+    monkeypatch.setattr(tempfile, "tempdir", str(folder))
+    for variable in ("TMPDIR", "TEMP", "TMP"):
+        monkeypatch.setenv(variable, str(folder))
+    return folder
+
+
+def _move_locks(*folders: Path) -> list[str]:
+    """The move locks in ``folders``, by either name the lock has had."""
+    names = (home_migration.MOVE_LOCK_PREFIX, "rlx-home-migration-")
+    found = (p.name for folder in folders for p in folder.iterdir())
+    return sorted(name for name in found if name.startswith(names))
+
+
+def test_the_move_lock_is_beside_the_home_and_no_move_leaves_it_behind(
+    old_home: Path, user_home: Path, own_tmp: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#62: the lock was left in the temp folder after every move. It is beside the home, out
+    of the tree the move renames, and gone after a move refused while another holds it, one
+    refused once it held it, a crash through it, a resume of a mover killed outright (whose
+    lock stays: nothing of it ran) and a drop of the cache."""
+    key, named = home_migration._move_lock_key()
+    lock = home_migration.move_lock_path(key, named=named)
+    assert lock.parent == user_home and lock.name.startswith(".rlx-home-move-")
+
+    with home_migration._one_at_a_time(key, named=named):
+        assert lock.is_file()
+        with pytest.raises(home_migration.MigrationRefused, match=home_migration.ANOTHER_MOVE):
+            home_migration.move_home()
+    assert _move_locks(user_home, own_tmp) == []
+
+    def no_room(journal: home_migration.Journal) -> None:
+        assert lock.is_file(), "written under the lock"
+        raise OSError(errno.ENOSPC, "No space left on device", "journal.json")
+
+    with pytest.MonkeyPatch.context() as full:
+        full.setattr(home_migration, "_save_move_journal", no_room)
+        with pytest.raises(home_migration.MigrationRefused, match="journal could not be written"):
+            home_migration.move_home()
+    assert _move_locks(user_home, own_tmp) == []
+
+    with pytest.MonkeyPatch.context() as crash:
+        _crash_in(crash, "move", "after")
+        with pytest.raises(Crash):
+            home_migration.move_home()
+    assert _move_locks(user_home, own_tmp) == []
+
+    lock.touch()  # a mover killed outright: its lock stays, as nothing of it ran
+    assert home_migration.move_home() is not None
+    assert paths.home_of() == (user_home / ".rlx", paths.NEW)
+    assert _move_locks(user_home, own_tmp) == [], "the resume took that lock and removed it"
+
+    home_migration.drop_cache()
+    assert _move_locks(user_home, own_tmp) == []
+
+
+_ANOTHER_MOVER = """
+import sys, tempfile
+from aisquare.services import home_migration
+key, named = home_migration._move_lock_key()
+print("TMP", tempfile.gettempdir())
+print("LOCK", home_migration.move_lock_path(key, named=named))
+try:
+    with home_migration._one_at_a_time(key, named=named):
+        print("HELD yes")
+except home_migration.MigrationRefused as exc:
+    print("REFUSED", exc.reason)
+"""
+
+
+def _another_mover(tmp: Path) -> dict[str, str]:
+    """A second process moving this home, with ``tmp`` its temp folder, as each fleet agent
+    has its own (#57): what it found and whether it took the lock."""
+    env = {**os.environ, "TMPDIR": str(tmp), "TEMP": str(tmp), "TMP": str(tmp)}
+    result = subprocess.run(
+        [sys.executable, "-c", _ANOTHER_MOVER], capture_output=True, text=True, env=env, timeout=60
+    )
+    assert result.returncode == 0, result.stderr[-2000:]
+    return dict(line.split(" ", 1) for line in result.stdout.splitlines() if " " in line)
+
+
+def test_two_movers_with_different_temp_folders_still_take_one_lock(
+    user_home: Path, own_tmp: Path, tmp_path: Path
+) -> None:
+    """The manager's change to #62's plan: in the temp folder, two movers each given their own
+    (#57) locked two files and both ran. The lock is found the same way by every process: a
+    second mover with another temp folder is refused while the first holds it, and takes it
+    once it is let go."""
+    elsewhere = tmp_path / "another-tmp"
+    elsewhere.mkdir()
+    key, named = home_migration._move_lock_key()
+    lock = home_migration.move_lock_path(key, named=named)
+
+    with home_migration._one_at_a_time(key, named=named):
+        refused = _another_mover(elsewhere)
+    took = _another_mover(elsewhere)
+
+    assert Path(refused["TMP"]).resolve() == elsewhere.resolve() != own_tmp.resolve()
+    assert refused["LOCK"] == str(lock)
+    assert refused.get("REFUSED") == home_migration.ANOTHER_MOVE, refused
+    assert took.get("HELD") == "yes", took
+    assert _move_locks(user_home, own_tmp, elsewhere) == []
+
+
+@pytest.mark.skipif(
+    sys.platform == "win32", reason="Windows removes no open file: no lock is taken on one gone"
+)
+def test_a_lock_taken_on_the_file_its_holder_removed_is_taken_again(
+    user_home: Path, own_tmp: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The race removing a lock file brings: a mover opened it, its holder removed it as it let
+    go, and the mover then locked a file no other process can find. Held so, a third mover made
+    a new one and ran beside it. The mover sees the file gone and takes the one there now."""
+    key = str(user_home / paths.OLD_HOME_NAME)
+    lock = home_migration.move_lock_path(key, named=False)
+    real = home_migration.open_lock_file
+    gone: list[int] = []
+
+    def opened_before_its_holder_let_go(path: Path, **kwargs: Any) -> int:
+        fd = real(path, **kwargs)
+        if not gone:
+            os.unlink(path)  # its holder removes it as it lets go, after this opened it
+            gone.append(fd)
+        return fd
+
+    monkeypatch.setattr(home_migration, "open_lock_file", opened_before_its_holder_let_go)
+    with home_migration._one_at_a_time(key, named=False):
+        assert lock.is_file(), "the lock held is the file there now"
+        with (
+            pytest.raises(home_migration.MigrationRefused, match=home_migration.ANOTHER_MOVE),
+            home_migration._one_at_a_time(key, named=False),
+        ):
+            pass
+    assert len(gone) == 1 and not lock.exists()
+
+
+@pytest.mark.skipif(not can_deny_writes(), reason="this machine cannot deny a folder's writes")
+def test_a_home_in_a_folder_its_user_may_not_write_is_not_moved_and_says_where_its_lock_goes(
+    user_home: Path, keychain: FakeSecurity, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The lock has one place, beside the home, as a second place would be a second lock. A
+    home whose folder its user may not write is not moved, and the refusal names that place;
+    the home is as it was."""
+    folder = tmp_path / "shared"
+    folder.mkdir()
+    named = folder / "named-home"
+    make_old_home(tmp_path / "named-user").rename(named)
+    monkeypatch.setenv(paths.RLX_HOME_ENV, str(named))
+    lock = home_migration.move_lock_path(str(named), named=True)
+    assert lock.parent == Path(os.path.realpath(folder))
+
+    with unwritable(folder), pytest.raises(home_migration.MigrationRefused) as refused:
+        home_migration.move_home()
+
+    assert "its lock beside the home could not be taken" in refused.value.reason
+    assert str(lock) in refused.value.reason
+    assert not named.joinpath(*paths.MOVE_JOURNAL).exists(), "nothing began"
+    assert _move_locks(folder) == []
