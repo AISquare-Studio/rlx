@@ -18,7 +18,9 @@ frame read as the two-second tick reads it.
 from __future__ import annotations
 
 import gc
+import inspect
 import threading
+import types
 import weakref
 from pathlib import Path
 
@@ -288,6 +290,68 @@ def test_opening_a_stopped_agent_again_builds_its_view_as_it_was(
     assert seen["live again"] == ("%7", True), "the view built again finds its agent's pane"
 
 
+def holders(ref: weakref.ref[object], *, depth: int = 3, limit: int = 60) -> list[str]:
+    """What still holds ``ref``'s object, none when it is gone: each referrer's type and a short
+    repr, and what holds that, ``depth`` levels up. The GC test's message, so a leak names its
+    holder wherever it is found (Windows CI, review of #644)."""
+    target = ref()
+    if target is None:
+        return []
+    lines: list[str] = []
+    made: list[object] = [lines]
+    ignored = {id(lines), id(made), id(inspect.currentframe())}
+    # What the object holds itself (its styles, its __dict__'s values) points back at it: a
+    # cycle of its own, which the collector frees with it. Named, not followed.
+    own = {id(part) for part in gc.get_referents(target)}
+    own |= {
+        id(value)
+        for part in gc.get_referents(target)
+        if isinstance(part, dict)
+        for value in part.values()
+    }
+
+    def walk(node: object, level: int) -> None:
+        if level > depth or len(lines) >= limit:
+            return
+        found = gc.get_referrers(node)
+        made.append(found)
+        ignored.add(id(found))
+        here = inspect.currentframe()
+        ignored.add(id(here))
+        for holder in found:
+            if id(holder) in ignored:
+                continue
+            ignored.add(id(holder))
+            if level == 1 and id(holder) in own:
+                lines.append(f"(its own) {_described(holder)}")
+                continue
+            lines.append(f"{'  ' * (level - 1)}{_described(holder)}")
+            walk(holder, level + 1)
+
+    walk(target, 1)
+    del target
+    return lines
+
+
+def _described(holder: object) -> str:
+    """``holder``'s type, and a short repr that says which one it is."""
+    kind = f"{type(holder).__module__}.{type(holder).__qualname__}"
+    if isinstance(holder, types.FrameType):
+        code = holder.f_code
+        return f"{kind} {code.co_name} {Path(code.co_filename).name}:{holder.f_lineno}"
+    if isinstance(holder, dict):
+        return f"{kind} keys={[str(key)[:40] for key in list(holder)[:10]]}"
+    if isinstance(holder, (list, tuple, set, frozenset)):
+        return f"{kind} len={len(holder)} {[type(item).__name__ for item in list(holder)[:6]]}"
+    if isinstance(holder, (types.FunctionType, types.MethodType)):
+        return f"{kind} {getattr(holder, '__qualname__', '')}"
+    try:
+        text = repr(holder)
+    except Exception as exc:
+        text = f"<repr raised {exc!r}>"
+    return f"{kind} {text[:160]}"
+
+
 def test_a_removed_view_and_its_pane_are_freed(tmp_path: Path, script: Script) -> None:
     """The point of #43 is the memory: nothing keeps the view or its pane (and the rows its
     render cache holds) alive once removed — no screen selection, no control client, no
@@ -298,10 +362,13 @@ def test_a_removed_view_and_its_pane_are_freed(tmp_path: Path, script: Script) -
     out (measured: one 50 ms pause). A reference that lasts is a leak, and fails here."""
     two_projects(tmp_path, script, coder(0))
 
-    async def go(pilot: Pilot[None]) -> tuple[bool, bool, bool, bool]:
+    async def go(pilot: Pilot[None]) -> tuple[bool, list[str], list[str], bool]:
         app = fleet_app(pilot)
         view = await open_agent(app, coder(0))
-        refs = weakref.ref(view), weakref.ref(view.pane)
+        refs: tuple[weakref.ref[object], weakref.ref[object]] = (
+            weakref.ref(view),
+            weakref.ref(view.pane),
+        )
         mounted_before = all(ref() is not None for ref in refs)
         del view
         await leave_for(app, "prj_b")
@@ -313,12 +380,13 @@ def test_a_removed_view_and_its_pane_are_freed(tmp_path: Path, script: Script) -
             return all(ref() is None for ref in refs)
 
         await watch_until(freed, timeout=5.0)
-        return mounted_before, refs[0]() is None, refs[1]() is None, not mounted(app)
+        return mounted_before, holders(refs[0]), holders(refs[1]), not mounted(app)
 
-    before, view_freed, pane_freed, unmounted = drive(go)
+    before, view_held, pane_held, unmounted = drive(go)
     assert before and unmounted
-    assert view_freed, "the removed AgentView is still referenced"
-    assert pane_freed, "the removed TerminalPane is still referenced"
+    held = "the removed {} is still referenced by:\n{}"
+    assert not view_held, held.format("AgentView", "\n".join(view_held))
+    assert not pane_held, held.format("TerminalPane", "\n".join(pane_held))
 
 
 # --- the keyboard ----------------------------------------------------------------------------
