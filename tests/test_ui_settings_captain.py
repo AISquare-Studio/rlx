@@ -13,8 +13,10 @@ from __future__ import annotations
 import asyncio
 import threading
 from pathlib import Path
+from typing import Any
 
 import pytest
+from textual.app import App
 from textual.pilot import Pilot
 from textual.widgets import Checkbox, Input, Select, Static
 
@@ -59,7 +61,7 @@ async def _settings(pilot: Pilot[None]) -> CaptainToggle:
     app = fleet_app(pilot)
     await pilot.click(app.query_one(SettingsRow))
     await settle_page(app)
-    await pilot.click("#hub-captain")
+    await pilot.click("#hub-experimental")
     await settle_page(app)
     return app.query_one(CaptainToggle)
 
@@ -333,6 +335,27 @@ def test_start_captain_opens_the_spawn_dialog_with_the_captain_chosen(
 # --- the message box ------------------------------------------------------------------------
 
 
+Said = tuple[str, str, float | None]
+"""One toast as it was raised: its message, severity and timeout."""
+
+
+def _spy_on_toasts(app: App[Any]) -> list[Said]:
+    """Every ``app.notify`` call from now on, as it is made (#3682): a toast's timeout, 5 s,
+    can end before a starved runner reads ``app._notifications``, so what was said is kept at
+    the call. Each toast is still shown as before."""
+    said: list[Said] = []
+    notify = app.notify
+
+    def spy(message: str, **kwargs: Any) -> None:
+        said.append(
+            (str(message), str(kwargs.get("severity", "information")), kwargs.get("timeout"))
+        )
+        notify(message, **kwargs)
+
+    app.notify = spy  # type: ignore[method-assign]
+    return said
+
+
 async def _say(pilot: Pilot[None], line: str) -> tuple[list[str], str]:
     """Type ``line`` into the captain view's box and press Enter; what was said, and what the
     box holds once the send has answered."""
@@ -408,8 +431,9 @@ def test_a_tick_of_the_captain_box_is_taken_back_by_ctrl_z(
     file's captain back off, and the shell follows."""
     seed(tmp_path, ("prj_aaa", "alpha", "amber-otter"))
 
-    async def body(pilot: Pilot[None]) -> tuple[bool, bool, bool, bool, list[str]]:
+    async def body(pilot: Pilot[None]) -> tuple[bool, bool, bool, bool, list[Said]]:
         app = fleet_app(pilot)
+        said = _spy_on_toasts(app)
         await refreshed(app)
         toggle = await _settings(pilot)
         box = toggle.query_one("#captain-toggle", Checkbox)
@@ -419,10 +443,11 @@ def test_a_tick_of_the_captain_box_is_taken_back_by_ctrl_z(
         await pilot.press("ctrl+z")
         await settle_page(app)
         await refreshed(app)
-        toasts = [n.message for n in app._notifications]
-        return ticked, load_config().experimental.captain, box.value, app.captain_on, toasts
+        return ticked, load_config().experimental.captain, box.value, app.captain_on, said
 
-    ticked, undone, shown, shell, toasts = drive(body)
+    ticked, undone, shown, shell, said = drive(body)
     assert ticked is True
     assert (undone, shown, shell) == (False, False, False), "off on disk, on the box, the shell"
-    assert "Saved the captain: on · Undo: ctrl+z" in toasts, toasts
+    saved = [call for call in said if call[0] == "Saved the captain: on · Undo: ctrl+z"]
+    assert saved, said
+    assert all(severity == "information" for _, severity, _ in saved), said

@@ -193,9 +193,16 @@ class ExperimentalSettings(BaseModel):
     persona is absent and the voice page does not serve. ``AISQUARE_EXPERIMENTAL_CAPTAIN``
     wins over this field either way; ``core.experimental.captain_enabled`` is the one
     reader of both.
+
+    ``remote``: Remote, the fleet on a phone (#46). ``None`` until decided: read then as on
+    for a home where Remote was set up before it had a switch, else off
+    (``core.experimental.remote_enabled``, the one reader, with
+    ``AISQUARE_EXPERIMENTAL_REMOTE``). ``true`` and ``false`` are a choice made, kept by a
+    reset as ``[service]`` is, so an off is never turned back on behind the person's back.
     """
 
     captain: bool = False
+    remote: bool | None = None
 
 
 class RoleLaunchProfile(BaseModel):
@@ -1460,8 +1467,12 @@ def holds_a_setting(path: Path | None = None) -> bool:
         return True
     _migrate(data)
     # [service] is not a reset's to undo (``services.settings.reset_settings`` keeps it): a
-    # file that holds nothing else holds no setting a reset would undo.
+    # file that holds nothing else holds no setting a reset would undo. Nor is a decided
+    # [experimental] remote (#46), which a reset keeps too; a value that is no choice is.
     data.pop("service", None)
+    experimental = data.get("experimental")
+    if isinstance(experimental, dict) and isinstance(experimental.get("remote"), bool):
+        del experimental["remote"]
     return bool(_overrides(data, system_defaults()))
 
 
@@ -1921,7 +1932,9 @@ def reset_config(path: Path | None = None) -> Path | None:
     But ``[service]``, which the reset leaves in place (:func:`_kept_by_a_reset`): the
     person's choice about the rlx service's login item, not a setting of rlx's. Forgotten,
     the next ``rlx init`` would add back an item they had turned off (the manager's decision
-    on #33). The new file holds that table and ``config_version`` alone.
+    on #33). And ``[experimental] remote`` once decided, for the same reason: undecided again,
+    a home where Remote was set up would read as on, an off undone behind the person's back
+    (#46). The new file holds those and ``config_version`` alone.
     """
     target = path or paths.config_path()
     written = Path(os.path.realpath(target))
@@ -1941,26 +1954,34 @@ def reset_config(path: Path | None = None) -> Path | None:
         despite_windows_contention(lambda: shutil.copy2(written, backup))
         write_replacing(written, "", keep_mode=True)
     if kept is not None:
-        left = _KeptByAReset(service=ServiceSettings(start_at_login=kept))
-        body = tomli_w.dumps(left.model_dump(mode="json", exclude_none=True))
+        body = tomli_w.dumps(kept.model_dump(mode="json", exclude_none=True))
         write_replacing(written, body, keep_mode=True)
         with contextlib.suppress(OSError):  # the mode the user's file had, 0600 kept 0600
             written.chmod(stat.S_IMODE(backup.stat().st_mode))
     return backup
 
 
+class _KeptExperimental(BaseModel):
+    """What a reset leaves of ``[experimental]``: Remote's switch, once decided (#46)."""
+
+    remote: bool
+
+
 class _KeptByAReset(BaseModel):
-    """What a reset leaves in ``config.toml``: its version, and ``[service]``."""
+    """What a reset leaves in ``config.toml``: its version, ``[service]``, and
+    ``[experimental] remote``, each only when the file held it."""
 
     config_version: int = CONFIG_VERSION
-    service: ServiceSettings
+    service: ServiceSettings | None = None
+    experimental: _KeptExperimental | None = None
 
 
-def _kept_by_a_reset(written: Path) -> bool | None:
+def _kept_by_a_reset(written: Path) -> _KeptByAReset | None:
     """What of the file at ``written`` a reset leaves in place: its ``[service]`` table's
-    ``start_at_login``, when it holds one, read from its text when the file does not parse
-    (:func:`salvaged_start_at_login`): the reset rlx recommends for a broken file must not
-    lose an off (tester of #33, round 2)."""
+    ``start_at_login`` and its ``[experimental] remote``, when it holds them, read from its
+    text when the file does not parse (:func:`salvaged_start_at_login`,
+    :func:`salvaged_remote`): the reset rlx recommends for a broken file must not lose an off
+    (tester of #33, round 2). ``None`` when it holds neither."""
     try:
         raw = despite_windows_contention(written.read_bytes)
     except OSError:
@@ -1968,28 +1989,54 @@ def _kept_by_a_reset(written: Path) -> bool | None:
     try:
         data = _parse_toml(raw)
     except (tomllib.TOMLDecodeError, UnicodeDecodeError):
-        return salvaged_start_at_login(raw)
-    service = data.get("service")
-    if not isinstance(service, dict) or not isinstance(service.get("start_at_login"), bool):
+        login, remote = salvaged_start_at_login(raw), salvaged_remote(raw)
+    else:
+        login = _a_choice(data, "service", "start_at_login")
+        remote = _a_choice(data, "experimental", "remote")
+    if login is None and remote is None:
         return None
-    return bool(service["start_at_login"])
+    return _KeptByAReset(
+        service=None if login is None else ServiceSettings(start_at_login=login),
+        experimental=None if remote is None else _KeptExperimental(remote=remote),
+    )
+
+
+def _a_choice(data: dict[str, Any], table: str, key: str) -> bool | None:
+    """``[table] key`` of a parsed file when it is a ``true`` or ``false``, else ``None``."""
+    section = data.get(table)
+    if not isinstance(section, dict) or not isinstance(section.get(key), bool):
+        return None
+    return bool(section[key])
 
 
 _SERVICE_TABLE = re.compile(r"^\s*\[\s*service\s*\]\s*(?:#.*)?$")
+_EXPERIMENTAL_TABLE = re.compile(r"^\s*\[\s*experimental\s*\]\s*(?:#.*)?$")
 _A_TABLE = re.compile(r"^\s*\[")
 _START_AT_LOGIN = re.compile(r"^\s*start_at_login\s*=\s*(true|false)\s*(?:#.*)?$")
+_REMOTE = re.compile(r"^\s*remote\s*=\s*(true|false)\s*(?:#.*)?$")
 
 
 def salvaged_start_at_login(raw: bytes) -> bool | None:
     """``[service] start_at_login`` read line by line from a ``config.toml`` that does not parse
     as a whole (a syntax error elsewhere, bytes that are not UTF-8): ``None`` when it holds no
     such line. What a reset or ``init --reinit --yes`` of a broken file carries over."""
-    in_service = False
+    return _salvaged(raw, _SERVICE_TABLE, _START_AT_LOGIN)
+
+
+def salvaged_remote(raw: bytes) -> bool | None:
+    """``[experimental] remote`` read as :func:`salvaged_start_at_login` reads its line (#46)."""
+    return _salvaged(raw, _EXPERIMENTAL_TABLE, _REMOTE)
+
+
+def _salvaged(raw: bytes, table: re.Pattern[str], key: re.Pattern[str]) -> bool | None:
+    """The ``true`` or ``false`` of the first line matching ``key`` under the table header
+    matching ``table``, read line by line; ``None`` when there is none."""
+    inside = False
     for line in raw.decode("utf-8", errors="replace").splitlines():
-        if _SERVICE_TABLE.match(line):
-            in_service = True
+        if table.match(line):
+            inside = True
         elif _A_TABLE.match(line):
-            in_service = False
-        elif in_service and (found := _START_AT_LOGIN.match(line)):
+            inside = False
+        elif inside and (found := key.match(line)):
             return found.group(1) == "true"
     return None

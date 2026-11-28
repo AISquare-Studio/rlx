@@ -1747,6 +1747,22 @@ def captain_gate_off(request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyP
     monkeypatch.setattr(gate, "configured", lambda: False)
 
 
+@pytest.fixture(autouse=True)
+def remote_on(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The suite runs with Remote ON (``AISQUARE_EXPERIMENTAL_REMOTE=1``, #46): every Remote
+    pin was written while Remote was always there, and runs unchanged. Remote's switch has its
+    own pins (``tests/test_remote_flag.py``), which unset or set it themselves, or ask
+    :func:`remote_off`."""
+    monkeypatch.setenv(experimental.REMOTE_ENV, "1")
+
+
+@pytest.fixture
+def remote_off(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Remote OFF, as a fresh home has it: the variable set to ``0``, which wins over the
+    config and the home's state."""
+    monkeypatch.setenv(experimental.REMOTE_ENV, "0")
+
+
 @pytest.fixture
 def captain_off(monkeypatch: pytest.MonkeyPatch) -> None:
     """The experimental captain OFF, as it ships: for a test that pins what the shell shows by

@@ -5903,7 +5903,7 @@ def build_remote_app(
         )
         return response
 
-    async def remote(request: Request) -> Response:
+    async def remote_state_endpoint(request: Request) -> Response:
         return JSONResponse(runtime.remote_json())
 
     async def remote_extend_endpoint(
@@ -6514,7 +6514,7 @@ def build_remote_app(
     no_socket = _NoSuchSocket()
     api_routes = [
         Route("/api/unlock", unlock_endpoint, methods=["POST"]),
-        Route("/api/remote", remote, methods=["GET"]),
+        Route("/api/remote", remote_state_endpoint, methods=["GET"]),
         Route(
             "/api/projects",
             guarded("projects", lambda _project: reads.projects(), scoped=False),
