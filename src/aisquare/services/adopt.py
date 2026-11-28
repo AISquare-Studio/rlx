@@ -41,7 +41,7 @@ import os
 import re
 import subprocess
 import sys
-from collections.abc import Callable, Iterator, Sequence
+from collections.abc import Callable, Collection, Iterator, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -149,6 +149,13 @@ def _process_args() -> list[Process]:
         if len(fields) == 3 and fields[0].isdigit() and fields[1].isdigit():
             listed.append((int(fields[0]), int(fields[1]), fields[2]))
     return listed
+
+
+def process_args() -> list[Process]:
+    """Every process this user can see, ``(pid, parent pid, arguments)``: the one ``ps`` read
+    of this module (:func:`_process_args`), for a caller that reads a pane's processes as this
+    module does (``services.tmux_panes``)."""
+    return _process_args()
 
 
 def _ancestors(
@@ -478,11 +485,9 @@ def find(ref: str) -> tuple[AdoptableConversation, Path]:
     return _conversation(found, projects, None), found.path
 
 
-def adopt(ref: str, *, role: str = "coder", label: str | None = None) -> fleet_service.SpawnReceipt:
-    """Bring the conversation ``ref`` names under the fleet: a row on its project, resumed
-    by its own agent on its own account in its own directory, keeping its session."""
-    accounts = _known()
-    found = _find(ref, accounts)
+def _refuse_owned(found: _Found) -> list[ProjectInfo]:
+    """:class:`AdoptRefused` when a fleet row owns ``found``'s conversation, or did; else the
+    onboarded projects, read in the same store session."""
     board_id = found.board_id
     with store_session() as store:
         owner = store.fleet_agent_for_session(board_id)
@@ -497,17 +502,14 @@ def adopt(ref: str, *, role: str = "coder", label: str | None = None) -> fleet_s
         raise AdoptRefused(
             "owned_by_the_fleet", f"{found.native} is already {owner.label} in the fleet"
         )
-    holders = _Holders(accounts, None)
-    if (pid := holders.of(found.native, found.path, found.adapter)) is not None:
-        why = (
-            found.reader.server_note([prog.word(), "accounts", "run", str(found.account.slot)])
-            if holders.serving(pid)
-            else "quit it first, then adopt — two processes would write one conversation"
-        )
-        raise AdoptRefused(
-            "held", f"a live {found.adapter.label} (pid {pid}) still holds {found.native}: {why}"
-        )
-    conversation = _conversation(found, projects, None)
+    return projects
+
+
+def _onboarded(
+    found: _Found, conversation: AdoptableConversation, projects: Sequence[ProjectInfo]
+) -> ProjectInfo:
+    """The onboarded project ``conversation`` ran in; :class:`AdoptRefused` when no project
+    holds its folder (onboarding stays intentional)."""
     project = _project_for(conversation.cwd, projects)
     if project is None:
         where = conversation.cwd or "a directory its transcript does not record"
@@ -519,6 +521,38 @@ def adopt(ref: str, *, role: str = "coder", label: str | None = None) -> fleet_s
                 app=": add it as a project first",
             ),
         )
+    return project
+
+
+def _held_note(found: _Found, holders: _Holders, pid: int, quit_note: str) -> str:
+    """How the process ``pid`` that holds ``found`` lets it go: Codex's managed daemon's own way
+    (``AgentTranscript.server_note``, given the argv that runs an agent in its account), or
+    ``quit_note`` for any other holder, which quitting releases."""
+    if holders.serving(pid):
+        return found.reader.server_note([prog.word(), "accounts", "run", str(found.account.slot)])
+    return quit_note
+
+
+def adopt(ref: str, *, role: str = "coder", label: str | None = None) -> fleet_service.SpawnReceipt:
+    """Bring the conversation ``ref`` names under the fleet: a row on its project, resumed
+    by its own agent on its own account in its own directory, keeping its session."""
+    accounts = _known()
+    found = _find(ref, accounts)
+    board_id = found.board_id
+    projects = _refuse_owned(found)
+    holders = _Holders(accounts, None)
+    if (pid := holders.of(found.native, found.path, found.adapter)) is not None:
+        why = _held_note(
+            found,
+            holders,
+            pid,
+            "quit it first, then adopt — two processes would write one conversation",
+        )
+        raise AdoptRefused(
+            "held", f"a live {found.adapter.label} (pid {pid}) still holds {found.native}: {why}"
+        )
+    conversation = _conversation(found, projects, None)
+    project = _onboarded(found, conversation, projects)
     return fleet_service.spawn(
         project,
         role,
@@ -530,4 +564,132 @@ def adopt(ref: str, *, role: str = "coder", label: str | None = None) -> fleet_s
         resume=fleet_service.ResumeSpec(
             board_id, found.path, found.native if found.native != board_id else None
         ),
+    )
+
+
+# --- the agent in a tmux pane (Settings ▸ tmux, handoff E) ---------------------------------
+#
+# The tmux page adopts a Claude Code or Codex that runs in a window of rlx's tmux server which
+# no fleet row names (``services.tmux_panes``). Adopt refuses a held conversation, so the page
+# quits the agent in its pane first; and so that it never quits one it then cannot resume,
+# every refusal :func:`adopt` makes is asked before anything is quit (:func:`plan_pane`), and
+# :func:`adopt` asks them all again once it has.
+
+
+@dataclass(frozen=True)
+class PanePlan:
+    """What adopting the agent in a pane would do, found before anything is quit."""
+
+    conversation: AdoptableConversation
+    """The conversation the agent in the pane holds, as the picker lists one."""
+    project: ProjectInfo
+    """The onboarded project its folder is in: where it is adopted."""
+    transcript: Path
+    """Its transcript: what :func:`adopt` is handed, so no prefix of an id names another."""
+    holder: int
+    """The process in the pane that holds it: the one that has to quit first."""
+    agent_label: str
+    """Its agent, as prose names it (``Claude Code``)."""
+    exit_command: str
+    """What its agent quits at (``AgentAdapter.exit_command``)."""
+
+
+def _exact(named: str, accounts: Sequence[ClaudeAccount]) -> _Found | None:
+    """The conversation ``named`` is, its agent's whole id for it or its transcript's path,
+    among the known accounts' (an id's newest copy); ``None`` for none."""
+    if named.endswith(".jsonl"):
+        real = os.path.realpath(named)
+        return next(
+            (
+                each
+                for account in accounts
+                for each in _found_in(account)
+                if os.path.realpath(each.path) == real
+            ),
+            None,
+        )
+    matches = [each for account in accounts for each in _found_in(account) if each.native == named]
+    return max(matches, key=lambda each: _mtime(each.path), default=None)
+
+
+def _held_in(
+    pids: Collection[int], processes: Sequence[Process], accounts: Sequence[ClaudeAccount]
+) -> tuple[_Found, int] | None:
+    """The conversation one of ``pids`` (a pane's processes) holds, and which of them: what
+    :class:`_Holders` tells, read the other way round. Claude Code's registry first
+    (``sessions/<pid>.json`` names a pid's ``sessionId``), then a process's arguments
+    (``AgentAdapter.adoptable``), then a transcript a process of an agent whose writer holds
+    it open has open (``AgentTranscript.held_open``: a Codex started fresh names no thread)."""
+    wanted = set(pids)
+    for account in accounts:
+        with contextlib.suppress(OSError):
+            for entry in sorted((account.config_dir / "sessions").glob("*.json")):
+                with contextlib.suppress(OSError, ValueError):
+                    data = json.loads(entry.read_text(encoding="utf-8"))
+                    session, pid = data.get("sessionId"), data.get("pid")
+                    if (
+                        isinstance(session, str)
+                        and type(pid) is int
+                        and pid in wanted
+                        and (found := _exact(session, accounts)) is not None
+                    ):
+                        return found, pid
+    mine = [(pid, args.split()) for pid, _parent, args in processes if pid in wanted]
+    for pid, words in mine:
+        for each in adapters():
+            named = each.adoptable(words)
+            if named and (found := _exact(named, accounts)) is not None:
+                return found, pid
+    for pid, words in mine:
+        for each in adapters():
+            reader = each.transcript_reader
+            if reader is None or reader.held_open(words) is None:
+                continue
+            held = process_table.open_files([pid]) or frozenset()
+            for account in accounts:
+                for found in _found_in(account):
+                    if found.adapter.id == each.id and os.path.realpath(found.path) in held:
+                        return found, pid
+    return None
+
+
+def plan_pane(pids: Collection[int], *, processes: Sequence[Process] | None = None) -> PanePlan:
+    """What adopting the agent among ``pids`` (a pane's process and those below it) would do:
+    its conversation, the project it goes into and the process that holds it.
+
+    :class:`AdoptRefused` for each reason :func:`adopt` would refuse it once that process has
+    quit, so nothing is quit for a conversation that would not then be resumed: none found, a
+    fleet row's, held by a process outside the pane as well, or run in a folder no onboarded
+    project holds."""
+    accounts = _known()
+    listed = _process_args() if processes is None else list(processes)
+    held = _held_in(pids, listed, accounts)
+    if held is None:
+        raise AdoptRefused(
+            "no_conversation",
+            "no conversation of its agent's was found under the accounts rlx knows: one that "
+            "has not been written to yet has nothing to resume",
+        )
+    found, holder = held
+    projects = _refuse_owned(found)
+    holders = _Holders(accounts, listed)
+    pid = holders.of(found.native, found.path, found.adapter)
+    if pid is not None and pid not in pids:
+        why = _held_note(
+            found, holders, pid, "quit it first — two processes would write one conversation"
+        )
+        raise AdoptRefused(
+            "held",
+            f"a live {found.adapter.label} outside this pane (pid {pid}) holds "
+            f"{found.native} too: {why}",
+        )
+    conversation = _conversation(found, projects, holder)
+    project = _onboarded(found, conversation, projects)
+    return PanePlan(
+        conversation=conversation,
+        project=project,
+        transcript=found.path,
+        holder=holder,
+        agent_label=found.adapter.label,
+        exit_command=found.adapter.exit_command,
     )

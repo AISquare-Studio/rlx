@@ -14,6 +14,7 @@ from collections.abc import Callable, Collection, Container, Iterable, Mapping, 
 from datetime import UTC, datetime, timedelta
 from importlib import metadata
 from pathlib import Path, PurePath
+from typing import TYPE_CHECKING
 from urllib.parse import urlsplit
 
 from aisquare.core import agents as agent_core
@@ -76,6 +77,10 @@ from aisquare.services import fleet as fleet_service
 from aisquare.services import project as project_service
 from aisquare.services import settings as settings_service
 from aisquare.services import team as team_service
+from aisquare.services.onboarding import BROWSER_TOOLS_ARGV
+
+if TYPE_CHECKING:
+    from aisquare.services.tidy import DiskUse
 
 
 def status() -> StatusReport:
@@ -164,6 +169,8 @@ def doctor(*, live: bool = False, cwd: Path | None = None) -> list[DoctorCheck]:
             _check_provenance(),
             _check_home(),
             _check_home_filesystem(),
+            # Only for a home from before 0.10.2 that no upgrade has moved yet (#31).
+            *_optional(_check_home_layout()),
             _check_config(),
             _check_database(),
             _check_claude_code(cwd),
@@ -172,6 +179,7 @@ def doctor(*, live: bool = False, cwd: Path | None = None) -> list[DoctorCheck]:
             *_claude_accounts_checks(),
             *_shared_number_checks(),
             *_other_accounts_checks(),
+            *_optional(_check_statusline()),
             *_optional(_undeclared_share_check()),
             *_check_role_bindings(),
             _check_tmux(),
@@ -210,12 +218,15 @@ def doctor(*, live: bool = False, cwd: Path | None = None) -> list[DoctorCheck]:
             # Can warn (memory below the floor, pressure at warn), so it waits with the late rows.
             _check_fleet_capacity(),
             _check_watcher(),
+            # Beside the watcher, whose periodic tidy frees what it counts (#60). Late: it warns
+            # at 1 GB to free, which never pushes an urgent row out of the sidebar's first three.
+            _check_disk(),
             # Warns when two asqs, or an asq and this aisquare, run different releases (#20), so
             # it waits with the late rows.
             _check_instances(),
-            # Only while the experimental captain is off: one ok row saying how to turn it
-            # on. On, doctor is as it was before the switch.
-            *_optional(_captain_check()),
+            # The experimental switches, captain and Remote (#46): one ok row, and how to
+            # turn one on while it is off.
+            _experimental_check(),
             # A stale ANTHROPIC_BASE_URL kills a launch whether or not tracing or the team is on
             # (#51), so it is a machine check of its own, and not part of explainability's
             # section.
@@ -410,8 +421,10 @@ def _live_only(live: bool, check: Callable[[], DoctorCheck | None]) -> list[Doct
     return [found] if found is not None else []
 
 
-def _ok(name: str, detail: str) -> DoctorCheck:
-    return DoctorCheck(name=name, status=CheckStatus.ok, detail=detail)
+def _ok(name: str, detail: str, *, offer: str | None = None) -> DoctorCheck:
+    """A passing row; ``offer`` is an optional improvement asq's Doctor makes a quiet button
+    of (``DoctorCheck.offer``, #15), never a problem."""
+    return DoctorCheck(name=name, status=CheckStatus.ok, detail=detail, offer=offer)
 
 
 def _warn(name: str, detail: str, fix: str, *, ui_fix: str | None = None) -> DoctorCheck:
@@ -696,12 +709,46 @@ def _config_file_kind() -> str:
         return "unreadable"
 
 
+HOME_LAYOUT_UI_FIX = "Move it with ⬆ Move rlx's home in the sidebar, once nothing runs on it"
+"""The home-layout row's fix in asq, which names no command (R13): the update row's own action
+(``cli.ui.sidebar.HOME_MOVE_ROW``), which hands off to the one-click upgrade."""
+
+
+def _check_home_layout() -> DoctorCheck | None:
+    """A home laid out before 0.10.2 that the move has not moved yet (#31): ``rlx upgrade`` moves
+    it, on the release that runs too (an upgrade from 0.10.1 is 0.10.1's code, which cannot). A
+    warning, never a failure: the old home works as it is. ``None`` for a home in the new
+    layout. Reads only (``lifecycle.planned_home_move``)."""
+    from aisquare.services import lifecycle
+
+    try:
+        move, refusal = lifecycle.planned_home_move()
+    except Exception:
+        return None
+    if refusal is not None:
+        return _warn(
+            "home-layout",
+            f"laid out before 0.10.2, and it cannot be moved as it stands: {refusal}",
+            f"Move what is in the way aside, then run `{prog.word()} upgrade`",
+            ui_fix="Move what is in the way aside, then use ⬆ Move rlx's home in the sidebar",
+        )
+    if move is None:
+        return None
+    return _warn(
+        "home-layout",
+        f"laid out before 0.10.2 ({move})"
+        + prog.detail_advice(f": `{prog.word()} upgrade` moves it, once nothing runs on it"),
+        f"Move it: `{prog.word()} upgrade` (run it again if it installed a release)",
+        ui_fix=HOME_LAYOUT_UI_FIX,
+    )
+
+
 def _check_home_filesystem() -> DoctorCheck:
     """Say out loud which filesystem the config lives on.
 
     ``save_config`` publishes changes with write-temp/fsync/rename/fsync-parent,
     and the atomicity of that rename is a property of the FILESYSTEM. It was
-    measured on a native disk, which is where the default ``~/.aisquare`` sits.
+    measured on a native disk, which is where the default ``~/.rlx`` sits.
     ``AISQUARE_HOME`` is taken verbatim, so a Windows-backed path is one export
     away — and until now nothing in the code could tell an operator which kind of
     path they were on.
@@ -2947,8 +2994,7 @@ def _check_fleet_terminal(
     """What an agent pane's keys have to cross (#147): the outer terminal, tmux, the server.
 
     Three facts an operator otherwise learns one broken chord at a time: whether
-    the terminal this shell runs in speaks the kitty keyboard protocol (without
-    it shift+enter arrives as enter and the UI never fakes it), whether the tmux
+    the terminal this shell runs in speaks the kitty keyboard protocol, whether the tmux
     the keys cross carries extended keys (3.5+; below it shift+enter travels as
     ``C-j``, the same newline to Claude Code; the running server's version, which
     an in-place upgrade leaves older than the binary here, else the binary's),
@@ -2957,6 +3003,9 @@ def _check_fleet_terminal(
     pre-#147 conf keeps ``C-b``, Claude Code's background-tasks chord, in
     ``fleet attach``) and which of the desktop variables it holds stale (each new
     spawn carries this shell's, agents already running keep the server's).
+
+    The outer terminal's keyboard protocol determines whether Shift+Enter reaches the pane
+    as a distinct key. Ctrl+J adds a line in Claude Code and Codex.
 
     ``ok`` for everything but the stale prefix, which only a server restart
     fixes and which eats a documented Claude Code key.
@@ -2971,11 +3020,11 @@ def _check_fleet_terminal(
             )
         elif kitty is False:
             outer = (
-                f"outer terminal {terminal} (no kitty keyboard protocol: shift+enter arrives as "
-                "enter — `\\` then Enter, or ctrl+j, is the newline)"
+                f"outer terminal {terminal} (no kitty keyboard protocol, shift+enter arrives as "
+                "enter. Use ctrl+j for a newline)"
             )
         else:
-            outer = f"outer terminal {terminal} (protocol unknown: try shift+enter in a pane)"
+            outer = f"outer terminal {terminal} (protocol unknown, use ctrl+j for a newline)"
         if env.get("TMUX"):
             outer += "; this shell is itself inside tmux, which adds its own translation"
         if server is None and _uncreated_home(name) is not None:
@@ -3016,7 +3065,13 @@ def _check_fleet_terminal(
                 "shell's values; agents already running keep the server's)"
             )
         if prefix and prefix != "None":
-            parts.append(f"the running server still has prefix {prefix}")
+            parts.append(
+                prog.detail_advice(
+                    f"the running server still has prefix {prefix}",
+                    app=f"rlx's agent server still runs with an old setting that keeps {prefix} "
+                    "from the agent",
+                )
+            )
             return _warn(
                 name,
                 "; ".join(parts),
@@ -3026,9 +3081,9 @@ def _check_fleet_terminal(
                 f"{fleet_service.settings().tmux_socket} kill-server",
             )
         parts.append(
-            "server prefix None (every key reaches the agent"
-            + prog.detail_advice(
-                " in fleet attach; F12 detaches)", app=" in its pane; F12 returns to the sidebar)"
+            prog.detail_advice(
+                "server prefix None (every key reaches the agent in fleet attach; F12 detaches)",
+                app="every key you type reaches the agent in its pane (F12 returns to the sidebar)",
             )
         )
         return _ok(name, "; ".join(parts))
@@ -3141,9 +3196,124 @@ def _check_watcher() -> DoctorCheck:
         return _warn(
             name,
             f"running (pid {found.pid}), {looked}",
-            f"{prog.word()} watch --stop, then {prog.word()} watch --detach",
+            f"{prog.word()} watch --stop; then {prog.word()} watch --detach",
         )
     return _ok(name, f"running (pid {found.pid}), {looked}")
+
+
+def _check_disk() -> DoctorCheck:
+    """``disk`` (#60, the owner's disk tidy, item 4): what rlx's folders take (the agents'
+    worktrees, the build output in them, the sessions' temp) and what tidy would free. Warns at
+    ``tidy.RECEIPT_BYTES`` (1 GB) to free, or at a folder it cannot read. One look, within
+    ``tidy.DISK_BUDGET_S``, per Doctor run (``tidy.disk_use``): the last periodic pass's stamp
+    while fresh, else a dry run; past the budget each size is a lower bound. It never frees:
+    the fix is ``tidy``'s, or the watcher's (R13: in asq, rlx's own words, never a command).
+    asq runs the Doctor on a worker, never on its UI thread."""
+    name = "disk"
+    try:
+        if (uncreated := _uncreated_home(name)) is not None:
+            return uncreated
+        from aisquare.services import tidy
+        from aisquare.services import watch as watch_service
+
+        use = tidy.disk_use()
+        every = tidy._settings().every_minutes
+        watching = watch_service.watch_status().pid is not None
+    except Exception as exc:  # diagnostics must never crash
+        return _ok(name, f"not evaluated ({exc})")
+    detail = _disk_detail(use)
+    named = ", ".join(str(root) for root in use.unreadable)
+    if named:
+        detail += f"; {named} could not be read, so nothing in it was measured"
+    to_free = use.would_free >= tidy.RECEIPT_BYTES
+    if not (named or to_free):
+        return _ok(name, detail)
+    unread = [f"make {named} readable by you: nothing in it is measured or freed"] if named else []
+    return _warn(
+        name,
+        detail,
+        "; ".join(
+            [
+                *unread,
+                *(
+                    [
+                        f"{prog.word()} tidy"
+                        if tidy.DELETES
+                        else f"{prog.word()} tidy in WSL, where the fleet runs: on native "
+                        "Windows it only reports"
+                    ]
+                    if to_free
+                    else []
+                ),
+            ]
+        ),
+        ui_fix="; ".join(
+            [
+                *(f"{way[0].upper()}{way[1:]}" for way in unread),
+                *([_disk_way_in_app(every, watching, deletes=tidy.DELETES)] if to_free else []),
+            ]
+        ),
+    )
+
+
+def _disk_detail(use: DiskUse) -> str:
+    """``disk``'s detail: the sizes, "at least" where the look ran out of time, and what tidy
+    would free, now or as of the last pass (local time). A size the look never reached is
+    said so, never as "at least 0 B" (reviewer #4085, NIT 1)."""
+    from aisquare.services.tidy import size_text
+
+    def amount(count: int, whole: bool) -> str:
+        return size_text(count) if whole else f"at least {size_text(count)}"
+
+    whole, trees = use.use_whole, use.trees_whole
+    if not (trees or use.worktrees):
+        sizes = "rlx's folders: not reached in time"
+    else:
+        head = (
+            f"rlx's folders take {amount(use.total, whole)}"
+            if whole or use.total
+            else "rlx's folders"
+        )
+        caches = (
+            f" (build caches {amount(use.build_caches, trees)} of it)"
+            if trees or use.build_caches
+            else ""
+        )
+        temp = (
+            amount(use.session_temp, whole) if whole or use.session_temp else "not reached in time"
+        )
+        sizes = (
+            f"{head}: worktrees {amount(use.worktrees, trees)}{caches}, session and agent temp "
+            f"{temp}"
+        )
+    free = (
+        f"tidy would free {amount(use.would_free, use.free_whole)}"
+        if use.free_whole or use.would_free
+        else "what tidy would free was not reached in time"
+    )
+    said = f"{sizes}; {free}"
+    if use.as_of_said is not None:  # tidy's to say: no clock is spelt here (#152)
+        said += f" as of its last pass {use.as_of_said}, which freed {size_text(use.freed_then)}"
+    return said
+
+
+def _disk_way_in_app(every: float, watching: bool, *, deletes: bool) -> str:
+    """What asq says under a ``disk`` row with GBs to free (R13, manager #3817): rlx's own
+    way, never a command. Native Windows only reports; the watcher's periodic tidy frees it,
+    while it runs and is on."""
+    if not deletes:
+        return "rlx only reports this here: on native Windows it frees nothing"
+    if every <= 0:
+        return "rlx's own tidy is off in its settings, so nothing frees it by itself"
+    if not watching:
+        return "The fleet watcher isn't running, so rlx doesn't free it by itself"
+    if every == 60:
+        within = "within the hour"
+    elif every > 60 and every % 60 == 0:
+        within = f"within {every / 60:g} hours"
+    else:
+        within = f"within {every:g} minutes"
+    return f"rlx frees it by itself {within}"
 
 
 def _check_instances() -> DoctorCheck:
@@ -3257,7 +3427,7 @@ def _check_fleet_server_env(
         # The home of an agent whose tool shell started the server is that spawner's too.
         watched = (*TEAM_ENV_VARS, *agent_identity_env_vars(), *tool_shell_homes(held))
         pinned = {var: held[var] for var in watched if var in held}
-        where = f"the fleet server (-L {srv.socket})"
+        where = prog.detail_advice(f"the fleet server (-L {srv.socket})", app="rlx's agent server")
         if not pinned:
             return _ok(name, f"{where} pins no team variable and no agent's process identity")
         wanted = list(boards) if boards is not None else _fleet_boards(srv.socket, cwd)
@@ -3661,21 +3831,99 @@ def _check_browser_tools(cwd: Path | None = None) -> DoctorCheck:
             f"{', '.join(dict.fromkeys(declared))} declared — the ui-tester can measure; "
             f"{chrome_note}",
         )
-    return _ok(
-        name,
+    detail = (
         f"no browser MCP/plugin declared in {len(dirs)} config dir(s) or {_short_path(mcp_json)}; "
         f"{chrome_note}. Without one the ui-tester reopens UI tasks as 'not browser-verified' "
         "rather than passing them on code alone — "
         # In the app, the same advice without the shell's command (review of #542).
         + prog.detail_advice(
             "add the Chrome DevTools MCP with "
-            "`claude mcp add -s user chrome-devtools npx chrome-devtools-mcp@latest` (what "
+            f"`{BROWSER_TOOLS_ADD}` (what "
             "install.sh --with chrome-devtools runs), or install the "
             "Claude in Chrome extension (claude.ai/chrome)",
             "add the Chrome DevTools MCP to Claude Code, or install the Claude in Chrome "
             "extension (claude.ai/chrome)",
-        ),
+        )
     )
+    # OK, with the add as a quiet offer (#15). A warning, the add its fix, only while a
+    # ui-tester is wanted: one running, or the role in the person's own config. A fresh
+    # install has neither, so install.sh's amber set (the docstring) never meets it.
+    if _ui_tester_wanted():
+        return _warn(
+            name, detail, f"Add the Chrome DevTools MCP to Claude Code: {BROWSER_TOOLS_ADD}"
+        )
+    return _ok(name, detail, offer=BROWSER_TOOLS_ADD)
+
+
+BROWSER_TOOLS_ADD = " ".join(BROWSER_TOOLS_ARGV)
+"""What the browser-tools row offers (#15): the Chrome DevTools MCP, as install.sh adds it,
+in its adapter's words (``onboarding.BROWSER_TOOLS_ARGV``), which its pane fix matches whole."""
+
+
+def _ui_tester_wanted() -> bool:
+    """Whether a ui-tester is wanted here: one runs on the fleet, or the person set the role
+    up themselves (:func:`_ui_tester_set_up`). Read-only, and no for anything that cannot be
+    read; each read on its own, so a store that will not open still has the config asked
+    (the tester of #15, round 3)."""
+    return _ui_tester_running() or _ui_tester_set_up()
+
+
+def _ui_tester_running() -> bool:
+    """A live fleet row in a ui-tester's seat, numbered or not (``ui-tester2``): a launch
+    stores the seat as given, so it is read by its role (``harness.base_role``)."""
+    try:
+        if not paths.db_path().exists():
+            return False
+        with store_session() as store:
+            return any(
+                harness.base_role(agent.role or "") == "ui-tester"
+                for agent in store.live_fleet_agents()
+            )
+    except Exception:
+        return False
+
+
+def _ui_tester_set_up() -> bool:
+    """The role in the person's own ``config.toml``: its ``[fleet.roles.ui-tester]`` table
+    other than the built-in one, or a ``[team.profiles.<seat>]`` of a ui-tester's that binds
+    anything: how it launches (``team bind ui-tester --bin …``) or only its account (``team
+    bind ui-tester --account 1``, ``accounts default 1 --role ui-tester``, App settings' role
+    row; the tester of #15, round 4). Hub #429: a team profile that names a ui-tester.
+
+    The fleet's table alone is not enough: ``save_config`` writes every role's table whole
+    (``config._with_whole_role_tables``), so any setting saved writes the default one too
+    (the reviewer of #15). Team profiles are written as set, none by default."""
+    import tomllib
+
+    from aisquare.core.config import FleetRoleSettings, RoleLaunchProfile, _default_fleet_roles
+
+    try:
+        own = tomllib.loads(paths.config_path().read_text(encoding="utf-8"))
+    except Exception:
+        return False
+    fleet = own.get("fleet")
+    roles = fleet.get("roles") if isinstance(fleet, dict) else None
+    table = roles.get("ui-tester") if isinstance(roles, dict) else None
+    if isinstance(table, dict):
+        try:
+            if FleetRoleSettings.model_validate(table) != _default_fleet_roles()["ui-tester"]:
+                return True
+        except Exception:
+            pass  # a table that does not load is the config row's to report
+    team = own.get("team")
+    profiles = team.get("profiles") if isinstance(team, dict) else None
+    if not isinstance(profiles, dict):
+        return False
+    for seat, profile in profiles.items():
+        if harness.base_role(str(seat)) != "ui-tester" or not isinstance(profile, dict):
+            continue
+        try:
+            bound = RoleLaunchProfile.model_validate(profile)
+        except Exception:
+            continue
+        if bound.carries_launch or bound.account:
+            return True
+    return False
 
 
 def _agents_own_browser(cwd: Path) -> DoctorCheck | None:
@@ -3761,6 +4009,36 @@ def _short_path(path: PurePath, home: PurePath | None = None) -> str:
         return str(path)
 
 
+STATUSLINE_INSTALL = ("accounts", "statusline", "--install")
+"""What the status line row offers (#15): ``asq-statusline`` where an account has none."""
+GH_SIGN_IN = "gh auth login"
+"""What the gh row offers while no sign-in is visible (#15): GitHub CLI's own sign-in."""
+
+
+def _check_statusline() -> DoctorCheck | None:
+    """``status line``: Claude Code's ``asq-statusline`` on each account, which is opt-in
+    (#287). Where some account has no status line, an OK row with a quiet offer to install
+    it (#15, the hub's decision): never a problem, and nothing when every account has one,
+    none does a status line, or the accounts cannot be read."""
+    try:
+        if not paths.db_path().exists():  # a doctor run creates nothing
+            return None
+        sites = claude_accounts_service.statusline_sites(action="status")
+    except Exception:
+        return None
+    off = [site for site in sites if site.state == "none"]
+    if not off:
+        return None
+    command = prog.words(*STATUSLINE_INSTALL)
+    return _ok(
+        "status line",
+        f"off on {len(off)} account(s): Claude Code's status line can show each account's use "
+        "and the session's context"
+        + prog.detail_advice(f"; `{command}` sets it", app=" (optional)"),
+        offer=command,
+    )
+
+
 def _check_gh() -> DoctorCheck:
     """GitHub CLI: the fleet's coder and reviewer open and review PRs through it (§3.5)."""
     name = "gh"
@@ -3775,7 +4053,12 @@ def _check_gh() -> DoctorCheck:
                 ui_fix=f"Install GitHub CLI and sign in to it as {GH_INSTALL_PAGE} says, then "
                 "re-run the checks",
             )
-        return _ok(name, f"gh at {found} — PR flow available{_gh_login_note()}")
+        note = _gh_login_note()
+        # Signed out stays OK (an earlier decision, pinned in test_doctor_fleet): the sign-in
+        # is a quiet offer, a pane in asq (#15).
+        return _ok(
+            name, f"gh at {found} — PR flow available{note}", offer=GH_SIGN_IN if note else None
+        )
     except Exception as exc:  # diagnostics must never crash
         # The last check in this file without the guard every sibling has, and
         # the gap was reachable: see _gh_login_note. Failing open costs this
@@ -3828,22 +4111,40 @@ def _check_code_index(cwd: Path | None = None) -> DoctorCheck:
     return _ok(name, detail)
 
 
-def _captain_check() -> DoctorCheck | None:
-    """``captain: off (experimental)`` while the switch is off; ``None`` while it is on.
+def _experimental_check() -> DoctorCheck:
+    """``experimental: captain off, remote on``: both switches of Settings' *Experimental*
+    (#46), each with what decides it when that is not the config alone.
 
-    Ok, not a warning: off is the shipped state (``core.experimental``), and the row
-    is there to say how to turn it on.
+    Ok either way: off is how each ships (``core.experimental``). While one is off, the row
+    says how to turn it on: by command at a shell, by Settings in rlx (R13).
     """
-    if experimental.captain_enabled():
-        return None
-    return _ok(
-        "captain",
-        "off (experimental)"
-        + prog.detail_advice(
-            f" — turn it on with: {prog.word()} config set experimental.captain true "
-            f"(or {experimental.CAPTAIN_ENV}=1)"
-        ),
+    captain = experimental.captain_enabled()
+    remote = experimental.remote_enabled()
+    detail = (
+        f"captain {_switch_state(captain, experimental.captain_forced(), experimental.CAPTAIN_ENV)}"
+        f", remote {_switch_state(remote, experimental.remote_forced(), experimental.REMOTE_ENV)}"
     )
+    if remote and experimental.remote_forced() is None and _remote_undecided():
+        detail += " (set up before it had a switch)"
+    if not (captain and remote):
+        names = [name for name, on in (("captain", captain), ("remote", remote)) if not on]
+        detail += prog.detail_advice(
+            " — turn one on with: "
+            + " or ".join(f"{prog.word()} config set experimental.{name} true" for name in names),
+            app=" — turn one on in Settings > App settings > Experimental",
+        )
+    return _ok("experimental", detail)
+
+
+def _switch_state(on: bool, forced: bool | None, variable: str) -> str:
+    return ("on" if on else "off") + (f" ({variable})" if forced is not None else "")
+
+
+def _remote_undecided() -> bool:
+    try:
+        return load_config(copy=False).experimental.remote is None
+    except Exception:  # doctor's config row says why
+        return False
 
 
 def last_injection() -> InjectionRecord | None:
@@ -4016,7 +4317,7 @@ def _fleet_conf() -> Path:
     the path up front skips both. tmux only reads ``-f`` when it STARTS a
     server, and nothing here starts one, so a missing file costs nothing.
     """
-    return paths.aisquare_home() / tmux_core.CONF_NAME
+    return paths.tmux_conf_path()
 
 
 def _fleet_server(socket: str) -> tmux_core.TmuxServer:
@@ -4244,10 +4545,15 @@ def _check_fleet(
                 if taken:
                     unreached.extend(taken)
                     problems.append(
-                        f"{len(taken)} recorded live but another tmux server answers on the "
-                        f"socket of the private tmux server '{sock}', not the one "
-                        f"{'it was' if len(taken) == 1 else 'they were'} started on, which may "
-                        f"still be running: {_fleet_labels(taken, names)}"
+                        prog.detail_advice(
+                            f"{len(taken)} recorded live but another tmux server answers on the "
+                            f"socket of the private tmux server '{sock}', not the one "
+                            f"{'it was' if len(taken) == 1 else 'they were'} started on, which "
+                            f"may still be running: {_fleet_labels(taken, names)}",
+                            app=f"{len(taken)} recorded running, but another program now answers "
+                            "in place of rlx's agent server, which may still be running: "
+                            f"{_fleet_labels(taken, names)}",
+                        )
                     )
             elif servers[sock].server_absent():
                 # tmux itself says there is no server — the one case reap's
@@ -4275,24 +4581,36 @@ def _check_fleet(
                 if down:
                     server_down = True
                     problems.append(
-                        f"{len(down)} recorded live but the private tmux server "
-                        f"'{sock}' is not running: {_fleet_labels(down, names)}"
+                        prog.detail_advice(
+                            f"{len(down)} recorded live but the private tmux server "
+                            f"'{sock}' is not running: {_fleet_labels(down, names)}",
+                            app=f"{len(down)} recorded running, but rlx's agent server is not "
+                            f"running: {_fleet_labels(down, names)}",
+                        )
                     )
                 if held:
                     unreached.extend(held)
                     problems.append(
-                        f"{len(held)} recorded live but no tmux client reaches the private "
-                        f"tmux server '{sock}', as its socket file is gone or could not be "
-                        f"asked, and it may still be running: {_fleet_labels(held, names)}"
+                        prog.detail_advice(
+                            f"{len(held)} recorded live but no tmux client reaches the private "
+                            f"tmux server '{sock}', as its socket file is gone or could not be "
+                            f"asked, and it may still be running: {_fleet_labels(held, names)}",
+                            app=f"{len(held)} recorded running, but rlx cannot reach its agent "
+                            f"server, which may still be running: {_fleet_labels(held, names)}",
+                        )
                     )
             else:
                 # Silent but not absent: a protocol mismatch after a tmux upgrade,
                 # a wedged server, a socket under another TMUX_TMPDIR. The agents
                 # may well be alive; nothing here should vouch otherwise.
                 problems.append(
-                    f"{len(agents)} recorded live but the private tmux server '{sock}' "
-                    f"does not answer (not a missing server — a version mismatch or a "
-                    f"different TMUX_TMPDIR?): {listed}"
+                    prog.detail_advice(
+                        f"{len(agents)} recorded live but the private tmux server '{sock}' "
+                        f"does not answer (not a missing server — a version mismatch or a "
+                        f"different TMUX_TMPDIR?): {listed}",
+                        app=f"{len(agents)} recorded running, but rlx's agent server does not "
+                        f"answer (it may be running after a tmux update): {listed}",
+                    )
                 )
         if exited:
             problems.append(
@@ -4329,16 +4647,28 @@ def _check_fleet(
         if live:
             return _ok(
                 name,
-                f"{len(live)} live agent(s) across {len(sessions)} session(s) on the private "
-                f"tmux server '{today}'",
+                prog.detail_advice(
+                    f"{len(live)} live agent(s) across {len(sessions)} session(s) on the private "
+                    f"tmux server '{today}'",
+                    app=f"{len(live)} agent(s) running in {len(sessions)} project(s)",
+                ),
             )
         if sessions:
             return _ok(
                 name,
-                f"private tmux server '{today}' running with {len(sessions)} session(s); "
-                "no agents recorded live",
+                prog.detail_advice(
+                    f"private tmux server '{today}' running with {len(sessions)} session(s); "
+                    "no agents recorded live",
+                    app="rlx's agent server is running; no agent is",
+                ),
             )
-        return _ok(name, f"no fleet agents; the private tmux server '{today}' is not running")
+        return _ok(
+            name,
+            prog.detail_advice(
+                f"no fleet agents; the private tmux server '{today}' is not running",
+                app="no agents running",
+            ),
+        )
     except Exception as exc:  # diagnostics must never crash
         # A store that will not open is the database check's verdict. Failing
         # open here costs the stale-row report — a label can stay taken and a

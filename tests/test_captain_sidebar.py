@@ -30,7 +30,7 @@ from tests import test_ui_shell as ui_suite
 from tests import toast_log
 from tests.fleet_fakes import list_agents_as
 from tests.test_ui_shell import Script, drive, fleet_app, refreshed, row_for, seed, shown, status
-from tests.ui_workers import settle_until
+from tests.ui_workers import pause_until, settle_until
 
 # The UI suite's fixtures, bound here so pytest finds them for this module's tests
 # (``no_real_tmux`` is autouse there: every tmux call held to a private socket).
@@ -46,13 +46,10 @@ async def until(pilot: Pilot[None], done: Callable[[], bool], *, what: str) -> N
     Windows CI ``pilot.pause()`` returned between the two halves (its idle wait
     rides a coarse timer): the test body ended, and the rest of the handler ran
     during teardown — ``NoMatches`` for the Doctor section (#219, 77ed31cb, job
-    108064714234). So a test waits for the handler's LAST effect, not for a pause.
+    108064714234). So a test waits for the handler's LAST effect, not for a pause, and for so
+    many seconds of the wall clock, not a count of pauses (``pause_until``, #67).
     """
-    for _ in range(200):
-        if done():
-            return
-        await pilot.pause(0.02)
-    raise AssertionError(f"the UI never settled: {what}")
+    await pause_until(pilot, done, what=f"the UI to settle: {what}")
 
 
 async def quiet(pilot: Pilot[None]) -> None:
@@ -116,7 +113,7 @@ def test_the_captain_row_keeps_its_session_figure_beside_its_persona(
     script: Script,
 ) -> None:
     """Review of #267's merge, M-F1: the captain always runs as its persona, so its row read
-    ``🤖 captain       ⏸ #1·42…`` at the default width — the badge pushed the figure under
+    ``🤖 captain       ◦ #1·42…`` at the default width — the badge pushed the figure under
     the row's ellipsis. The chip and ``#<slot>·<pct>%`` stay whole and the badge shows."""
     seed(tmp_path, ("prj_aaa", "alpha", "amber-otter"))
     home = captain_state.home_project()
@@ -132,7 +129,7 @@ def test_the_captain_row_keeps_its_session_figure_beside_its_persona(
 
     row = drive(body, headroom=ui_suite.session_use((1, 42.0)))
     assert row.startswith("🤖 captain"), row
-    assert "⏸ #1·42% · ca" in row and "#1·42…" not in row, row
+    assert "◦ #1·42% · ca" in row and "#1·42…" not in row, row
 
 
 @pytest.mark.needs_captain
@@ -205,6 +202,9 @@ def test_with_the_captured_directories_shown_the_home_is_still_no_card(
             for row in app.query(AgentRow)
             if row.status.agent.id == captain.agent.id
         ]
+        for _ in range(12):  # to the top first: start opens home since L1, a project's row
+            await pilot.press("up")
+            await pilot.pause()
         walk: list[str] = []
         for _ in range(12):  # more presses than there are rows: the walk ends at the last one
             await pilot.press("down")
@@ -363,47 +363,38 @@ def test_restarting_the_captain_selects_its_new_row_and_keeps_the_doctor_global(
 
 
 @pytest.mark.needs_captain
-def test_a_remembered_selection_never_reopens_the_home_as_a_project(
+def test_a_remembered_selection_never_opens_the_home_as_a_project(
     tmp_path: Path, script: Script
 ) -> None:
-    """#144's fallback is an agent's project; the captain's board is no project.
-
-    A remembered captain whose row has left the frame fell back to
-    ``project:<home>``, which ``FleetSnapshot.project`` resolved — the next
-    launch opened a ProjectView of ``$AISQUARE_HOME``. It falls through to the
-    welcome page and the memory is dropped, as for a project that is gone. The
-    control: a captain still in the frame is reopened like any agent.
-    """
+    """#144's fallback was an agent's project, and the captain's board is no project: a
+    remembered captain whose row had left the frame fell back to ``project:<home>``, which
+    opened a ProjectView of ``$AISQUARE_HOME``. Since L1 start opens home, the last-used
+    PROJECT's Manager tab, else the first listed: whatever is remembered of the captain (its
+    row live, its row gone, its board as a project), never the home's board as a project."""
     seed(tmp_path, ("prj_aaa", "alpha", None))
     home = captain_state.home_project()
     captain = status(home.id, "captain", "captain", "waiting")
     script[home.id] = [captain]
 
-    reopens: list[str] = []
-    """The agent the next launch reopens, when it reopens one — its handler is waited out."""
-
     async def relaunch(pilot: Pilot[None]) -> tuple[str | None, str | None, list[str]]:
         app = fleet_app(pilot)
         await pilot.pause()
         await pilot.pause()
-        if reopens:
-            await until(pilot, agent_opened(pilot, reopens.pop()), what="the captain reopened")
         await quiet(pilot)
         view = app.current_view()
         pages = [page.project.id for page in app.query(ProjectView)]
         return (view.id if view else None), app.sidebar.selected_key, pages
 
+    alpha = ("project-prj_aaa", "project:prj_aaa", ["prj_aaa"])
     _remember(f"agent:{home.id}/{captain.agent.id}")
-    reopens.append(captain.agent.id)
-    assert drive(relaunch) == (f"agent-{captain.agent.id}", f"agent:{captain.agent.id}", [])
+    assert drive(relaunch) == alpha, "home is a project's, not the captain's view"
 
     script[home.id] = []  # the captain's row is gone: its board is no fallback
-    assert drive(relaunch) == ("welcome", None, [])
-    assert _remembered() is None, "a memory with nothing to reopen is dropped, not retried"
+    _remember(f"agent:{home.id}/{captain.agent.id}")
+    assert drive(relaunch) == alpha
 
     _remember(f"project:{home.id}")
-    assert drive(relaunch) == ("welcome", None, [])
-    assert _remembered() is None
+    assert drive(relaunch) == alpha, "the home's board is never opened as a project"
 
 
 # --- review of T2: a read that failed is not "no captain" ----------------------------------

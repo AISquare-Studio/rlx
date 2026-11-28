@@ -10,10 +10,10 @@ without anyone writing an alias.
 
 Layout (:func:`accounts_root` / :func:`tmp_root`, each under the accounts' ``dir_name``)::
 
-    ~/.aisquare/claude-accounts/<n>/                    CLAUDE_CONFIG_DIR of slot n (n ≥ 2)
-    ~/.aisquare/claude-accounts/<n>/.aisquare-account.json   the marker: slot, created_at
-    ~/.aisquare/claude-accounts/<n>.removed-<stamp>/    a removed slot, kept but never listed
-    ~/.aisquare/cache/claude-accounts/<n>/              CLAUDE_CODE_TMPDIR of slot n
+    ~/.rlx/accounts/claude/<n>/                    CLAUDE_CONFIG_DIR of slot n (n ≥ 2)
+    ~/.rlx/accounts/claude/<n>/.aisquare-account.json   the marker: slot, created_at
+    ~/.rlx/accounts/claude/<n>.removed-<stamp>/    a removed slot, kept but never listed
+    ~/.rlx/cache/claude-accounts/<n>/              CLAUDE_CODE_TMPDIR of slot n
 
 **Slot 1 is never a directory of ours.** It is whatever a plain ``claude`` in
 this shell is — ``CLAUDE_CONFIG_DIR`` when the environment sets it,
@@ -53,7 +53,7 @@ copied from another account under Claude Code's own lock, and nothing else.
 
 **Codex logins are slots too.** Every agent whose adapter has an accounts
 slot (``core.agent_adapters.types.AgentAccounts``) keeps its managed homes the
-same way, under its own directory (``~/.aisquare/codex-accounts/<n>``, whose
+same way, under its own directory (``~/.rlx/accounts/codex/<n>``, whose
 marker also names ``"agent": "codex"``), and the per-agent facts — the
 variables, the plain home, the identity, the usage — are the adapter's. ONE
 LADDER numbers the managed slots of every agent: a new slot takes the lowest
@@ -84,12 +84,14 @@ from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta, tzinfo
 from pathlib import Path
+from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, Literal, TypeVar
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from aisquare.core import claude_sharing, paths, tls
 from aisquare.core.harness import MODEL_FAMILIES, model_family
 from aisquare.core.names import name_flaw, name_key
+from aisquare.core.parsed_files import forget_under, json_object, parsed_or
 from aisquare.core.version import __version__
 from aisquare.models import (
     ClaudeAccount,
@@ -778,8 +780,21 @@ def identity(
 
 
 def read_identity(path: Path) -> ClaudeIdentity | None:
-    """Read stable account identity without using or fingerprinting rotating tokens."""
-    return identity_in(_read_json(path))
+    """Read stable account identity without using or fingerprinting rotating tokens. The file
+    is read only once its stat changes; until then the parse kept for it is reused
+    (``core.parsed_files``), and each caller gets its own copy."""
+    identity = parsed_or(path, _identity_in_file, None)
+    return identity.model_copy() if identity is not None else None
+
+
+def _identity_in_file(path: Path, text: str) -> ClaudeIdentity | None:
+    return identity_in(json_object(path, text))
+
+
+def forget_unlisted_identities(accounts: Iterable[ClaudeAccount]) -> None:
+    """Drop the identities :func:`read_identity` keeps for files under :func:`accounts_root`
+    that are in none of ``accounts``' directories: an overview's sweep of removed slots."""
+    forget_under(accounts_root(), [account.config_dir for account in accounts])
 
 
 def identity_in(data: Mapping[str, Any] | None) -> ClaudeIdentity | None:
@@ -1029,7 +1044,9 @@ def plaintext_credentials_path(
     import unicodedata
 
     source = os.environ if environ is None else environ
-    directory = source.get(SECURE_STORAGE_VAR)
+    directory = _users_secure_storage(source)
+    if directory is None and account.managed:
+        directory = keychain_pin(account)
     if directory is None:
         return credentials_path(account)
     base = Path(unicodedata.normalize("NFC", directory)) if directory else home_config_dir()
@@ -1146,10 +1163,11 @@ def keychain_service(account: ClaudeAccount, environ: Mapping[str, str] | None =
     this environment inherits, wins over both, as it does in Claude Code.
     """
     source = os.environ if environ is None else environ
-    directory = source.get(SECURE_STORAGE_VAR)
+    directory = _users_secure_storage(source)
     if directory is None:
         if account.managed:
-            directory = launch_env(account)[CONFIG_DIR_VAR]
+            launched = launch_env(account)
+            directory = launched.get(SECURE_STORAGE_VAR, launched[CONFIG_DIR_VAR])
         else:
             directory = plain_environment(source).get(CONFIG_DIR_VAR, "")
     suffix = f"-{_js_sha256(directory)[:8]}" if directory else ""
@@ -1350,6 +1368,192 @@ def _keychain_problem(code: int, stderr: bytes) -> tuple[KeychainProblem, str]:
     return "failed", f"could not read the Keychain (security exited {code})"
 
 
+# --- a slot's login kept under its old Keychain name: the home's move (#31) ------------------
+#
+# A login too long to copy without putting it on a command line (``KEYCHAIN_LINE_LIMIT``) stays
+# where it is: the slot is PINNED to the directory its old place's item is named by, recorded in
+# its marker (``MARKER``'s ``keychain_dir``), and every launch on it sets
+# ``CLAUDE_SECURESTORAGE_CONFIG_DIR`` to that directory, which Claude Code keys its item on.
+
+KEYCHAIN_PIN_KEY = "keychain_dir"
+"""The marker's key for a slot's pin: the raw ``CLAUDE_CONFIG_DIR`` its item is named by."""
+KEYCHAIN_PIN_VAR = "AISQUARE_KEYCHAIN_PIN"
+"""Set beside ``CLAUDE_SECURESTORAGE_CONFIG_DIR`` by a pinned slot's launch, to its value: the
+variable is then rlx's pin, not the user's, so a read or a launch of another account in that
+environment names that account's own item (:func:`_users_secure_storage`)."""
+_PINS: dict[str, tuple[int, str | None]] = {}
+"""Each marker's pin as last read, by its path, with the file's ``st_mtime_ns``."""
+
+
+def keychain_pin(account: ClaudeAccount) -> str | None:
+    """The directory ``account``'s Keychain item is named by when the home's move pinned it
+    (:data:`KEYCHAIN_PIN_KEY` in its marker), else ``None``: every slot but one whose login was
+    too long to copy. Read again only when the marker changed."""
+    if not account.managed:
+        return None
+    marker = account.config_dir / MARKER
+    try:
+        changed = marker.stat().st_mtime_ns
+    except OSError:
+        return None
+    kept = _PINS.get(str(marker))
+    if kept is not None and kept[0] == changed:
+        return kept[1]
+    try:
+        data = json.loads(marker.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        data = None
+    pin = data.get(KEYCHAIN_PIN_KEY) if isinstance(data, dict) else None
+    found = pin if isinstance(pin, str) and pin else None
+    _PINS[str(marker)] = (changed, found)
+    return found
+
+
+def pin_keychain_dir(account: ClaudeAccount, directory: str | None) -> None:
+    """Record (``directory``) or take away (``None``) ``account``'s pin in its marker, keeping
+    everything else the marker says. Raises ``OSError`` when it cannot be written."""
+    from aisquare.core.atomic import write_replacing
+
+    marker = account.config_dir / MARKER
+    if directory is None and not marker.is_file():
+        return  # no slot there: nothing pinned to take away
+    try:
+        data = json.loads(marker.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        data = {}
+    if not isinstance(data, dict):
+        data = {}
+    if directory is None:
+        data.pop(KEYCHAIN_PIN_KEY, None)
+    else:
+        data[KEYCHAIN_PIN_KEY] = directory
+    write_replacing(marker, json.dumps(data, indent=2) + "\n")
+    _PINS.pop(str(marker), None)
+
+
+def _users_secure_storage(source: Mapping[str, str]) -> str | None:
+    """``CLAUDE_SECURESTORAGE_CONFIG_DIR`` as the user set it in ``source``; ``None`` when unset
+    or when it is a pinned slot's (:data:`KEYCHAIN_PIN_VAR`), which names that slot's item only."""
+    directory = source.get(SECURE_STORAGE_VAR)
+    if directory is not None and source.get(KEYCHAIN_PIN_VAR) == directory:
+        return None
+    return directory
+
+
+def keychain_copy_fits(service: str, account: str, data: bytes) -> bool:
+    """Whether :func:`add_keychain_item` can write ``data`` on one ``security -i`` line."""
+    return len(_add_line(service, account, data)) <= KEYCHAIN_LINE_LIMIT
+
+
+# --- an item copied to another name: the home's move (#31, H2) ----------------------------------
+#
+# A managed slot's item is named by its config dir (`keychain_service`), so a slot the home's
+# move takes elsewhere is signed out unless its item is copied to the name its new place
+# hashes to. Copied as Claude Code writes an item: `add-generic-password -U -a <account>
+# -s <service> -X <hex>`, given to `security -i` on its stdin, so the secret is never on a
+# command line, where any process of this user could read it. `security -i` reads a command
+# line of at most 4096 bytes; Claude Code keeps its own to 4,032, and so does this.
+
+KEYCHAIN_LINE_LIMIT = 4032
+"""The longest command :func:`add_keychain_item` gives ``security -i``: Claude Code's own limit."""
+_ITEM_NAME = re.compile(r"[A-Za-z0-9 ._-]+")
+"""What a service or account may hold to be quoted on ``security -i``'s line as it stands."""
+
+
+@dataclass(frozen=True)
+class KeychainItemData:
+    """What an item holds, as Claude Code's own lookup reads it (:func:`keychain_item_data`): its
+    bytes, ``None`` with no item; or why the Keychain would not say."""
+
+    data: bytes | None
+    printed: bytes = b""
+    """What ``security -w`` printed for it, as printed: a copy is the same item when the same
+    lookup prints the same."""
+    unreadable: str | None = None
+
+
+def keychain_item_data(service: str, account: str) -> KeychainItemData:
+    """The item ``service``/``account`` as Claude Code reads it, ``security
+    find-generic-password -a <account> -w -s <service>``, undecoded: the bytes ``-w`` printed,
+    or those of the hex it prints instead for data it will not print as it stands. Never
+    logged, never kept, never in a reason."""
+    done = _run_security(["find-generic-password", "-a", account, "-w", "-s", service])
+    if isinstance(done, str):
+        return KeychainItemData(None, unreadable=done)
+    code, stdout, stderr = done
+    if code == _ITEM_NOT_FOUND or code in _NO_KEYCHAIN:
+        return KeychainItemData(None)
+    if code != 0:
+        return KeychainItemData(None, unreadable=_keychain_problem(code, stderr)[1])
+    return KeychainItemData(_printed_item_bytes(stdout.removesuffix(b"\n")), printed=stdout)
+
+
+def _printed_item_bytes(printed: bytes) -> bytes:
+    """The data ``security -w`` printed as ``printed``: hex for data with a byte it will not
+    print (as :func:`_item_json` reads it), the bytes as printed else."""
+    text = printed.decode("ascii", "replace")
+    if not _HEX.fullmatch(text):
+        return printed
+    data = bytes.fromhex(text)
+    printable = all(0x20 <= byte < 0x7F or byte in (0x09, 0x0A, 0x0D) for byte in data)
+    return printed if printable else data
+
+
+def add_keychain_item(service: str, account: str, data: bytes) -> str | None:
+    """Write ``data`` as the item ``service``/``account``, as Claude Code writes one, through
+    ``security -i`` on its stdin (never a command line): ``None`` when ``security`` took it,
+    otherwise why not. What it took is to be read back (:func:`keychain_item_data`): ``security -i``
+    goes on past a command that failed."""
+    if not (_ITEM_NAME.fullmatch(service) and _ITEM_NAME.fullmatch(account)):
+        return "its name cannot be given to security as it stands"
+    line = _add_line(service, account, data)
+    if len(line) > KEYCHAIN_LINE_LIMIT:
+        return f"it is {len(data):,} bytes, too long to copy without putting it on a command line"
+    done = _run_security(["-i"], stdin=line.encode("ascii"))
+    if isinstance(done, str):
+        return done
+    code, _stdout, stderr = done
+    return None if code == 0 else _keychain_problem(code, stderr)[1]
+
+
+def _add_line(service: str, account: str, data: bytes) -> str:
+    """The ``security -i`` line that writes ``data`` as the item, as Claude Code writes one."""
+    return f'add-generic-password -U -a "{account}" -s "{service}" -X "{data.hex()}"\n'
+
+
+def delete_keychain_item(service: str, account: str) -> str | None:
+    """Delete the item ``service``/``account``: ``None`` when it is gone (or was never
+    there), otherwise why not."""
+    done = _run_security(["delete-generic-password", "-a", account, "-s", service])
+    if isinstance(done, str):
+        return done
+    code, _stdout, stderr = done
+    if code in (0, _ITEM_NOT_FOUND) or code in _NO_KEYCHAIN:
+        return None
+    return _keychain_problem(code, stderr)[1]
+
+
+def _run_security(args: list[str], *, stdin: bytes | None = None) -> tuple[int, bytes, bytes] | str:
+    """``security <args>`` (:data:`KEYCHAIN_TOOL`, never a shell), given ``stdin``: its exit
+    code and what it printed, or why it did not run. What it printed is never logged."""
+    import subprocess
+
+    try:
+        done = subprocess.run(
+            [KEYCHAIN_TOOL, *args],
+            input=stdin,
+            stdin=None if stdin is not None else subprocess.DEVNULL,
+            capture_output=True,
+            timeout=KEYCHAIN_TIMEOUT_SECONDS,
+            check=False,
+        )
+    except subprocess.TimeoutExpired:  # carries what it printed so far: dropped here
+        return f"the Keychain gave no answer in {KEYCHAIN_TIMEOUT_SECONDS:g} s"
+    except OSError as exc:
+        return f"{KEYCHAIN_TOOL}: {exc.strerror or 'not run'}"
+    return done.returncode, done.stdout, done.stderr
+
+
 def token_state(creds: ClaudeCredentials | None, now: datetime | None = None) -> str:
     if creds is None:
         return "missing"
@@ -1376,6 +1580,11 @@ def _claude_signed_in(account: ClaudeAccount, *, fresh: bool = False) -> bool:
         return False
     login = stored_login(account, fresh=fresh)
     return login.credentials is not None or login.unreadable is not None
+
+
+PLAN_UNITS: Mapping[str, float] = MappingProxyType({"max 20x": 4.0, "max 5x": 1.0, "pro": 0.2})
+"""Capacity units per Claude Code plan, as :func:`subscription_label` names it: a Max 5x is one
+unit, a Max 20x four, a Pro about a fifth (``AgentAccounts.plan_units``)."""
 
 
 def subscription_label(creds: ClaudeCredentials | None) -> str | None:
@@ -1739,6 +1948,13 @@ def launch_env(account: ClaudeAccount) -> dict[str, str]:
         # Each of its scratch variables names the slot's scratch dir; Codex has none, and
         # keeps its temporary files under its home.
         env.update(dict.fromkeys(accounts.extra_env, str(account.tmp_dir)))
+    pin = keychain_pin(account)
+    if pin is not None:
+        # Its login stays under the Keychain name its old place hashed to (#31): Claude Code
+        # keys its item on this variable when it is set. Said as ours beside it, so no other
+        # account's launch or read in this environment takes it for the user's own.
+        env[SECURE_STORAGE_VAR] = pin
+        env[KEYCHAIN_PIN_VAR] = pin
     return env
 
 
@@ -1760,6 +1976,9 @@ def apply_launch_env(
     """
     launch_vars, plain_vars = _launch_vars(account.agent)
     plain = plain_environment(shell, agent=account.agent)
+    pin = env.pop(KEYCHAIN_PIN_VAR, None)
+    if pin is not None and env.get(SECURE_STORAGE_VAR) == pin:
+        del env[SECURE_STORAGE_VAR]  # another slot's pin (#31): set again below only for its own
     wanted: dict[str, str | None]
     if account.managed:
         env.update(launch_env(account))
@@ -2105,6 +2324,8 @@ class ClaudeCodeAccounts:
     sign_out = "inside Claude Code (/logout)"
     shares_settings = True
     keychain_login = True  # on macOS: the login Keychain's item (`stored_login`)
+    plan_units: Mapping[str, float] = PLAN_UNITS
+    reserves_for_person = True  # its sessions report to the status line (`asq-statusline`)
 
     def __init__(
         self, share_parts: tuple[SharePart, ...] = (), memory: SharedMemory | None = None

@@ -54,8 +54,10 @@ def declared_captain(captain_off: None) -> None:
 
 
 def _window(spawned: dict[str, Any]) -> dict[str, Any]:
-    """What a spawned window was given, less what is that agent's own."""
-    env = {k: v for k, v in spawned["env"].items() if k != "AISQUARE_FLEET_AGENT"}
+    """What a spawned window was given, less what is that agent's own: its row, and its own
+    temporary directory's key (#57)."""
+    own = ("AISQUARE_FLEET_AGENT", "AISQUARE_TMP_KEY")
+    env = {k: v for k, v in spawned["env"].items() if k not in own}
     return {"cwd": spawned["cwd"], "env": env}
 
 

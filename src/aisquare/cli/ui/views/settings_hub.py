@@ -1,16 +1,19 @@
 """The Settings hub: what *⚙ Settings* in the sidebar opens.
 
-Eight links, each a button with one line saying what is behind it — *App
-settings* (the machine-wide settings, ``views.app_settings``), *Remote control* and
-*Captain* (App settings again, on its *Remote* tab and on the *Agent settings* tab the
-captain's box tops: one obvious way in to each, #41), *Accounts* (the AISquare sign-in
+Nine links, each a button with one line saying what is behind it — *App
+settings* (the machine-wide settings, ``views.app_settings``), *Remote control* (the one
+Remote page, which ``R`` opens too: ``views.remote``, Q17; only while Remote is on, #46),
+*Experimental* (App settings again, its *Agent settings* scrolled to *Experimental*, its last
+section, Q18: one obvious way in, #41; the captain's and Remote's switches, #46), *Accounts*
+(the AISquare sign-in
 and the Claude Code and Codex accounts, ``views.accounts``), *Personas* (yours and the
 bundled ones, for every project: ``views.personas_tab`` with no project, R27), *Usage &
 stats* (what all your agents' sessions on this machine spent, ``views.usage_stats``), *Agent
-resources* (what each live agent consumes, ``views.resources``) and *Doctor* (the checks,
-which opening it runs). A link posts the message the app routes; the pages it opens keep
-*⚙ Settings* highlighted in the sidebar. ↑/↓ move between the links, Enter or a click opens
-one.
+resources* (what each live agent consumes, ``views.resources``), *tmux* (every window on rlx's
+tmux server, ``views.tmux_page``) and *Doctor* (the checks, which opening it runs). A link posts
+the message the app routes (*Remote control* and *tmux* show their pages themselves); the pages
+it opens keep *⚙ Settings* highlighted in the sidebar. ↑/↓ move between the links, Enter or a
+click opens one.
 
 Under them, *Fleet*: *Restart all…* and *Stop all…*, for every running agent of every
 project, and *Pause all…* and *Resume all…*, ``fleet pause --all`` and ``fleet resume --all``
@@ -19,8 +22,8 @@ the UI thread, with a toast per agent as it is done and one that sums it up. Eve
 greyed while it runs. Each of the four is a ``GuardedButton`` (``click_guard``): a click
 that reaches it before the page is painted under the pointer opens nothing.
 
-Remote control and the Captain box were sections of this page (#33). They live in App
-settings' tabs now, in its format, where the owner placed them (#41).
+Remote control and the Captain box were sections of this page (#33), then App settings'
+tabs (#41). Remote is one page of its own now; the Captain box ends App settings' first tab.
 """
 
 from __future__ import annotations
@@ -48,7 +51,8 @@ from aisquare.cli.ui.sidebar import (
     UsageStatsSelected,
     doctor_badge,
 )
-from aisquare.cli.ui.views.app_settings import AGENT_TAB, REMOTE_TAB
+from aisquare.cli.ui.views import tmux_page
+from aisquare.cli.ui.views.app_settings import EXPERIMENTAL
 from aisquare.cli.ui.views.fleet_bulk import (
     BULK_WORKER,
     ConfirmBulk,
@@ -56,6 +60,7 @@ from aisquare.cli.ui.views.fleet_bulk import (
     bulk_running,
     report_toast,
 )
+from aisquare.core import experimental
 from aisquare.services import fleet as fleet_service
 
 LINKS: tuple[tuple[str, str, str], ...] = (
@@ -65,7 +70,11 @@ LINKS: tuple[tuple[str, str, str], ...] = (
         "agent settings (roles, the fleet, accounts' rules) and your preferences",
     ),
     ("remote", "Remote control", "the fleet on your phone: a link, its QR code and a password"),
-    ("captain", "Captain", "the experimental captain, on or off (App settings ▸ Agent settings)"),
+    (
+        "experimental",
+        "Experimental",
+        "the captain and Remote, each off until you turn it on (App settings, last)",
+    ),
     ("accounts", "Accounts", "the AISquare sign-in and the Claude Code and Codex accounts"),
     ("personas", "Personas", "who an agent can be: browse, edit and import personas"),
     (
@@ -77,6 +86,11 @@ LINKS: tuple[tuple[str, str, str], ...] = (
         "resources",
         "Agent resources",
         "CPU, memory, processes and tokens of every running agent, live while open",
+    ),
+    (
+        "tmux",
+        "tmux",
+        "every window on rlx's tmux server: open one, close or adopt what no agent owns",
     ),
     ("doctor", "Doctor", "the checks — they run when the page opens"),
 )
@@ -115,8 +129,11 @@ class SettingsHubView(VerticalScroll, can_focus=False):
 
     def compose(self) -> ComposeResult:
         yield Static(Text(f"{SETTINGS_ICON} Settings"), id="settings-title")
+        remote = bool(getattr(self.app, "remote_on", experimental.remote_enabled()))
         for stem, label, about in LINKS:
-            with Vertical(classes="hub-row"):
+            # Remote's only while it is on (#46): off, there is nothing of it to open.
+            with Vertical(classes="hub-row", id=f"hub-{stem}-row") as row:
+                row.display = stem != "remote" or remote
                 yield Button(label, id=f"hub-{stem}", classes="hub-link", compact=True)
                 yield Static(Text(about), classes="hub-about", id=f"hub-{stem}-about")
         yield Static(Text("Fleet"), id="hub-fleet-title")
@@ -150,10 +167,19 @@ class SettingsHubView(VerticalScroll, can_focus=False):
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
         stem = (event.button.id or "").removeprefix("hub-")
+        if stem == "remote":  # the one Remote page, as R opens it (Q17)
+            event.stop()
+            from aisquare.cli.ui.views.remote import open_remote_page  # loaded: Remote is on
+
+            open_remote_page(self.app)
+            return
+        if stem == "tmux":  # a page of its own, shown among the app's (``views.tmux_page``)
+            event.stop()
+            tmux_page.show_page(self.app)
+            return
         message: Message | None = {
             "app-settings": AppSettingsSelected(),
-            "remote": AppSettingsSelected(REMOTE_TAB),
-            "captain": AppSettingsSelected(AGENT_TAB),
+            "experimental": AppSettingsSelected(EXPERIMENTAL),
             "accounts": AccountsSelected(),
             "personas": PersonasSelected(),
             "usage-stats": UsageStatsSelected(),
@@ -166,13 +192,21 @@ class SettingsHubView(VerticalScroll, can_focus=False):
 
     def action_step(self, delta: int) -> None:
         """↑/↓: the link above or below the focused one, stopping at the ends."""
-        links = list(self.query(".hub-link").results(Button))
+        links = [
+            link
+            for link in self.query(".hub-link").results(Button)
+            if getattr(link.parent, "display", True)  # Remote's row hides while it is off
+        ]
         focused = self.app.focused
         if isinstance(focused, Button) and focused in links:
             at = links.index(focused)
         else:
             at = -1 if delta > 0 else len(links)
         links[max(0, min(len(links) - 1, at + delta))].focus()
+
+    def show_remote(self, on: bool) -> None:
+        """Remote turned on or off while rlx runs (#46): its link shown, or hidden."""
+        self.query_one("#hub-remote-row").display = on
 
     def focus_first(self) -> None:
         """Put the keyboard on the first link, as the page opens from the keyboard."""

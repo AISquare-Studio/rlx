@@ -42,7 +42,7 @@ from typer.testing import CliRunner
 from aisquare.cli.app import app
 from aisquare.core import agents as agent_core
 from aisquare.core import claude_accounts as accounts_core
-from aisquare.core import claude_sharing, harness
+from aisquare.core import claude_sharing, harness, paths
 from aisquare.core.agent_adapters import (
     adapter_for_binary,
     adapters,
@@ -74,7 +74,7 @@ from aisquare.core.orchestrator import team_project
 from aisquare.core.pricing import RequestTokens
 from aisquare.core.store import store_session
 from aisquare.models import ClaudeAccount
-from aisquare.services import agent_events, first_run, store_broker
+from aisquare.services import agent_events, agent_tmp, first_run, store_broker
 from aisquare.services import claude_accounts as accounts_service
 from aisquare.services import fleet as fleet_service
 from tests import fakebin
@@ -688,7 +688,7 @@ def test_an_agent_that_sandboxes_its_tools_says_what_its_sandbox_may_write(
             assert writes is None, f"{adapter.id} {write}: no sandbox, nothing to answer"
             continue
         assert writes is not None, f"{adapter.id} answers nothing for its {write} sandbox"
-        assert not writes.may_write(store / "context.db"), f"{adapter.id}: the store is read-only"
+        assert not writes.may_write(store / "rlx.db"), f"{adapter.id}: the store is read-only"
         assert writes.may_write(workspace) is (write == "workspace"), (adapter.id, write)
 
 
@@ -1138,13 +1138,18 @@ def test_the_fake_agent_runs_through_the_fleet_like_any_other(
     protect, writable = store_broker.launch_paths(launched_env, Path.cwd())
     # And the launch's own reports, the other place its sandbox writes (task #21): handed to
     # any adapter as one more writable path, so a new agent's sandboxed `asq exec` needs no
-    # more than its `broker_access` already takes.
+    # more than its `broker_access` already takes. And the agent's own TMPDIR (#57), where its
+    # launch made one, writable to every seat as its reports are: made on Windows here, which
+    # has no socket to fit; a POSIX tmp_path's home is past the 49 bytes, and keeps the
+    # inherited one, which adds nothing.
+    own_tmp = agent_tmp.own_dir(launched_env)
+    assert own_tmp is not None or sys.platform != "win32"
     expected = fake_agent.broker_access(
         native,
         store_dir(),
         broker / store_broker.INBOX,
         protect=protect,
-        writable=(*writable, broker / store_broker.REPORTS),
+        writable=(*writable, broker / store_broker.REPORTS, *([own_tmp] if own_tmp else [])),
     )
     assert expected is not None and argv[-len(expected) :] == expected
     if sys.platform != "win32":
@@ -2152,7 +2157,8 @@ def test_the_default_binary_is_the_default_agents_own(
         created_at=datetime.now(UTC),
     )
     assert row.binary == fake_agent.binary
-    assert status_line_text(None).plain.endswith(fake_agent.binary)
+    # Named in words (Q8): the binary, its first letter a capital.
+    assert status_line_text(None).plain.lower().endswith(fake_agent.binary.lower())
 
 
 def test_a_binarys_flags_session_id_and_account_are_its_adapters(
@@ -2257,7 +2263,10 @@ def test_an_agents_slots_are_arranged_launched_and_refused_by_its_own_answers(
     env = accounts_core.launch_env(account)
     assert env[slot.home_env] == str(account.config_dir)
     assert all(env[name] == str(account.tmp_dir) for name in slot.extra_env)
-    assert accounts_service.carried_vars(adapter.id)[1:] == (slot.home_env, *slot.extra_env)
+    # The home by both its names first (#30: RLX_HOME wins), then the agent's own variables.
+    carried = accounts_service.carried_vars(adapter.id)
+    assert carried[:2] == (paths.RLX_HOME_ENV, paths.HOME_ENV_VAR)
+    assert carried[2:] == (slot.home_env, *slot.extra_env)
     assert slot.launched_account(env, listed) == next(a for a in listed if a.slot == account.slot)
 
     described = accounts_service.describe(account)

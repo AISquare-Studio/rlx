@@ -146,6 +146,10 @@ if (-not $target) {
 }
 
 Write-Note "found WSL distribution(s): $($distros -join ', ')"
+# install.sh also sets the rlx service to start at each login inside WSL (S2): its
+# `aisquare service install --if-undecided`, a systemd user unit there. Nothing is set up on
+# Windows itself, where a WSL distribution does not start at sign-in (rlxd's, 0.10.3).
+# --no-service, like every option, passes through to it.
 Write-Step "Running the installer inside $target"
 Write-Host ''
 
@@ -175,5 +179,13 @@ if ($code -ne 0) {
 
 Write-Host ''
 Write-Step 'Done. rlx is installed inside WSL.'
-Write-Note "Open it with:  wsl -d $target -- rlx"
+# The word to type, by install.sh's program_word rule (#135): rlx while the rlx a login shell
+# finds first is the one in uv's tool directory, this install's own, or while none is found;
+# else aisquare, which is always this install's. Asked as two plain commands, so nothing in
+# them is the default shell's to expand on the way in.
+$found = "$(& wsl.exe -d $target -- bash -lc 'command -v rlx 2>/dev/null' | Select-Object -Last 1)".Trim()
+$bin = "$(& wsl.exe -d $target -- bash -lc 'uv tool dir --bin 2>/dev/null' | Select-Object -Last 1)".Trim()
+$word = 'rlx'
+if ($found -and ($found -ne "$bin/rlx")) { $word = 'aisquare' }
+Write-Note "Open it with:  wsl -d $target -- $word"
 Write-Note 'Run everything else from that shell too -- the agents live there.'

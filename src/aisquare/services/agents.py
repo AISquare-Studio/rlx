@@ -92,7 +92,7 @@ def claude_code_connected(config_dir: Path | None = None, *, cwd: Path | None = 
     answering it can start a process.
 
     Read-only and offline, and it never raises: a few files are read and nothing
-    is written, so no ``~/.aisquare`` appears. ``agents.json`` is not consulted,
+    is written, so no ``~/.rlx`` appears. ``agents.json`` is not consulted,
     because hooks on disk run whether or not this home recorded them (#84). A
     ``settings.json`` that cannot be read answers False: nothing shows our hooks
     are there.
@@ -295,7 +295,7 @@ def _check_settings(path: Path, *, kept: bool = False, strict: bool = False) -> 
     write: one not a JSON object, which ``install_hooks`` never replaces, one this user may
     not write (a link into a read-only ``/nix/store``), and one under a ``~user`` this
     machine does not have, which read as written lands in the cwd. Each refused only after
-    the context was ingested and ``~/.aisquare`` built (review of #257). ``kept``: read
+    the context was ingested and ``~/.rlx`` built (review of #257). ``kept``: read
     again only once it changes (:func:`_unless_changed`). ``strict``: hooks of another
     shape are refused too (:func:`_hooks_file_readable`).
     """
@@ -553,7 +553,7 @@ def settings_unwritable(path: Path) -> str | None:
     try:
         if path.is_symlink() and not path.exists():
             # A link to nothing yet: the write makes what it points to, or fails there,
-            # after connect has saved CLAUDE.md and built ~/.aisquare (review of #257).
+            # after connect has saved CLAUDE.md and built ~/.rlx (review of #257).
             stopped = _no_room(Path(os.path.realpath(path)).parent)
             return (
                 None if stopped is None else f"it is a link to {os.readlink(path)}, and {stopped}"
@@ -733,7 +733,7 @@ def connect(name: str, config_dir: Path | None = None) -> AgentConnection:
         raise KeyError(name)
     if not spec.connectable:
         # Before anything is read or written: no context ingested, nothing in
-        # agents.json, no ~/.aisquare created for a connection that installs nothing.
+        # agents.json, no ~/.rlx created for a connection that installs nothing.
         planned = f"; support is planned for {spec.planned}" if spec.planned else ""
         raise UnsupportedAgentError(f"rlx can't connect {spec.label} yet{planned}")
     _make_first_run_dir(name, config_dir)

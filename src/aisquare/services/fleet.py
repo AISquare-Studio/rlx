@@ -38,6 +38,7 @@ import re
 import shutil
 import sqlite3
 import subprocess
+import sys
 import time
 import unicodedata
 from collections.abc import Callable, Collection, Iterable, Iterator, Mapping, Sequence
@@ -49,8 +50,8 @@ from types import MappingProxyType, ModuleType
 from typing import Any, Literal, NoReturn
 
 from aisquare.core import agents as agent_core
-from aisquare.core import claude_accounts as claude_accounts_core
 from aisquare.core import (
+    cachedir,
     claude_screen,
     claude_sharing,
     codenames,
@@ -66,6 +67,7 @@ from aisquare.core import (
     selfcli,
     shell_line,
 )
+from aisquare.core import claude_accounts as claude_accounts_core
 from aisquare.core import load as load_core
 from aisquare.core import memory as memory_core
 from aisquare.core import names as names_core
@@ -105,7 +107,7 @@ from aisquare.core.config import (
 from aisquare.core.ids import new_agent_id
 from aisquare.core.locking import holding
 from aisquare.core.process_table import PaneProcesses
-from aisquare.core.spawn import git_env, untraced_env
+from aisquare.core.spawn import TMP_KEY_ENV, git_env, untraced_env
 from aisquare.core.store import (
     FLEET_RENAMED,
     RETIRED_LABEL,
@@ -155,12 +157,14 @@ from aisquare.models import (
 from aisquare.services import (
     agent_events,
     agent_launch,
+    agent_tmp,
     auto_mode,
     autostop,
     delivery,
     explainability_ops,
     handoff,
     install_route,
+    manager_seat,
     model_memory,
     pane_idle,
 )
@@ -220,8 +224,10 @@ sandbox, :func:`nudge_manager`). Its value is when; :func:`deliver_owed_nudge` t
 
 NUDGE_DEFERRED = "nudge_deferred:"
 """The ``team_meta`` prefix of a nudge a draft held back (P0-W2), or a dialog on the manager's
-screen (R25): ``nudge_deferred:<session>`` → when it was held back. :func:`retry_deferred_nudges`
-sends it once the box is clear and no dialog is open."""
+screen (R25), or a scheduled manager's routine news not due yet (#41,
+``team.pending_wake``): ``nudge_deferred:<session>`` → when it was held back.
+:func:`retry_deferred_nudges` sends it once the box is clear, no dialog is open and the news is
+due."""
 
 _NUDGE_RE_PRESS: tuple[float, ...] = (2.0,)
 _NUDGE_LAST_WAIT = 2.0
@@ -575,6 +581,8 @@ class ReapReport:
     socket file taken from under its server or a socket that could not be asked
     (:func:`_hold_on_absent_server`). The reason says which. Said as ``shutdown`` says a row
     it left live (follow-up of #257; review of #259, round 5)."""
+    temp_dirs_removed: list[Path] = field(default_factory=list)
+    """Ended agents' own temporary directories removed (:func:`agent_tmp.sweep_ended`, #57)."""
 
 
 @dataclass(frozen=True)
@@ -3190,17 +3198,104 @@ def _pushed(root: Path, rev: str, default: str) -> bool:
     return remote.returncode == 0 and bool(remote.stdout.strip())
 
 
+def _status_failed(status: _GitResult) -> str:
+    """What ``_why_kept`` says of a tree git would not give the status of."""
+    return f"git status failed there ({status.stderr.strip() or status.returncode})"
+
+
+REAP_FREES_CACHES = sys.platform != "win32"
+"""Whether reap frees an ended tree's untracked ``CACHEDIR.TAG`` output before judging the tree
+(#58). Not on native Windows in 0.10.2 (manager #3697, as ``rlx tidy`` reports only there,
+#3647): reap judges a tree there as 0.10.1 did, and an untracked cache keeps it."""
+
+
+def _untracked_caches(tree: Path) -> tuple[str | None, list[Path], bool]:
+    """``tree``'s status read once: why git could not say (else ``None``), the untracked
+    entries whose every file lies inside a ``CACHEDIR.TAG`` directory (``core.cachedir``:
+    build output by its own tag, whatever the language), and whether anything else is
+    changed or untracked.
+
+    Untracked files are asked for by name: ``status.showUntrackedFiles=no`` hides them from a
+    plain ``status``, and ``git worktree remove`` honours it too, so the tree read clean and
+    the file went with it."""
+    status = _git(tree, "status", "--porcelain=v1", "-z", "--untracked-files=normal")
+    if status.returncode != 0:
+        return _status_failed(status), [], True
+    caches: list[Path] = []
+    other = False
+    fields = iter(status.stdout.split("\0"))
+    for entry in fields:
+        if not entry:
+            continue
+        code, name = entry[:2], entry[3:]
+        if "R" in code or "C" in code:
+            next(fields, None)  # a rename's or copy's other path
+        path = tree / name.rstrip("/")
+        # A mount is never build output, whatever it holds (review of #58, M3); nor is any
+        # untracked entry where reap does not free caches (REAP_FREES_CACHES): 0.10.1's reap.
+        if (
+            code == "??"
+            and REAP_FREES_CACHES
+            and cachedir.same_filesystem(path, tree)
+            and cachedir.only_caches(path)
+        ):
+            caches.append(path)
+        else:
+            other = True
+    return None, caches, other
+
+
+def _remove_untracked_caches(
+    tree: Path,
+    only: Collection[Path] | None = None,
+    allows: Callable[[Path], bool] | None = None,
+) -> list[Path]:
+    """Delete the ``CACHEDIR.TAG`` directories in ``tree``'s untracked entries that hold
+    nothing else (:func:`_untracked_caches`); the ones deleted. One that will not go is left
+    for ``git worktree remove`` to refuse, which says so."""
+    if not REAP_FREES_CACHES or os.path.islink(tree):
+        return []  # off on native Windows; and nothing is deleted through a link
+    _failed, caches, _other = _untracked_caches(tree)
+    removed: list[Path] = []
+    for entry in caches:
+        for tagged in [entry] if cachedir.is_cache(entry) else cachedir.cache_dirs(entry):
+            if only is not None and tagged not in only:
+                continue  # found after the plan: ``rlx tidy`` frees what it listed alone
+            try:
+                cachedir.remove_within(tagged, tree, allows=allows)
+            except (OSError, ValueError):
+                continue  # left in the tree: git's own refusal names it
+            removed.append(tagged)
+    return removed
+
+
+NESTED_REPOSITORY = (
+    "it holds another git repository (ignored, or a submodule): rlx won't delete a repository; "
+    "remove it by hand if you don't need it"
+)
+"""Why a tree that holds a repository besides its own is kept (#58, C-a)."""
+LINKED_TREE = "it is a link: nothing goes through it"
+"""Why a tree recorded at a path that is now a link is kept: ``git worktree remove`` given a
+link would act on wherever it points (review of #58)."""
+
+
 def _why_kept(root: Path, tree: Path, default: str) -> str | None:
     """Why ``tree`` must stay — what in it exists only there — or ``None`` when nothing does.
 
-    Untracked files are asked for by name: ``status.showUntrackedFiles=no`` hides them
-    from a plain ``status``, and ``git worktree remove`` honours it too, so the tree read
-    clean and the file went with it."""
-    status = _git(tree, "status", "--porcelain", "--untracked-files=normal")
-    if status.returncode != 0:
-        return f"git status failed there ({status.stderr.strip() or status.returncode})"
-    if status.stdout.strip():
+    An untracked directory holding nothing but ``CACHEDIR.TAG`` output (a ``target/`` on a
+    branch with no ``.gitignore`` for it) is no work: it does not keep the tree, and
+    :func:`_reap_tree` deletes it before the tree goes (the owner's disk tidy, #58). Anything
+    else changed or untracked does."""
+    if os.path.islink(tree):
+        return LINKED_TREE
+    failed, _caches, other = _untracked_caches(tree)
+    if failed is not None:
+        return failed
+    if other:
         return "uncommitted changes"
+    if cachedir.holds_repository(tree, below_only=True):
+        # Ignored by git, or a submodule's: its commits are judged by nothing here (#58, C-a).
+        return NESTED_REPOSITORY
     head = _git(tree, "rev-parse", "--verify", "--quiet", "HEAD")
     if head.returncode != 0 or not head.stdout.strip():
         return "no commit to check"
@@ -3247,6 +3342,63 @@ def _remove_finished_worktrees(
     asked on every reap of a project an agent with a tree has ended in, whether or not a tree
     was removed.
     """
+    trees = ended_trees(store, project)
+    if trees is None:
+        return
+    if isinstance(trees, RootUnseen):
+        report.worktrees_kept.append((trees.root, trees.why))
+        return
+    for agent in trees.candidates:
+        try:
+            if not _present(agent.cwd):
+                continue
+        except OSError as exc:
+            report.worktrees_kept.append((agent.cwd, f"not looked at: {_why(exc)}"))
+            continue
+        removed, kept = _reap_tree(
+            store, project, agent, trees.default, trees.common, trees.read_at
+        )
+        if removed:
+            report.worktrees_removed.append(agent.cwd)
+        elif kept is not None:
+            report.worktrees_kept.append((agent.cwd, kept))
+    report.worktrees_kept.extend(_unplaced_trees_kept(trees.placed, trees.owners, trees.in_use))
+    # Read again: the branches recorded just now are the ones the sweep asks about.
+    _sweep_fleet_branches(
+        trees.root, trees.common, trees.default, store.fleet_agents(project.id), report
+    )
+
+
+@dataclass(frozen=True)
+class RootUnseen:
+    """A project root reap could not look at, kept with why (:func:`ended_trees`)."""
+
+    root: Path
+    why: str
+
+
+@dataclass(frozen=True)
+class EndedTrees:
+    """The ended agents' trees of one project that reap may remove, as :func:`ended_trees`
+    selects them, and what reap needs beside them."""
+
+    root: Path
+    read_at: datetime
+    """When the rows were read: :func:`_reap_tree` removes no tree a row reached since."""
+    default: str
+    common: Path
+    candidates: list[FleetAgent]
+    """The newest row at each tree, ended and not paused, its tree in no live row's use, in
+    the order reap asks: whether the tree is still there is asked as each comes."""
+    placed: list[Placement]
+    owners: dict[Path, FleetAgent]
+    in_use: set[Path]
+
+
+def ended_trees(store: ContextStore, project: ProjectInfo) -> EndedTrees | RootUnseen | None:
+    """Which ended agents' trees :func:`_remove_finished_worktrees` asks about, chosen once,
+    for reap and for ``rlx tidy``'s dry run alike, so the two cannot drift (#58). ``None``
+    where none can be: no ended agent ever had a tree here, or no git."""
     root = project.root
     read_at = _now()
     rows = store.fleet_agents(project.id)
@@ -3254,18 +3406,17 @@ def _remove_finished_worktrees(
         # No ended agent ever had a tree here — a project no agent ran in, the captured
         # directories `reap()` walks included: no tree and no branch is the fleet's to take,
         # and git is not asked (review of #259, round 16).
-        return
+        return None
     try:
         if not _present(root / ".git"):  # `is_git_project`, asked alike on every Python
-            return
+            return None
     except OSError as exc:
-        report.worktrees_kept.append((root, f"not looked at, nor any tree in it: {_why(exc)}"))
-        return
+        return RootUnseen(root, f"not looked at, nor any tree in it: {_why(exc)}")
     try:
         default = _default_branch(root)
         common = _git_common_dir(root)  # once: the branch lock is taken for each tree
     except FleetError:
-        return  # no git here: nothing can be removed safely, so nothing is
+        return None  # no git here: nothing can be removed safely, so nothing is
     # Each row at the tree its launch record names; one no record places is at none.
     config = settings()
     placed = [resolve_place(row, config=config) for row in rows]
@@ -3281,23 +3432,13 @@ def _remove_finished_worktrees(
     owners = {here: agent for here, agent in trees if here is not None and agent.worktree}
     in_use = {here for here, agent in trees if here is not None and agent.ended_at is None}
     in_use.add(root.resolve())
-    for path, agent in owners.items():
-        if path in in_use or agent.ended_at is None or _paused_row(agent):
-            continue  # a paused agent's tree is where `fleet resume` starts it again
-        try:
-            if not _present(agent.cwd):
-                continue
-        except OSError as exc:
-            report.worktrees_kept.append((agent.cwd, f"not looked at: {_why(exc)}"))
-            continue
-        removed, kept = _reap_tree(store, project, agent, default, common, read_at)
-        if removed:
-            report.worktrees_removed.append(agent.cwd)
-        elif kept is not None:
-            report.worktrees_kept.append((agent.cwd, kept))
-    report.worktrees_kept.extend(_unplaced_trees_kept(placed, owners, in_use))
-    # Read again: the branches recorded just now are the ones the sweep asks about.
-    _sweep_fleet_branches(root, common, default, store.fleet_agents(project.id), report)
+    candidates = [
+        agent
+        for path, agent in owners.items()
+        # a paused agent's tree is where `fleet resume` starts it again
+        if not (path in in_use or agent.ended_at is None or _paused_row(agent))
+    ]
+    return EndedTrees(root, read_at, default, common, candidates, placed, owners, in_use)
 
 
 def unplaced_trees_kept(project: ProjectInfo, rows: Sequence[FleetAgent]) -> list[tuple[Path, str]]:
@@ -3389,6 +3530,10 @@ def _reap_tree(
     default: str,
     common: Path,
     read_at: datetime,
+    *,
+    remove: bool = True,
+    caches: Collection[Path] | None = None,
+    allows: Callable[[Path], bool] | None = None,
 ) -> tuple[bool, str | None]:
     """Reap ``agent``'s tree: ``agent`` ended, and was the newest row at the tree's path when
     :func:`reap` read the rows at ``read_at``. Record on its row the branch the tree is on
@@ -3435,8 +3580,18 @@ def _reap_tree(
             if any(row.id != agent.id and _tree_at(row.cwd) == here for row in since):
                 return False, None
             _record_the_branch(store, agent)
+            # Its build output first, whether or not the tree stays: regenerable by its own tag,
+            # and deleted only here, under the lock, once no other agent is at the tree (#58).
+            _remove_untracked_caches(tree, caches, allows)
             if kept is not None:
                 return False, kept
+            if not remove:  # ``rlx tidy`` planned it kept: it never decides again (#58)
+                return False, "kept, as planned"
+            # Asked again under the lock, for a tree about to go alone: what it holds may have
+            # changed since it was first asked, unlocked (review of #58, the race).
+            again = _why_kept(project.root, tree, default)
+            if again is not None:
+                return False, again
             removal = _git(project.root, "worktree", "remove", str(tree))
     except FleetError as exc:
         held = f"; when asked just before, it held: {kept}" if kept is not None else ""
@@ -3493,6 +3648,22 @@ def _sweep_fleet_branches(
     hand, or one its agent left for another — is left as it is, and so is a recorded one
     that is not ``fleet/…`` (``fix/auth``): only branches :func:`branch_name` makes go.
     """
+    done, kept = sweep_plan(root, common, default, rows)
+    report.branches_kept.extend((root, branch) for branch in kept)
+    _delete_swept(root, common, done, report)
+
+
+def sweep_plan(
+    root: Path,
+    common: Path,
+    default: str,
+    rows: Sequence[FleetAgent],
+    *,
+    gone: Collection[Path] = (),
+) -> tuple[dict[str, str], list[str]]:
+    """What :func:`_sweep_fleet_branches` decides, without deleting: the branches it deletes,
+    each with the tip judged, and the ones it names kept. ``gone``: trees about to be removed
+    (``rlx tidy``'s dry run, #58), whose branches count as out of every tree."""
     paused = _paused_heads(rows)  # a paused agent's branch is where its resume carries on
     live = {row.branch for row in rows if row.ended_at is None or row.id in paused}
     recorded = {
@@ -3504,26 +3675,30 @@ def _sweep_fleet_branches(
         and row.branch not in live
     }
     if not recorded:
-        return
+        return {}, []
     # Of the recorded ones, those still there: ended rows are kept for good, so `recorded`
     # is never empty again once a project ran a coder, and with them all swept, the trees
     # were asked (`git worktree list` and their state files) on every reap for nothing
     # (review of #259, round 35, 5/8).
     every = {b: tip for b, tip in (_fleet_branches(root) or {}).items() if b in recorded}
     if not every:
-        return
+        return {}, []
     merged = _fleet_branches(root, f"--merged={default}")
     out = None if merged is None else _branches_in_use(root, common)
     if merged is None or out is None:
-        return
+        return {}, []
+    if gone:  # trees about to go (tidy's dry run): their branches are out of no tree then
+        held = _worktree_branches(root)
+        out = out - {held[tree] for tree in (_tree_at(t) for t in gone) if tree in held}
     asked = {b: tip for b, tip in every.items() if b not in out}
     squashed = _squashed(root, {b: tip for b, tip in asked.items() if b not in merged}, default)
-    done: list[str] = []
-    for branch in asked:
-        if branch in merged or branch in squashed:
-            done.append(branch)
-        else:
-            report.branches_kept.append((root, branch))
+    done = {b: tip for b, tip in asked.items() if b in merged or b in squashed}
+    return done, [b for b in asked if b not in done]
+
+
+def _delete_swept(root: Path, common: Path, done: Mapping[str, str], report: ReapReport) -> None:
+    """Delete each of ``done`` (branch → the tip judged), as :func:`_sweep_fleet_branches` says:
+    under the branch lock, asking the trees again, each at its judged tip alone."""
     if not done:
         return
     try:
@@ -3531,11 +3706,11 @@ def _sweep_fleet_branches(
         # next reap deletes what this one could not.
         with _branches_locked(common, wait=0):
             out = _branches_in_use(root, common)  # asked again, under the lock
-            for branch in done:
+            for branch, tip in done.items():
                 if out is None or branch in out:
                     continue
                 ref = f"refs/heads/{branch}"
-                if _git(root, "update-ref", "-d", ref, every[branch]).returncode == 0:
+                if _git(root, "update-ref", "-d", ref, tip).returncode == 0:
                     _git(root, "config", "--remove-section", f"branch.{branch}")  # none: fine
                     report.branches_deleted.append((root, branch))
     except FleetError:
@@ -5703,6 +5878,19 @@ def spawn(
             beside = [*defaults.args, *unbound, *role_args, *extra]
             if slot_args and selected.adapter.native_choice(beside).model is None:
                 bound = unbound
+        # A list the agent would not start on is refused, named, before a worktree, codename or
+        # window is made; a word after the options may be its prompt only in the spawn's own,
+        # beside no first message of the fleet's on its command line.
+        prompt_way = delivery.first_prompt_way(
+            positional=selected.adapter.capabilities.positional_prompt, setting=config.first_prompt
+        )
+        prompt_in_argv = prompt_way == "argv" and bool(prompt or (task_id is not None and kickoff))
+        launch_lists = (
+            (f"team.profiles.{role}.args", list(bound), False),
+            (f"fleet.roles.{role}.agent_args.{selected.adapter.id}", list(role_args), False),
+            ("the spawn's own arguments", list(extra), not prompt_in_argv),
+        )
+        _refuse_what_the_agent_would_not_start_on(selected.adapter, launch_lists)
         # The binding's first for an agent that keeps 0.9.2's order (`binding_args_first`):
         # the window's line opens with them (`agent_launch.BOUND_IN_LINE_FLAG`), so the
         # window's own flags and the user's come later and win, as on 0.9.2 (R8, F-bound).
@@ -5988,6 +6176,7 @@ def spawn(
                 agent=selected.adapter.id,
                 pick=selected.pick,
                 family=family,
+                task_id=resolved_task_id,  # its tier: a task another one --needs is high (#35)
             )
         except claude_accounts_service.NoSuchAccount as exc:
             message = str(exc)
@@ -6008,6 +6197,14 @@ def spawn(
         raise FleetError(
             f"--account selects an account, and {selected.adapter.label} has no account slots"
         )
+    # The lists again, under the home the window runs in now that its account is chosen: what
+    # only that home can say (a Codex profile is a file there) is asked of it, still before
+    # the codename and the worktree.
+    _refuse_what_the_agent_would_not_start_on(
+        selected.adapter,
+        launch_lists,
+        home=choice.account.config_dir if choice.account is not None else selected.config_dir,
+    )
     if experimental.captain_role(role):
         # Asked of the home the window runs under, the account's, else this process's,
         # which the window is given below: its operator's own MCP servers are the ones the
@@ -6196,7 +6393,7 @@ def spawn(
         # `$HOME`, under `~/.aisquare`) as a project; the window's hub, the home's
         # root (`_spawn_board_and_hub`), lands the launcher on the home board, which
         # the store keeps captured (T2).
-        env["AISQUARE_HOME"] = str(paths.aisquare_home().resolve())
+        env["AISQUARE_HOME"] = env["RLX_HOME"] = str(paths.aisquare_home().resolve())
         # Nobody may be watching its pane, which is answered from a phone: a prompt of the
         # agent's own there holds it (`unattended_env`). Claude Code's session-rating survey
         # drew in the captain's pane mid-conversation, and send (rightly) never types into a
@@ -6437,7 +6634,12 @@ def spawn(
                 else models.added.effort
             ),
             board_context=reads,
+            # Its own temporary directory: a replay's (a restart, a switch, a resume) is the
+            # one it had; a new agent's, a fork's included, is new (#57).
+            tmp_key=agent_tmp.key_for(spec, fork=fork),
         )
+        if launch_spec.tmp_key is not None:
+            env[TMP_KEY_ENV] = launch_spec.tmp_key
         if session is not None:
             # The predecessor's start is not this launch's: its own hook says when it started.
             session = session.model_copy(update={"started_at": None})
@@ -8253,7 +8455,7 @@ def _admit(config: FleetSettings) -> list[str]:
     memory refusal the floor is ``min_free_mb + 512`` for five minutes, so admission
     does not flap on a box hovering at the line. Unknown headroom admits, with a note.
     Each refusal, and each admission that fills the budget, is one line in
-    ``~/.aisquare/fleet/admission.jsonl``.
+    ``~/.rlx/fleet/admission.jsonl``.
     """
     notes: list[str] = []
     counts = _live_per_project() if config.max_agents_total > 0 else {}
@@ -8944,7 +9146,7 @@ def _memory_refused(record: Mapping[str, object], why: str) -> NoReturn:
 def _log_admission(outcome: str, record: Mapping[str, object]) -> None:
     """One JSON line per refusal and per admission at the budget; never fails a spawn."""
     with contextlib.suppress(OSError):
-        log = paths.aisquare_home() / "fleet" / "admission.jsonl"
+        log = paths.fleet_dir() / "admission.jsonl"
         log.parent.mkdir(parents=True, exist_ok=True)
         if log.is_file() and log.stat().st_size > _ADMISSION_LOG_MAX:
             log.replace(log.with_name(log.name + ".1"))
@@ -9485,6 +9687,7 @@ def _first_prompt_unsent(agent: FleetAgent, why: str) -> bool:
                 "prompt_unsent",
                 f"{agent.label}: first prompt not taken — {why}",
                 session_id=agent.session_id,
+                meta={manager_seat.EVENT_PROJECT: agent.project_id},
             )
     except Exception:
         return False
@@ -10083,6 +10286,11 @@ def _statuses(
     if live_only:
         placements = _with_lingering_windows(placements, views, running, keep=paused)
     reached = {placement.row.id for placement in placements if _view(placement, views) is not None}
+    # A live row's session on another board, read by its id (`_listing`): a hub's, or the
+    # principal checkout's for a project rooted in a sub-folder or at a linked worktree,
+    # where its hooks register it. Its state, its limit and the task it claimed are that
+    # session's; without it such a row read as having none (#14, tester #1306).
+    sessions = {**{sid: s for sid, s in by_id.items() if s is not None}, **sessions}
     sessions = _record_failed_turns(
         [placement.agent for placement in placements], sessions, reached, records
     )
@@ -10267,7 +10475,12 @@ def _end_dead_rows(
     reaches on the same name is another, and a dead ``%N`` there ended a live row under its
     running agent (round 28 of #257). Where its launch record places it: a row no record
     places has no view, and is ended by nothing here.
+
+    Every read also sweeps the ended agents' own temporary directories, at most once a
+    minute per process (:func:`agent_tmp.maybe_sweep_ended`, #57): it opens nothing while no agent
+    has one, and fails open.
     """
+    agent_tmp.maybe_sweep_ended()
     dead = [
         (placement.row, pane)
         for placement in placements
@@ -14482,10 +14695,15 @@ def switch(
                 raise _replaced(project, label, head, agent_id) from None
             if not _the_owners(spawned_by, store):
                 raise _paused_by_the_owner(project, label) from None
-            resume = project_service.fleet_command("resume", project)
+            # asq's Move reaches here (views.agent): it gets the sentence without the command.
             raise FleetError(
-                f"{label} is paused, with no process to move: `{resume}` brings it back, and "
-                "a switch then moves it; nothing was changed"
+                f"{label} is paused, with no process to move: "
+                + prog.shell_advice(
+                    f"`{project_service.fleet_command('resume', project)}` brings it back, and "
+                    "a switch then moves it",
+                    app="resume it, then move it",
+                )
+                + "; nothing was changed"
             ) from None
         # First: every refusal after this one reads the role, the agent and the account,
         # and they are the launch record's (`core.launch_seal`), never the row's.
@@ -14573,14 +14791,21 @@ def switch(
             )
             raise FleetError(
                 f"no account under the line for {label!r}{where} — every other account is "
-                f"over switch_at or unreadable; {stays}, or "
-                f"`{project_service.fleet_command('switch', project, label)}` moves it by "
-                f"hand{said}"
+                f"over switch_at or unreadable; {stays}"
+                + prog.shell_advice(
+                    f", or `{project_service.fleet_command('switch', project, label)}` moves it "
+                    "by hand"
+                )
+                + said
             )
         raise FleetError(
-            f"no other account with headroom for {label!r}{where}"
-            f" — add or enable one (`{prog.word()} accounts`), name one with --to, or wait for "
-            f"the reset{said}"
+            f"no other account with headroom for {label!r}{where} — "
+            + prog.shell_advice(
+                f"add or enable one (`{prog.word()} accounts`), name one with --to, or wait for "
+                "the reset",
+                app="add or enable one on the Accounts page, or wait for the reset",
+            )
+            + said
         )
     target = choice.account
     if crossing:
@@ -15150,8 +15375,7 @@ def _respawn(
         ]
         said = f"{', '.join(kept)} and arguments" if kept else "arguments"
         notes.append(
-            f"launched as recorded — {said} come from its launch record, not from today's "
-            "config (#144)"
+            f"launched as recorded — {said} come from its launch record, not from today's config"
         )
     notes.extend(receipt.notes)
     return receipt, resume is not None, notes
@@ -15368,6 +15592,20 @@ def _hooks_installed_first(
             f"{adapter.label}'s hooks were not installed in {home} — installed them before it "
             "started there"
         )
+
+
+def _refuse_what_the_agent_would_not_start_on(
+    adapter: AgentAdapter,
+    lists: Sequence[tuple[str, Sequence[str], bool]],
+    *,
+    home: Path | None = None,
+) -> None:
+    """Each list a fleet launch gives the agent (the setting it came from, its words, whether a
+    word after its options may be the prompt) refused, naming that setting, where the agent
+    would not start on it (:meth:`AgentAdapter.args_refusal`), read in ``home`` once known."""
+    for source, args, may_prompt in lists:
+        if refusal := adapter.args_refusal(args, may_prompt=may_prompt, home=home):
+            raise FleetError(f"{source}: {refusal}")
 
 
 def _refuse_an_install_the_sandbox_writes(
@@ -16455,7 +16693,7 @@ def hand_off(
     agent_id: str | None = None,
     to_agent: str | None = None,
 ) -> HandoffReceipt:
-    """Start an agent from teammate ``source``: the Spawn dialog's *Hand off from*.
+    """Start an agent from teammate ``source``: the Spawn dialog's *Continue from*.
 
     **Fork**, the default, touches nothing of the source: no mark, no stop, no claim, and
     neither its row, its window, its tree nor its branch. The new agent takes a label that
@@ -16718,7 +16956,7 @@ def _handoff_row(
 
     The label alone names the newest row that carries it, and two rows of a project can
     carry one label over time: an exited coder-1 and the coder-1 started since. The Spawn
-    dialog's *Hand off from* can show the older one, so by label its fork forked, and its
+    dialog's *Continue from* can show the older one, so by label its fork forked, and its
     take-over stopped and restarted, the NEWER agent (review of #240, "also confirmed":
     hand-off by label). A caller that means one teammate names its row, as the agent view
     does for :func:`stop` and :func:`restart`: by its whole id, as theirs is. A row of
@@ -17299,7 +17537,7 @@ its replacement is a deliberate add, and would bring the project back to every l
 NOT_PAUSED = "not paused"
 """Why a resume by :func:`bulk` leaves a row: running, or exited (💤) without a pause — only
 the agents a ``fleet pause`` stopped come back."""
-NOT_CHOSEN = "not chosen"
+NOT_CHOSEN = "unticked in the pick-list"
 """Why :func:`bulk` leaves a row the plan it was shown would have acted on: the person
 unticked it in asq's dialog (R17, its pick-list). A pause that leaves one of a project's
 agents so does not fleet-pause the project (:func:`_fully_picked`)."""
@@ -18414,6 +18652,10 @@ def reap(project: ProjectInfo | None = None, *, server_down: bool = False) -> Re
         launch_seal.forget_row_windows(project_id, rows)
     for ended in waking:  # only an exit that wakes is nudged (P1 WS-2, #279)
         nudge_manager(ended.project_id, reason=f"{ended.label} exited", board=_board_of_row(ended))
+    # Every ended agent's own temporary directory, the whole home's (#57): a sweep that fails
+    # costs nothing but the sweep, never the reap.
+    with suppress(Exception):
+        report.temp_dirs_removed.extend(agent_tmp.sweep_ended())
     return report
 
 
@@ -18518,6 +18760,7 @@ def _emit_exit(
         "force": force,
         "released": released,
         "why": why,
+        manager_seat.EVENT_PROJECT: agent.project_id,
     }
     if reason is not None:
         meta["reason"] = reason
@@ -19459,16 +19702,22 @@ def _nudge(project_id: str, *, owe: bool, board: str | None = None) -> bool:
             session = store.get_session(row.session_id)
             if session is None or session.ended_at is not None:
                 return False
-            # Due only for news it wakes for, unread (``team.wake_pending``, R12): its own
+            # Due only for news it wakes for, unread (``team.pending_wake``, R12): its own
             # result, an echo of news it has read, or a line its standby holds wakes nobody,
             # whichever write asked. An owed one was always asked this; now every one is.
-            if not _team().wake_pending(store, session):
+            # A scheduled manager's routine news not due yet is held for the tickers (#41).
+            pending = _team().pending_wake(store, session)
+            now = _now()
+            if pending.now is None:
+                if pending.held:
+                    _hold(store, session, now)
                 return False
             key = f"nudge:{session.id}"
-            now = _now()
             last = store.get_meta(key)
             if last is not None and now - datetime.fromisoformat(last) < NUDGE_DEBOUNCE:
                 return False
+            if pending.scheduled and not _claim(store, key, last, now):
+                return False  # another process took this wake: the rlx service, asq or watch
             try:
                 facts = pane.facts_or_raise()
             except TmuxError:
@@ -19518,7 +19767,28 @@ def _nudge(project_id: str, *, owe: bool, board: str | None = None) -> bool:
         return False
 
 
-def retry_deferred_nudges() -> int:
+def _hold(store: ContextStore, session: TeamSession, now: datetime) -> None:
+    """Hold back a scheduled manager's nudge for routine news that is not due yet
+    (:data:`NUDGE_DEFERRED`), for :func:`retry_deferred_nudges` to send once it is. Written
+    when no mark is there, or the one there predates its last prompt, which read the news it
+    was for: a tick that finds it held still writes nothing."""
+    key = f"{NUDGE_DEFERRED}{session.id}"
+    since = store.get_meta(key)
+    prompted = session.prompted_at
+    if not since or (prompted is not None and datetime.fromisoformat(since) <= prompted):
+        store.set_meta(key, now.isoformat())
+
+
+def _claim(store: ContextStore, key: str, last: str | None, now: datetime) -> bool:
+    """Take a scheduled manager's nudge (its debounce ``key``) before typing it, by compare and
+    set: of the tickers that send a held one (the rlx service, ``asq``, ``rlx watch``), the
+    one that takes it types it, and the others see it taken (#41)."""
+    if last is None:
+        return store.set_meta_once(key, now.isoformat())
+    return store.compare_meta(key, last, now.isoformat())
+
+
+def retry_deferred_nudges(*, scheduled_only: bool = False) -> int:
     """Send each manager nudge a draft or a dialog held back (:data:`NUDGE_DEFERRED`), now that
     its input box may be clear and the dialog closed: ``asq``'s refresh asks every frame. How
     many were sent.
@@ -19533,16 +19803,19 @@ def retry_deferred_nudges() -> int:
     per read (P2-W3, #83)."""
     try:
         with store_session() as store:
-            targets = deferred_nudge_targets(store)
+            targets = deferred_nudge_targets(store, scheduled_only=scheduled_only)
     except Exception:
         return 0
     return send_deferred_nudges(targets)
 
 
-def deferred_nudge_targets(store: ContextStore) -> list[FleetAgent]:
+def deferred_nudge_targets(
+    store: ContextStore, *, scheduled_only: bool = False
+) -> list[FleetAgent]:
     """The managers whose held-back nudge is still owed, read in ``store``; one owed no
     more (its manager prompted since, or its row ended) is dropped there. One indexed read
-    when nothing is held back."""
+    when nothing is held back. ``scheduled_only``: those of fleets whose policy is
+    ``schedule`` alone (``rlx watch``'s, #41), the others left as they were."""
     held = {
         key.removeprefix(NUDGE_DEFERRED): since
         for key, since in store.list_meta(NUDGE_DEFERRED).items()
@@ -19551,6 +19824,10 @@ def deferred_nudge_targets(store: ContextStore) -> list[FleetAgent]:
     targets: list[FleetAgent] = []
     for session_id, since in held.items():
         row = store.fleet_agent_for_session(session_id)
+        if scheduled_only and (
+            row is None or not manager_seat.policy(store, row.project_id).scheduled
+        ):
+            continue
         session = store.get_session(session_id)
         prompted = session.prompted_at if session is not None else None
         gone = row is None or row.ended_at is not None or row.label != MANAGER_LABEL

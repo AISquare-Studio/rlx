@@ -26,9 +26,10 @@ Two rules shape the code more than the layout does:
 - **Rows post messages; the app decides.** ``AddProject``, ``ProjectSelected``,
   ``AgentSelected``, ``SpawnAgent``, ``SettingsSelected``, ``AccountsSelected``,
   ``UpdateSelected``, ``RenameProject``, ``RenameAgent`` and ``OpenProjectMenu`` are the whole
-  contract between this pane and the shell (the Settings hub posts ``AppSettingsSelected``,
-  ``AccountsSelected`` and ``DoctorSelected``). Nothing here opens a view or
-  writes the store.
+  contract between this pane and the shell, with the groups' gestures (``ui.groups``, a group
+  header's ``OpenGroupMenu`` and ``RenameGroup`` among them; the Settings hub posts
+  ``AppSettingsSelected``, ``AccountsSelected`` and ``DoctorSelected``). Nothing here opens
+  a view or writes the store.
 
 Every visible string is a ``rich.text.Text`` built with ``append`` — a project
 called ``[archive]`` must reach the screen as ``[archive]`` (CONTRIBUTING: no
@@ -38,11 +39,12 @@ markup in data).
 from __future__ import annotations
 
 from collections import Counter
-from collections.abc import Collection, Iterable, Mapping, Sequence
+from collections.abc import Callable, Collection, Iterable, Mapping, Sequence
 from pathlib import Path
 from typing import TYPE_CHECKING, ClassVar, NamedTuple
 
 from rich.cells import cell_len
+from rich.terminal_theme import TerminalTheme
 from rich.text import Text
 from textual import events, on
 from textual.app import ComposeResult, RenderResult
@@ -52,24 +54,28 @@ from textual.content import Content
 from textual.css.query import NoMatches
 from textual.geometry import Region
 from textual.message import Message
+from textual.theme import Theme
 from textual.widget import Widget
 from textual.widgets import Input, Static
+from textual.worker import Worker, WorkerState
 
+from aisquare.cli.ui import adopt_picker
 from aisquare.cli.ui.groups import (
     DragState,
     DropGroup,
     DropProject,
     GroupProjects,
     MoveRow,
+    OpenGroupMenu,
+    RenameGroup,
     ToggleCollapse,
     TogglePin,
     UndoLayout,
 )
 from aisquare.cli.ui.instances_chip import InstancesChip
 from aisquare.cli.ui.terminal import InPlaceField
-from aisquare.cli.ui.theme import MARK_STYLE, MarkStatic
+from aisquare.cli.ui.theme import MARK_STYLE, MarkStatic, readable_on, state_inks, theme_tones
 from aisquare.cli.ui.views.accounts import agent_mark
-from aisquare.core import codenames
 from aisquare.core.agent_adapters import default_binary, recorded_adapter
 from aisquare.core.version import PRODUCT_LOGO
 from aisquare.models import (
@@ -101,14 +107,72 @@ ROLE_ICON: dict[str, str] = {
 }
 STATE_CHIP: dict[str, tuple[str, str]] = {
     "working": ("▶", "green"),
-    "waiting": ("⏸", "yellow"),
+    # One meaning per mark (Q4): ⏸ is paused, as Pause's own button and menu entry draw it, and
+    # waiting, an agent at rest at its prompt, is a muted mark, not a second yellow ⏸.
+    "waiting": ("◦", "dim"),
     "attention": ("🔔", "bold red"),
     "limited": ("⏳", "magenta"),
     "exited": ("💤", "dim"),
     "lost": ("✗", "red"),
-    "paused": ("⏯", "cyan"),
+    "paused": ("⏸", "cyan"),
     "unknown": ("·", "dim"),
 }
+"""Each state's mark, and a style for where no theme is at hand (a test's text, the help). The
+sidebar draws each mark in its theme's tone instead (:data:`STATE_TONE`)."""
+
+STATE_TONE: dict[str, str] = {
+    "working": "success",
+    "waiting": "muted",
+    "attention": "error",
+    "limited": "warning",
+    "exited": "muted",
+    "lost": "error",
+    "paused": "accent",
+    "unknown": "muted",
+}
+"""The tone (``theme.TONES``) each state's mark is drawn in on a theme, readable on its ground
+at 4.5:1 or more (M8: Rich's named colours fell to 1.96:1 on textual-light)."""
+
+BOLD_STATES = frozenset({"attention"})
+"""The states whose mark is bold as well: the one that needs the person."""
+
+
+WORDS = "words"
+"""The key of :func:`state_styles`'s style for a row's words beside its mark (`` exited``,
+``#1·``): the theme's muted tone, where Rich's ``dim`` fell under 3:1 on light themes."""
+
+DRAWN_BEFORE: dict[str, str] = {**{state: style for state, (_, style) in STATE_CHIP.items()}}
+DRAWN_BEFORE["waiting"] = "yellow"
+"""How 0.10.1 drew each state's mark: no mark reads worse than that on any theme (the manager's
+call on #6), and where it read well enough it is drawn as it was (``theme.state_inks``)."""
+
+OWN_TONE_ONLY = frozenset({"waiting"})
+"""The states whose mark may not keep its 0.10.1 style however well it read: waiting's was a
+yellow ⏸ (Q4), and it is a muted mark now, as readable as that yellow."""
+
+
+def state_styles(theme: Theme, terminal: TerminalTheme) -> dict[str, str]:
+    """Each state's style under ``theme`` and the app's ANSI theme (``theme.state_inks``), bold
+    where :data:`BOLD_STATES` says, and the row's words (:data:`WORDS`) in the muted tone. Under
+    a theme of the terminal's own colours, :data:`STATE_CHIP`'s styles and ``dim``."""
+    inks = state_inks(
+        theme,
+        terminal,
+        {
+            state: (STATE_TONE.get(state, "muted"), DRAWN_BEFORE[state], state not in OWN_TONE_ONLY)
+            for state in STATE_CHIP
+        },
+    )
+    styles = {WORDS: theme_tones(theme).get("muted", "dim")}
+    for state, (_mark, fallback) in STATE_CHIP.items():
+        colour = inks.get(state)
+        if colour is None:
+            styles[state] = fallback
+        else:
+            styles[state] = f"bold {colour}" if state in BOLD_STATES else colour
+    return styles
+
+
 CUSTOM_ROLE_ICON = "🤖"
 """The icon for a role the table above does not know (a `team bind` role, say)."""
 
@@ -122,13 +186,18 @@ STOP_STATES: frozenset[str] = ALIVE_STATES | {"exited", "paused"}
 this one constant, never a copy of it: a process to stop (``ALIVE_STATES``), or an
 exited agent's dead window — `remain-on-exit` keeps it for the last screen, and Stop
 on the 💤 row removes it, which takes the row off the listing (``fleet stop`` on an
-ended row, #138). A ✗ lost row has neither: it is ``fleet reap``'s business. A ⏯ paused
+ended row, #138). A ✗ lost row has neither: it is ``fleet reap``'s business. A ⏸ paused
 agent's Stop ends its pause for good: its kept claims go back to the board, and
 ``fleet resume`` leaves it (``fleet stop`` of a paused agent)."""
 
 
 class AddProject(Message):
     """The + beside Fleet."""
+
+
+class HomeRequested(Message):
+    """Esc in the sidebar with no marks to clear: home, as the logo and the Home key go (L1;
+    ``FleetApp.go_home``)."""
 
 
 class ToggleActiveOnly(Message):
@@ -345,31 +414,16 @@ def short_path(path: Path, home: Path | None = None) -> str:
         return str(path)
 
 
-def codename_aside(project: ProjectInfo) -> str | None:
-    """The project's fleet codename when it is not the one its name gives
-    (:func:`codenames.codename_from_text` of :func:`project_name`), else ``None``.
-
-    A manager or a captain names a project by its codename (``--project earnest-hawk``), and
-    one never renamed has a generated one (``earnest-hawk``) its card does not otherwise
-    say; so does one set with ``fleet rename``, or one suffixed because another project
-    held the name's (``aisquare-cli-2``). One its name gives is said by the name itself."""
-    codename = project.codename
-    if codename is None or codename == codenames.codename_from_text(project_name(project)):
-        return None
-    return codename
-
-
 def project_subtitle(project: ProjectInfo, names: Counter[str], *, always: bool) -> str | None:
     """The dim line under a card's name: the project's directory (:func:`short_path`) when
     ``always`` — ``[ui] always_show_project_path`` — or when another listed project shares
-    its name (``names`` counts the listed projects by :func:`project_name`); then
-    `` · <codename>`` when its codename is not the one its name gives
-    (:func:`codename_aside`); ``None``, no line, when neither is said."""
-    path = short_path(project.root) if always or names[project_name(project)] > 1 else None
-    aside = codename_aside(project)
-    if aside is None:
-        return path
-    return f"{path} · {aside}" if path else f"· {aside}"
+    its name (``names`` counts the listed projects by :func:`project_name`); ``None``, no
+    line, otherwise.
+
+    Never the fleet codename (Q3 of the UX audit): it is tmux's and the command line's
+    spelling of the project, and the card named it beside a name that is the person's. The
+    title's tooltip still says it (:func:`project_title_tooltip`)."""
+    return short_path(project.root) if always or names[project_name(project)] > 1 else None
 
 
 def project_title_tooltip(project: ProjectInfo) -> str:
@@ -415,8 +469,10 @@ def agent_row_text(
     width: int | None = None,
     mark: Text | None = None,
     usage: bool = True,
+    styles: Mapping[str, str] | None = None,
+    selected: bool = False,
 ) -> Text:
-    """``🧭 manager       ⏸ #1·42% · skeptic`` — icon, label, state chip, the account's slot
+    """``🧭 manager       ▶ #1·42% · skeptic`` — icon, label, state chip, the account's slot
     and the session use on it, exit status when exited, persona.
 
     ``#<slot>`` is ``FleetAgent.account_slot`` and ``percent`` that account's window that
@@ -451,22 +507,40 @@ def agent_row_text(
     """
     agent = status.agent
     chip, style = STATE_CHIP.get(status.state, STATE_CHIP["unknown"])
+    words = "dim"
+    on_bar = styles is not None and selected
+    if styles is not None:
+        style = styles.get(status.state, styles.get("unknown", style))
+        words = styles.get(WORDS, words)
+    if on_bar:
+        # On the highlight bar the whole row takes the bar's own text colour, which reads on
+        # it (``theme.highlight_colours``): the mark, and its words, ``#1·42%`` and the persona
+        # too. A tone read on the sidebar's ground fell to 1.01:1 for the mark and 1.02 for
+        # the words on catppuccin-latte's bar (the manager's call on #6: text at 4.5:1 on the
+        # keyboard's side, 3:1 faded; marks at 3:1 everywhere).
+        style = "bold" if status.state in BOLD_STATES else ""
+        words = ""
     icon = f"{ROLE_ICON.get(agent.role, CUSTOM_ROLE_ICON)} "
     tail = Text()
     tail.append(chip, style=style)
     if status.state == "exited":
         # 💤 alone read as "sleeping" (#138); the word says what happened.
-        tail.append(" exited", style="dim")
+        tail.append(" exited", style=words)
         if agent.exit_status is not None:
-            tail.append(f"({agent.exit_status})", style="dim")
+            tail.append(f"({agent.exit_status})", style=words)
     elif status.state == "paused":
         # Not exited: `fleet pause` stopped it, and `fleet resume` brings it back.
-        tail.append(" paused", style="dim")
+        tail.append(" paused", style=words)
     elif agent.account_slot is not None and usage:
-        tail.append(f" #{agent.account_slot}" + ("·" if percent is not None else ""), style="dim")
+        tail.append(f" #{agent.account_slot}" + ("·" if percent is not None else ""), style=words)
         if percent is not None:
-            tail.append_text(used_percent_text(percent))
+            used = used_percent_text(percent)
+            if on_bar:  # the figure, in the bar's colour; its own colour off the bar
+                used = Text(used.plain)
+            tail.append_text(used)
     badge = persona_badge(status)
+    if on_bar:
+        badge = Text(badge.plain)
     label = Text(agent.label)
     if (
         mark is not None
@@ -537,30 +611,33 @@ def relabel_preview(typed: str, agent: FleetAgent, taken: Collection[str] = ()) 
 def project_title_text(project: ProjectInfo) -> Text:
     """``🗂 Auth rewrite`` — the name a person gave it (else the folder's), and nothing else.
 
-    The codename is not on this line: a rename gives the project the codename its name
-    gives, and one that is not is said under it (:func:`project_subtitle`) and in the
-    title's tooltip. The chips are their own widget (:func:`project_chips_text`), so a long
-    name is cut before them, not them.
+    The codename is not on the card (Q3), only in the title's tooltip. The chips are their own
+    widget (:func:`project_chips_text`), so a long name is cut before them, not them.
     """
     return Text(f"🗂 {project_name(project)}", no_wrap=True, overflow="ellipsis")
 
 
 def project_chips_text(project: ProjectInfo, statuses: list[FleetAgentStatus]) -> Text:
-    """``  captured  3 · 🔔1`` — what follows the name: captured, agents alive, 🔔 count."""
+    """``  captured  3 · 🔔1 · ⏳2`` — what follows the name: captured, agents alive, the 🔔
+    count, and the ⏳ count of agents at a usage limit (M1 of the UX audit: a limited agent is
+    alive and parked, and the card said nothing of it until its row was found)."""
     text = Text(no_wrap=True)
     if project.onboarded_at is None:
         # Listed only while the shell shows captured directories (#139).
         text.append("  captured", style="dim italic")
     alive = sum(1 for s in statuses if s.state in ALIVE_STATES)
     bells = sum(1 for s in statuses if s.state == "attention")
-    if alive or bells:
-        text.append("  ")
+    limited = sum(1 for s in statuses if s.state == "limited")
+    counts: list[tuple[str, str]] = []
     if alive:
-        text.append(str(alive), style="bold")
+        counts.append((str(alive), "bold"))
     if bells:
-        if alive:
-            text.append(" · ", style="dim")
-        text.append(f"🔔{bells}", style="bold red")
+        counts.append((f"🔔{bells}", "bold red"))
+    if limited:
+        counts.append((f"{STATE_CHIP['limited'][0]}{limited}", "bold"))
+    for place, (count, style) in enumerate(counts):
+        text.append("  " if place == 0 else " · ", style=None if place == 0 else "dim")
+        text.append(count, style=style)
     return text
 
 
@@ -645,6 +722,28 @@ class AgentHeadroom(NamedTuple):
     every_needs_login: bool = False
 
 
+class StatusPalette(NamedTuple):
+    """The status line's colours under a theme (M8): its words in the theme's muted tone, its
+    ``⚠`` in its warning tone, and each figure in its band's colour made readable (``ink``):
+    catppuccin-latte drew the words at 2.80:1 and the green figure at 2.25:1. A band's dot keeps
+    its colour, which tells the bands apart (ΔE 35, ``HEADROOM_DOT``); the grey of nothing read
+    takes the muted tone, where dracula drew it at 2.85:1."""
+
+    muted: str
+    warning: str
+    ink: Callable[[str], str]
+
+
+def status_palette(theme: Theme) -> StatusPalette:
+    """:class:`StatusPalette` under ``theme``."""
+    tones = theme_tones(theme)  # none under an ANSI theme: the line's own Rich styles
+    return StatusPalette(
+        muted=tones.get("muted", "dim"),
+        warning=tones.get("warning", "yellow"),
+        ink=lambda colour: readable_on(colour, theme),
+    )
+
+
 def status_line_text(
     headroom: HeadroomSummary | None,
     *,
@@ -652,8 +751,9 @@ def status_line_text(
     name: str | None = None,
     more: Sequence[AgentHeadroom] = (),
     width: int | None = None,
+    palette: StatusPalette | None = None,
 ) -> Text:
-    """``● 3x claude 58%`` (the x a multiplication sign), under *⚙ Settings*.
+    """``● Claude: 3 accounts · 58% left``, under *⚙ Settings*: the state in words (Q8).
 
     No AISquare sign-in: that is on the Accounts page alone (owner, 2026-11-17). The
     Claude dot is :func:`headroom_dot`; the count is how many accounts are usable;
@@ -662,18 +762,18 @@ def status_line_text(
     needs a login. ``headroom`` is ``None`` until the first summary lands. ``name`` is
     what the first dot names its accounts by, the default agent's binary unless given.
     Each agent in ``more`` (Codex's accounts) has a line of its own under it, read the
-    same way: ``● 1x codex 58%``.
+    same way: ``● Codex: 1 account · 58% left``.
 
-    ``width``, the cells the line has: the figure is left out where the line would not
-    fit it, so the ellipsis never cuts the ``⚠`` (something to do) nor a number in two. In
-    16 cells, ``2x claude 3% ⚠`` fits and ``2x claude 58% ⚠`` does not (review of #357,
-    when the AISquare dot took 12 of the sidebar's 28).
+    ``width``, the cells the line has: `` left``, then the figure, are left out where the
+    line would not fit them, so the ellipsis never cuts the ``⚠`` (something to do) nor a
+    number in two (review of #357). In the sidebar's 28 cells, ``● Claude: 2 accounts ·
+    58% ⚠`` fits and `` left`` does not.
     """
     text = Text(no_wrap=True, overflow="ellipsis")
-    _append_agent(text, name or default_binary(), headroom, every_needs_login, width)
+    _append_agent(text, name or default_binary(), headroom, every_needs_login, width, palette)
     for other in more:
         text.append("\n")
-        _append_agent(text, other.name, other.headroom, other.every_needs_login, width)
+        _append_agent(text, other.name, other.headroom, other.every_needs_login, width, palette)
     return text
 
 
@@ -683,31 +783,58 @@ def _append_agent(
     headroom: HeadroomSummary | None,
     every_needs_login: bool,
     room: int | None,
+    palette: StatusPalette | None = None,
 ) -> None:
-    """One agent's dot, count, name, figure and ``⚠`` at the end of ``text``'s last line;
-    ``room`` is the cells that line has."""
+    """One agent's line in words (Q8 of the UX audit), at the end of ``text``'s last line:
+    ``● Claude: 2 accounts · 58% left ⚠``, its dot, the agent, its usable accounts, the room
+    LEFT across them in the dot's colour, and a ``⚠`` when one needs a login. ``room`` is the
+    cells the line has: `` left`` gives way first, then the figure, never the ``⚠`` (something to
+    do). Before the first reading, the agent's name alone."""
     line = Text()
     dot, colour = headroom_dot(headroom, every_needs_login=every_needs_login)
-    line.append(f"{dot} ", style=colour)
-    if headroom is not None:
-        line.append(f"{headroom.usable}{TIMES} ", style="dim")
-    line.append(name, style="dim")
-    warning = " ⚠" if headroom is not None and headroom.needs_login else ""
-    if headroom is not None and headroom.percent_left is not None:
+    words = palette.muted if palette is not None else "dim"
+    figured = palette.ink(colour) if palette is not None else colour
+    dotted = colour
+    if palette is not None and colour and not colour.startswith("#"):
+        # The grey of nothing read, no band of its own: the muted tone, which reads (dracula's
+        # grey was 2.85:1). A band's dot keeps its colour, ΔE 35 from the next band's.
+        dotted = figured = palette.muted
+    line.append(f"{dot} ", style=dotted)
+    word = name[:1].upper() + name[1:]
+    if headroom is None:
+        line.append(word, style=words)
+        text.append_text(line)
+        return
+    accounts = "account" if headroom.usable == 1 else "accounts"
+    line.append(f"{word}: {headroom.usable} {accounts}", style=words)
+    warning = " ⚠" if headroom.needs_login else ""
+    if headroom.percent_left is not None:
         # The figure the dot's band stands for (#287): percent LEFT, in the dot's colour.
-        figure = f" {round(headroom.percent_left)}%"
-        if room is None or line.cell_len + cell_len(figure + warning) <= room:
-            line.append(figure, style=colour)
+        figure = f"{round(headroom.percent_left)}%"
+        for said in (" left", ""):
+            if room is None or line.cell_len + cell_len(f" · {figure}{said}{warning}") <= room:
+                line.append(" · ", style=words)
+                line.append(figure, style=figured)
+                line.append(said, style=words)
+                break
     if warning:
-        line.append(warning, style="yellow")
+        line.append(warning, style=palette.warning if palette is not None else "yellow")
     text.append_text(line)
 
 
-def update_row_text(version: str, *, runnable: bool = True) -> Text:
+HOME_MOVE_ROW = "Move rlx's home"
+"""The ⬆ row's words for the move of a home from before 0.10.2 alone (#31): no command (R13)."""
+
+
+def update_row_text(version: str, *, runnable: bool = True, home: bool = False) -> Text:
     """``⬆ 0.8.3 · restart to update`` — the row under *⚙ Settings* while a newer release is
     out. An install asq does not update itself (Homebrew, pip) is told how instead, so the
-    row says that: its dialog shows the command and no restart."""
+    row says that: its dialog shows the command and no restart. ``home``: no newer release,
+    and a home from before 0.10.2 to move (``updates.Offer.home_only``): ``⬆ Move rlx's home``."""
     text = Text(no_wrap=True, overflow="ellipsis")
+    if home:
+        text.append(f"{UPDATE_ICON} {HOME_MOVE_ROW}", style=f"bold {GREEN}")
+        return text
     text.append(f"{UPDATE_ICON} {version}", style=f"bold {GREEN}")
     text.append(" · restart to update" if runnable else " · how to update", style="dim")
     return text
@@ -808,8 +935,18 @@ class Activatable(Static):
         return None
 
 
+# The + menu's *Adopt a conversation…* is the Accounts page's flow (``adopt_picker.AdoptFlow``),
+# its workers by their names: the shell knows them, the list as a read a hand-over waits out
+# (``app._waited_reads``) and the adoption, a fleet spawn, as a writer a quit refuses beside
+# (``app._writing_workers``).
+ADOPT_LIST_WORKER = adopt_picker.ADOPT_LIST_WORKER
+ADOPT_WORKER = adopt_picker.ADOPT_WORKER
+
+
 class AddButton(Activatable):
-    """The ``+`` beside Fleet: onboard a project."""
+    """The ``+`` beside Fleet: its menu (M6), *Add a project…* (onboard one, as the ``+`` did on
+    its own) or *Adopt a conversation…* (``adopt_picker.AdoptFlow``, the Accounts page's
+    button's, which stays). The app's ``+`` key still onboards at once."""
 
     DEFAULT_CSS = """
     AddButton { width: 3; text-style: bold; color: $accent; }
@@ -819,9 +956,45 @@ class AddButton(Activatable):
         super().__init__(Text(" + "), id="add-project")
         # The arrows highlight it like any row; once onboarding opens, no row is.
         self.selection_key = "add"
+        self._adopt = adopt_picker.AdoptFlow(
+            self, self._report_adoption_step, adopted=self._read_the_adopted_row
+        )
+        """*Adopt a conversation…*: the Accounts page's flow, said in toasts."""
 
     def message(self) -> Message:
         return AddProject()
+
+    def activate(self) -> None:
+        """A click on the ``+``, or Enter on it: its menu, under it."""
+        self.app.push_screen(adopt_picker.AddMenu(self.region), self._chosen)
+
+    def _chosen(self, choice: str | None) -> None:
+        if choice == adopt_picker.ADD_A_PROJECT:
+            super().activate()  # AddProject, from this row, as the + posted it before
+        elif choice == adopt_picker.ADOPT_A_CONVERSATION:
+            self._adopt.begin_adoption()
+
+    def _report_adoption_step(self, text: str, tone: str) -> None:
+        error = tone == "error"
+        self.notify(
+            text,
+            severity="error" if error else "information",
+            timeout=8 if error else 6,
+            markup=False,
+        )
+
+    def _read_the_adopted_row(self, receipt: fleet_service.SpawnReceipt) -> None:
+        """The frame read again, so the adopted agent's row shows on its project's card."""
+        refresh = getattr(self.app, "refresh_data", None)
+        if callable(refresh):
+            refresh()
+
+    def on_worker_state_changed(self, event: Worker.StateChanged) -> None:
+        if event.state in (
+            WorkerState.SUCCESS,
+            WorkerState.ERROR,
+        ) and self._adopt.adoption_answered(event.worker, event.state):
+            event.stop()
 
 
 ACTIVE_ONLY_EMPTY = "No active projects — press l to show all."
@@ -1200,9 +1373,9 @@ class AgentRow(Activatable):
         super().__init__(agent_row_text(status), id=f"agent-row-{status.agent.id}")
         self.status = status
         self.selection_key = f"agent:{status.agent.id}"
-        self._painted: tuple[FleetAgentStatus, float | None, int, bool, bool, bool, bool] | None = (
-            None
-        )
+        self._painted: (
+            tuple[FleetAgentStatus, float | None, int, bool, str, bool, bool, bool] | None
+        ) = None
         self.prefill = ""
         """What the name field said when it opened: leaving it so is no change."""
         self._field: AgentLabelInput | None = None
@@ -1384,15 +1557,25 @@ class AgentRow(Activatable):
         marked = sidebar is not None and sidebar.agents_marked
         shown = sidebar is None or sidebar.usage_shown
         menu = self.menu_shown
-        # The mark takes the theme's darkness's colour (``AgentMark.colour``). A theme change
-        # renders every widget again, and :meth:`render` paints: the darkness is in the key.
+        # The mark takes the theme's darkness's colour (``AgentMark.colour``), the chip its
+        # theme's tone (:func:`state_styles`). A theme change renders every widget again, and
+        # :meth:`render` paints: the theme is in the key.
         dark = self.app.current_theme.dark
-        wanted = (self.status, percent, width, marked, dark, shown, menu)
+        selected = self.has_class("selected")
+        wanted = (self.status, percent, width, marked, self.app.theme, shown, menu, selected)
         if wanted != self._painted:
             self._painted = wanted
             mark = agent_mark(agent_kind(self.status), dark) if marked else None
             room = width - len(MENU_GLYPH) if menu and width else width
-            text = agent_row_text(self.status, percent, width=room or None, mark=mark, usage=shown)
+            text = agent_row_text(
+                self.status,
+                percent,
+                width=room or None,
+                mark=mark,
+                usage=shown,
+                styles=state_styles(self.app.current_theme, self.app.ansi_theme),
+                selected=selected,
+            )
             if menu and width:
                 # The label gave way for it: the chip and ``#N·NN%`` stay whole.
                 text.truncate(room, pad=True)
@@ -1495,8 +1678,41 @@ def has_live_agent(
     return (live or {}).get(project_id, 0) > 0
 
 
+class GroupNameInput(NicknameInput):
+    """A group header's name as a field (#39): the card's name field, Enter, Esc, a paste and
+    a press away alike. The header handles what it posts (``NicknameInput.Cancelled`` and
+    ``Left``): no card is above it to take them."""
+
+
+GROUP_EMPTY = "Empty. Drag a project here, or ⋯ → Delete"
+"""What an expanded group with no project says under its header (#39): quiet, and the two
+ways on from it."""
+
+GROUP_TIP = f"click folds · F2 renames · {MENU_TIP} · drag to reorder"
+"""A group header's gestures, on hover."""
+
+
+def group_name_refusal(typed: str, group_id: str, taken: Iterable[ProjectGroup]) -> str | None:
+    """Why a group header's field does not save ``typed``, in the sidebar's words: no name, or
+    another group's (the store's rule: exactly, or with another case). ``None`` saves it."""
+    clean = typed.strip()
+    if not clean:
+        return "a group needs a name"
+    for other in taken:
+        if other.id != group_id and (other.name == clean or other.name.lower() == clean.lower()):
+            return f"another group is called {other.name}"
+    return None
+
+
 class GroupHeader(DragHandle):
-    """A group's line: Enter or a click folds and unfolds it; drag it to reorder groups (#140)."""
+    """A group's line: Enter or a click folds and unfolds it; drag it to reorder groups (#140).
+
+    Its menu (#39) is the card's: ⋯ in its last two cells while it is hovered or highlighted,
+    a click there, a right-click anywhere on it, or ``.`` on it. Its name is renamed in place,
+    from that menu or F2: a field opens over the line, prefilled and all selected; Enter or
+    leaving it saves a name no other group has (:func:`group_name_refusal`, said in a toast,
+    the field staying open with what was typed), and Esc always closes it with nothing changed.
+    """
 
     # Two rows while it is the drop target: the accent line takes one, and on a
     # one-row header it took the only row — the name went blank under the pointer.
@@ -1504,6 +1720,7 @@ class GroupHeader(DragHandle):
     GroupHeader { padding: 0 1; color: $text; background: $boost; }
     GroupHeader.-dragging { opacity: 60%; }
     GroupHeader.-drop-before { height: 2; border-top: solid $accent; }
+    GroupHeader GroupNameInput { width: 1fr; height: 1; }
     """
 
     def __init__(
@@ -1512,9 +1729,16 @@ class GroupHeader(DragHandle):
         agents: Mapping[str, list[FleetAgentStatus]],
         live: Mapping[str, int] | None = None,
     ) -> None:
-        super().__init__(group_header_text(entry, agents, live), id=f"group-{entry.group.id}")
+        text = group_header_text(entry, agents, live)
+        super().__init__(text, id=f"group-{entry.group.id}")
         self.group: ProjectGroup = entry.group
+        self.count = len(entry.members) + len(entry.pinned_members)
+        """How many projects are the group's, its pinned ones too."""
         self.selection_key = f"group:{entry.group.id}"
+        self._text = text
+        self._painted: tuple[Text, int, bool] | None = None
+        self._field: GroupNameInput | None = None
+        self.tooltip = GROUP_TIP
 
     def show(
         self,
@@ -1523,7 +1747,9 @@ class GroupHeader(DragHandle):
         live: Mapping[str, int] | None = None,
     ) -> None:
         self.group = entry.group
-        self.update(group_header_text(entry, agents, live))
+        self.count = len(entry.members) + len(entry.pinned_members)
+        self._text = group_header_text(entry, agents, live)
+        self.paint()
 
     def message(self) -> Message:
         return ToggleCollapse(self.group.id)
@@ -1533,7 +1759,166 @@ class GroupHeader(DragHandle):
         # has nothing to move either): dropped, it renumbered the unpinned groups.
         if self.group.pinned_at is not None:
             return None
+        if self.renaming:
+            # A press in its name field bubbles up here: it is the field's (its cursor, its
+            # selection), never a drag of the group. A card's field is beside its title; this
+            # one is in the handle.
+            return None
         return DragState("group", self.group.id)
+
+    # --- its line, and the ⋯ on it --------------------------------------------------------
+
+    def paint(self) -> None:
+        """Draw the line for its width: ⋯ in the last two cells while it is hovered or
+        highlighted (:attr:`menu_shown`), the name giving way for it, as an agent's row does."""
+        width = self.content_size.width
+        menu = self.menu_shown
+        wanted = (self._text, width, menu)
+        if wanted == self._painted:
+            return
+        self._painted = wanted
+        text = self._text.copy()
+        if menu and width > len(MENU_GLYPH):
+            text.truncate(width - len(MENU_GLYPH), overflow="ellipsis", pad=True)
+            text.append(MENU_GLYPH, style="bold")
+        self.update(text, layout=False)
+
+    @property
+    def menu_shown(self) -> bool:
+        return self._hovered or self.has_class("selected")
+
+    _hovered = False
+
+    def on_enter(self, event: events.Enter) -> None:
+        if not self._hovered:
+            self._hovered = True
+            self.paint()
+
+    def on_leave(self, event: events.Leave) -> None:
+        if self._hovered:
+            self._hovered = False
+            self.paint()
+
+    def on_resize(self) -> None:
+        self.paint()
+
+    def render(self) -> RenderResult:
+        """Painted here too, as an agent's row is: a frame is never drawn at no width, and the
+        highlight (a class) repaints the line with its ⋯."""
+        self.paint()
+        return super().render()
+
+    def _on_menu(self, event: events.Click) -> bool:
+        """Whether ``event`` is a plain click on the line's ⋯, its last two cells."""
+        if event.button != 1 or not self.menu_shown:
+            return False
+        offset = event.get_content_offset(self)
+        return offset is not None and offset.x >= self.content_size.width - len(MENU_GLYPH)
+
+    def on_click(self, event: events.Click) -> None:
+        if self.renaming:
+            # A click in its field is the field's: no fold.
+            event.stop()
+            event.prevent_default()
+            return
+        sidebar = self._sidebar()
+        if sidebar is not None and (event.button == 3 or self._on_menu(event)):
+            # Its menu: a right-click anywhere on the line, or a click on its ⋯.
+            event.stop()
+            event.prevent_default()
+            sidebar.open_group_menu(self.group.id)
+
+    # --- the name, renamed in place ---------------------------------------------------
+
+    @property
+    def renaming(self) -> bool:
+        return self._field is not None
+
+    @property
+    def field(self) -> GroupNameInput | None:
+        return self._field
+
+    def open_rename(self, typed: str | None = None) -> None:
+        """Open the field over the line, prefilled with the name (or ``typed``), all selected.
+
+        Already open, it only takes the focus back: what was typed is kept."""
+        if self._field is None:
+            field = GroupNameInput(
+                value=self.group.name if typed is None else typed,
+                compact=True,
+                id=f"group-name-{self.group.id}",
+            )
+            field.tooltip = "Enter saves, Esc cancels"
+            self._field = field
+            self.add_class("-renaming")
+            self.mount(field)
+        self.call_after_refresh(self._focus_field)
+
+    def _focus_field(self) -> None:
+        if self._field is not None and self._field.is_mounted:
+            self._field.focus()
+            self._field.select_all()
+
+    def close_rename(self, *, refocus: bool) -> None:
+        """Close the field and show the line; ``refocus`` hands the keys back to the sidebar."""
+        field = self._field
+        if field is None:
+            return
+        self._field = None
+        self.remove_class("-renaming")
+        field.remove()
+        sidebar = self._sidebar()
+        if refocus and sidebar is not None:
+            sidebar.focus()
+
+    def _save_typed(self, typed: str, *, refocus: bool) -> None:
+        """Save what the field says: unchanged, it just closes; a name the sidebar refuses is
+        said, and the field stays open with it; any other the shell writes (``RenameGroup``)."""
+        if typed.strip() == self.group.name:
+            self.close_rename(refocus=refocus)
+            return
+        sidebar = self._sidebar()
+        refusal = group_name_refusal(typed, self.group.id, sidebar.groups if sidebar else ())
+        if refusal is not None:
+            self.app.notify(f"not renamed: {refusal}", severity="warning", timeout=6, markup=False)
+            if refocus:
+                self._focus_field()
+            return
+        self.close_rename(refocus=refocus)
+        self.post_message(RenameGroup(self.group.id, typed.strip()))
+
+    @on(Input.Submitted, "GroupNameInput")
+    def _submitted(self, event: Input.Submitted) -> None:
+        event.stop()
+        self._save_typed(event.value, refocus=True)
+
+    @on(NicknameInput.Left)
+    def _left(self, event: NicknameInput.Left) -> None:
+        """Focus-out saves, as Enter does — while the field is still open, and not when the
+        terminal itself lost the focus (Textual blurs the focused widget then)."""
+        event.stop()
+        if self._field is not None and self.app.app_focus:
+            self._save_typed(self._field.value, refocus=False)
+
+    @on(NicknameInput.Cancelled)
+    def _cancelled(self, event: NicknameInput.Cancelled) -> None:
+        event.stop()
+        self.close_rename(refocus=True)
+
+
+class GroupEmptyLine(Static):
+    """Under an expanded group with no project (#39): :data:`GROUP_EMPTY`, dim. Not a row the
+    arrows stop on; a card dropped on it goes into its group, as one dropped on the header."""
+
+    # Wrapped, not cut: the narrowest sidebar keeps both ways on (two lines at 30 columns).
+    DEFAULT_CSS = """
+    GroupEmptyLine { height: auto; padding: 0 1 0 4; color: $text-muted; }
+    GroupEmptyLine.-drop-before { border-top: solid $accent; }
+    """
+
+    def __init__(self, group_id: str) -> None:
+        super().__init__(Text(GROUP_EMPTY), id=f"group-empty-{group_id}")
+        self.group_id = group_id
 
 
 class SectionLabel(Static):
@@ -1811,11 +2196,12 @@ class UpdateRow(Activatable):
     def message(self) -> Message:
         return UpdateSelected()
 
-    def offer(self, version: str | None, *, runnable: bool = True) -> None:
-        """Show the row for ``version``; ``None`` takes it away."""
+    def offer(self, version: str | None, *, runnable: bool = True, home: bool = False) -> None:
+        """Show the row for ``version`` (``home``: the home's move alone); ``None`` takes it
+        away."""
         self.version = version
         if version is not None:
-            self.update(update_row_text(version, runnable=runnable))
+            self.update(update_row_text(version, runnable=runnable, home=home))
         self.set_class(version is not None, "offered")
 
 
@@ -2018,8 +2404,20 @@ class StatusLine(Static):
                 name=name,
                 more=more,
                 width=self.content_size.width or None,
+                palette=status_palette(self.app.current_theme),
             )
         )
+        self._painted_in = self.app.theme
+
+    _painted_in: str | None = None
+    """The theme the line was last drawn in (:meth:`notify_style_update`)."""
+
+    def notify_style_update(self) -> None:
+        """A theme change restyles every widget: the line again, in the new theme's colours,
+        once per theme (its colours are not CSS, so nothing else redraws them)."""
+        super().notify_style_update()
+        if self.is_mounted and self.app.theme != self._painted_in:
+            self.fit_line()
 
     def on_click(self, event: events.Click) -> None:
         event.stop()
@@ -2122,9 +2520,11 @@ class Sidebar(Vertical):
         Binding("G,shift+g", "group_marked", "group selection", show=False),
         Binding("m", "toggle_mark", "mark", show=False),
         Binding("space", "toggle_collapse", "fold", show=False),
-        Binding("u", "undo_layout", "undo", show=False),
-        Binding("escape", "clear_marks", "clear marks", show=False),
-        # The highlighted card: its name in place, and its menu (⋯).
+        # ctrl+z too (#39), the settings pages' undo key: bound here, it is the sidebar's
+        # alone, and a settings page's binds its own.
+        Binding("u,ctrl+z", "undo_layout", "undo", show=False),
+        Binding("escape", "escape", "clear marks · home", show=False),
+        # The highlighted card's or group header's name in place, and its menu (⋯).
         Binding("f2", "rename", "rename", show=False),
         Binding("full_stop", "project_menu", "menu", show=False, key_display="."),
         # The header's ○/●: only the projects with a live agent, or all of them again.
@@ -2315,6 +2715,7 @@ class Sidebar(Vertical):
         existing_cards = {c.project.id: c for c in shown if isinstance(c, ProjectCard)}
         existing_headers = {h.group.id: h for h in shown if isinstance(h, GroupHeader)}
         existing_labels = {label.id: label for label in shown if isinstance(label, SectionLabel)}
+        existing_empty = {line.group_id: line for line in shown if isinstance(line, GroupEmptyLine)}
         names = Counter(project_name(p) for p in projects)
         ordered: list[Widget] = []
         stripe = 0
@@ -2358,6 +2759,11 @@ class Sidebar(Vertical):
             if not header.display:
                 hidden_groups.add(entry.group.id)
             ordered.append(header)
+            if not entry.members and not entry.pinned_members:
+                # Quiet, not broken (#39): an expanded group with no project says so.
+                line = existing_empty.pop(entry.group.id, None) or GroupEmptyLine(entry.group.id)
+                line.display = header.display and not entry.group.collapsed
+                ordered.append(line)
             for member in entry.members:
                 card_for(member, scope=entry.group.id, hidden=entry.group.collapsed)
             return header.display
@@ -2385,6 +2791,7 @@ class Sidebar(Vertical):
             *existing_cards.values(),
             *existing_headers.values(),
             *existing_labels.values(),
+            *existing_empty.values(),
         ]
         for widget in stale:
             widget.remove()
@@ -2489,6 +2896,23 @@ class Sidebar(Vertical):
         if target is not None and target[0] == "project":
             self.toggle_mark(target[1])
 
+    def action_escape(self) -> None:
+        """Esc in the sidebar: clear the cards' marks, or with none to clear, go home (L1: the
+        last-used project's Manager tab, as the logo and the Home key go; the shell decides).
+        Esc's own: the shell clears the marks after a drop or a group pick (``clear_marks``),
+        and going home there replaced whatever view was open (review of #580, #981).
+
+        A group's name field left open, unsaved, by a refused name (#39) closes first: Esc
+        always leaves it with nothing changed."""
+        open_fields = [header for header in self.query(GroupHeader) if header.renaming]
+        if open_fields:
+            for header in open_fields:
+                header.close_rename(refocus=True)
+        elif self._marked:
+            self.action_clear_marks()
+        else:
+            self.post_message(HomeRequested())
+
     def action_clear_marks(self) -> None:
         self._marked.clear()
         for card in self.query(ProjectCard):
@@ -2550,6 +2974,12 @@ class Sidebar(Vertical):
             self.post_message(GroupProjects(list(self._marked)))
 
     def action_undo_layout(self) -> None:
+        """``u`` or ctrl+z: take the last arrangement back — never from a name field open in the
+        sidebar (a card's, an agent's, a group's). An ``Input`` lets ctrl+z through to here,
+        and a group just deleted came back mid-typing (reviewer of #39, #2993); ``u`` it takes
+        as text."""
+        if isinstance(self.screen.focused, Input):
+            return
         self.post_message(UndoLayout())
 
     # a card's name and its menu
@@ -2565,6 +2995,7 @@ class Sidebar(Vertical):
             if other.project.id != project_id and other.renaming:
                 other.close_rename(refocus=False)
         self._close_agent_fields()
+        self._close_group_fields()
         card = self._card(project_id)
         if card is not None and card.display:
             card.open_rename(typed)
@@ -2593,6 +3024,7 @@ class Sidebar(Vertical):
             if card.renaming:
                 card.close_rename(refocus=False)
         self._close_agent_fields(but=row)
+        self._close_group_fields()
         row.open_rename(typed)
         return None
 
@@ -2616,6 +3048,8 @@ class Sidebar(Vertical):
         target = self._cursor_target()
         if target is not None and target[0] == "project":
             self.open_rename(target[1])
+        elif target is not None and target[0] == "group":
+            self.open_group_rename(target[1])
 
     def action_project_menu(self) -> None:
         """``.``: the menu of what is highlighted — an agent's row, its agent's (Q-F1); a card,
@@ -2628,6 +3062,8 @@ class Sidebar(Vertical):
         target = self._cursor_target()
         if target is not None and target[0] == "project":
             self.open_menu(target[1])
+        elif target is not None and target[0] == "group":
+            self.open_group_menu(target[1])
 
     def open_agent_menu(self, agent_id: str) -> None:
         """Ask the shell for ``agent_id``'s menu, under its row."""
@@ -2635,6 +3071,62 @@ class Sidebar(Vertical):
         if row is not None:
             agent = row.status.agent
             self.post_message(OpenAgentMenu(agent.project_id, agent.id, row.region))
+
+    # a group header's name and its menu (#39)
+
+    @property
+    def groups(self) -> list[ProjectGroup]:
+        """Every group the last frame listed, pinned or not."""
+        if self.arrangement is None:
+            return []
+        pinned = [e.group for e in self.arrangement.pinned if isinstance(e, GroupEntry)]
+        return [*pinned, *(e.group for e in self.arrangement.groups)]
+
+    def _group_header(self, group_id: str) -> GroupHeader | None:
+        return next((h for h in self.query(GroupHeader) if h.group.id == group_id), None)
+
+    def open_group_menu(self, group_id: str) -> None:
+        """Ask the shell for ``group_id``'s menu, under its header: how many projects are the
+        group's, and whether a step up or down would move it (``project_groups.step_group``'s
+        rule: past the next header on screen, never a pinned group)."""
+        header = self._group_header(group_id)
+        if header is None or not self._on_screen(header):
+            return
+        steps = [
+            e.group.id
+            for e in (self.arrangement.groups if self.arrangement is not None else [])
+            if e.group.id not in self.hidden_groups
+        ]
+        movable = header.group.pinned_at is None and group_id in steps
+        index = steps.index(group_id) if movable else -1
+        self.post_message(
+            OpenGroupMenu(
+                header.group,
+                header.region,
+                count=header.count,
+                up=movable and index > 0,
+                down=movable and index < len(steps) - 1,
+            )
+        )
+
+    def open_group_rename(self, group_id: str, typed: str | None = None) -> None:
+        """Open ``group_id``'s name field on its header (``typed`` in it); every other name
+        field closes unsaved: one at a time."""
+        header = self._group_header(group_id)
+        if header is None or not self._on_screen(header):
+            return
+        for card in self.query(ProjectCard):
+            if card.renaming:
+                card.close_rename(refocus=False)
+        self._close_agent_fields()
+        self._close_group_fields(but=header)
+        header.open_rename(typed)
+
+    def _close_group_fields(self, but: GroupHeader | None = None) -> None:
+        """Close every group header's open name field, unsaved, but ``but``'s."""
+        for header in self.query(GroupHeader):
+            if header is not but and header.renaming:
+                header.close_rename(refocus=False)
 
     # drag and drop: press on a title or a group header, move past its row, release on a target
 
@@ -2702,8 +3194,9 @@ class Sidebar(Vertical):
             if before != drag.ident:  # dropped on itself: snap back
                 self.post_message(DropGroup(drag.ident, before=before))
             return True
-        if isinstance(target, GroupHeader):
-            self.post_message(DropProject(drag.project_ids, scope=target.group.id, before=None))
+        if isinstance(target, GroupHeader | GroupEmptyLine):
+            scope = target.group.id if isinstance(target, GroupHeader) else target.group_id
+            self.post_message(DropProject(drag.project_ids, scope=scope, before=None))
         elif isinstance(target, ProjectCard):
             if target.project.id not in drag.project_ids:  # dropped on itself: snap back
                 self.post_message(
@@ -2739,6 +3232,9 @@ class Sidebar(Vertical):
         if widget is holder:
             return holder
         for node in (widget, *widget.ancestors):
+            if isinstance(node, GroupEmptyLine):
+                # Into its group, as onto the header; never a place for a group (#39).
+                return None if drag.kind == "group" else node
             if isinstance(node, GroupHeader):
                 if drag.kind == "group" and (
                     node.group.pinned_at is not None or node.group.id == drag.ident
@@ -2761,7 +3257,7 @@ class Sidebar(Vertical):
         if self._drop_target is not None:
             self._drop_target.remove_class("-drop-before")
         self._drop_target = target
-        if isinstance(target, ProjectCard | GroupHeader):
+        if isinstance(target, ProjectCard | GroupHeader | GroupEmptyLine):
             target.add_class("-drop-before")
 
     def show_notice(self, text: str | None) -> None:
@@ -2819,10 +3315,12 @@ class Sidebar(Vertical):
             title.rebuild()
             title.tooltip = fleet_title_tooltip(self._title_count())
 
-    def show_update(self, version: str | None, *, runnable: bool = True) -> None:
-        """The ⬆ row for a newer release (``services.updates.check_for_release``); ``None``
-        hides it."""
-        self.query_one(UpdateRow).offer(version, runnable=runnable)
+    def show_update(
+        self, version: str | None, *, runnable: bool = True, home: bool = False
+    ) -> None:
+        """The ⬆ row for a newer release (``services.updates.check_for_release``), or for the
+        move of a home from before 0.10.2 alone (``home``); ``None`` hides it."""
+        self.query_one(UpdateRow).offer(version, runnable=runnable, home=home)
 
     def _paint_status(self) -> None:
         self.query_one(StatusLine).show_facts(

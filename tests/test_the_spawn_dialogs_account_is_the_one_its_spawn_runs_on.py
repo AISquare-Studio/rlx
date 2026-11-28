@@ -51,14 +51,15 @@ from tests.test_ui_spawn import Host, account_field, drive, select, settle, show
 RESETS = datetime.now(tz=UTC) + timedelta(days=3)
 
 
-def _reading(spent: Iterable[str] = ()) -> ClaudeUsage:
-    """Room in every window, and each family of ``spent`` out of its week."""
+def _reading(spent: Iterable[str] = (), *, week: float = 10.0) -> ClaudeUsage:
+    """Room in every window, ``week`` percent of the week used, and each family of ``spent``
+    out of its week."""
     families = list(spent)
     return ClaudeUsage(
         available=True,
         windows=(
             UsageWindow(name="session", minutes=300, used_percent=10.0),
-            UsageWindow(name="week", minutes=10080, used_percent=10.0, resets_at=RESETS),
+            UsageWindow(name="week", minutes=10080, used_percent=week, resets_at=RESETS),
         ),
         family_week_percent=dict.fromkeys(families, 100.0),
         family_week_resets_at=dict.fromkeys(families, RESETS),
@@ -120,7 +121,9 @@ def test_the_label_of_the_dialogs_default_path_is_the_account_the_spawn_runs_on(
         monkeypatch,
         {
             home["work"].slot: _reading(("opus", "fable")),
-            home["spare"].slot: _reading(spare_spent or ("sonnet", "haiku")),
+            # Fuller than work: with no family, work wins even keeping the 20% of its week the
+            # balanced pick (#35) leaves on rank 1 for the person.
+            home["spare"].slot: _reading(spare_spent or ("sonnet", "haiku"), week=40.0),
             home["codex-a"].slot: _reading(),
             home["codex-b"].slot: _reading(),
         },
@@ -164,7 +167,8 @@ def _every_claude_week_of_fable_spent(monkeypatch: pytest.MonkeyPatch) -> dict[s
         monkeypatch,
         {
             home["work"].slot: _reading(("opus", "fable")),
-            home["spare"].slot: _reading(("opus", "sonnet", "haiku", "fable")),
+            # Fuller than work, as above: a spawn of no family stays on work (#35's reserve).
+            home["spare"].slot: _reading(("opus", "sonnet", "haiku", "fable"), week=40.0),
             home["codex-a"].slot: _reading(),
             home["codex-b"].slot: _reading(),
         },

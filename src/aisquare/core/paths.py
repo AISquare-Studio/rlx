@@ -1,18 +1,30 @@
-"""Filesystem layout of the ``~/.aisquare`` home directory.
+"""rlx's home and its layout: the one file that says where everything under the home lives.
 
-Layout:
-    ~/.aisquare/
-    ├── config.toml     # typed TOML configuration (see core.config)
-    ├── credentials     # API keys / tokens
-    ├── context.db      # SQLite store: context entries and projects (see core.store)
-    ├── agents.json     # registry of detected and connected agents
-    ├── claude-accounts/# one CLAUDE_CONFIG_DIR per managed account (core.claude_accounts)
-    ├── codex-accounts/ # one CODEX_HOME per managed Codex account (core.codex_accounts)
-    ├── cache/          # disposable cached data (incl. each managed account's TMPDIR)
-    ├── explainability/ # session→Run join records (see services.explainability)
-    └── log/            # capture and diagnostic logs
+Since 0.10.2 (#30, H1) the home is ``~/.rlx``, laid out as docs/home-layout.md describes::
 
-Set ``AISQUARE_HOME`` to relocate the whole tree (tests rely on this).
+    ~/.rlx/
+    ├── config.toml  state.json  agents.json
+    ├── rlx.db                    # the store: projects, groups, fleet rows, boards, tasks, ...
+    ├── accounts/claude/<slot>/   # one CLAUDE_CONFIG_DIR per managed account
+    ├── accounts/codex/<slot>/    # one CODEX_HOME per managed Codex account
+    ├── accounts/aisquare/        # the AISquare sign-in's credentials
+    ├── projects/<project-id>/    # a project's own files (its manager's state, its code index)
+    ├── fleet/                    # tmux.conf, launch-seals/
+    ├── run/                      # instances/, locks/: what lives while an rlx runs
+    ├── remote/  watch/  logs/  cache/
+
+A home from before it (``~/.aisquare``) keeps the layout it was made in until H2 migrates it:
+``context.db``, ``claude-accounts/``, ``launch-seals/`` and the rest at its top (:data:`OLD`).
+
+WHERE the home is: ``$RLX_HOME``, else ``$AISQUARE_HOME`` (the name before it, still honoured),
+else ``~/.rlx`` if it exists, else ``~/.aisquare`` if it exists, else ``~/.rlx`` (a new user).
+A variable naming ``~/.aisquare`` itself, by any spelling, is read as no variable (#31).
+HOW it is laid out: a home a variable names is laid out by what is in it (``rlx.db``: the new
+layout; ``context.db``, ``launch-seals/``, ``instances/``, ``log/``, an agent's ``*-accounts/`` and
+the old layout's other top-level names: the old one;
+nothing yet: the new one), so the fleet's agents, which are handed the home as
+``AISQUARE_HOME``, read it as the rlx that started them does. ``~/.aisquare`` with no ``~/.rlx``
+is the old layout. Every path under the home is built by a helper here, named for what it holds.
 """
 
 from __future__ import annotations
@@ -23,15 +35,46 @@ import os
 import stat
 import sys
 import time
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TypeVar
+from typing import Literal, TypeVar
 
 _T = TypeVar("_T")
 
+RLX_HOME_ENV = "RLX_HOME"
+"""Where rlx's home is (#30): wins over :data:`HOME_ENV_VAR` when both are set."""
 HOME_ENV_VAR = "AISQUARE_HOME"
-"""Environment variable that overrides the default ``~/.aisquare`` location."""
+"""The home's variable before 0.10.2, still honoured as an alias of :data:`RLX_HOME_ENV`: the
+test suite, the 0.10.3 sandbox and every agent the fleet starts are handed the home by it."""
+HOME_NAME = ".rlx"
+"""The home's folder in the user's home directory, since 0.10.2."""
+OLD_HOME_NAME = ".aisquare"
+"""The home's folder before 0.10.2, which a user who has one keeps until H2 migrates it."""
+
+Layout = Literal["rlx", "aisquare"]
+"""How a home is laid out: ``rlx`` since 0.10.2 (docs/home-layout.md), ``aisquare`` before it."""
+NEW: Layout = "rlx"
+OLD: Layout = "aisquare"
+NEW_LAYOUT_MARKERS = ("rlx.db",)
+"""What only a home in the new layout has at its top."""
+OLD_LAYOUT_MARKERS = (
+    "context.db",
+    "launch-seals",
+    "instances",
+    "log",
+    "fleet-tmux.conf",
+    "remote.json",
+    "credentials",
+)
+"""What only a home in the old layout has at its top: one of them makes a home old, and so
+does an agent's accounts folder (:data:`OLD_ACCOUNTS_SUFFIX`). Not the store alone: a home only
+the CLI used has no ``instances/`` or ``launch-seals/``, and the damaged store's advice moves
+``context.db`` aside; read as new then, it would get the new layout beside its old files (the
+tester's blocker on #30)."""
+OLD_ACCOUNTS_SUFFIX = "-accounts"
+"""An agent's accounts folder at an old home's top (``<agent>-accounts``): the agent's name is
+its adapter's to say (``AgentAccounts.dir_name``), the suffix is the old layout's."""
 
 
 def restrict_to_owner(path: Path) -> bool:
@@ -372,8 +415,97 @@ def names_no_home(path: Path) -> bool:
     return bool(path.parts) and path.parts[0].startswith("~") and not path.is_absolute()
 
 
+def named_home(environment: Mapping[str, str] | None = None) -> Path | None:
+    """The home a variable names, ``$RLX_HOME`` first, then ``$AISQUARE_HOME``; ``None``
+    when neither is set (``environment``: another process's, else this one's)."""
+    source = os.environ if environment is None else environment
+    for variable in (RLX_HOME_ENV, HOME_ENV_VAR):
+        value = source.get(variable)
+        if value:
+            return Path(value).expanduser()
+    return None
+
+
+def home_of(
+    environment: Mapping[str, str] | None = None, *, user_home: Path | None = None
+) -> tuple[Path, Layout]:
+    """Where the home of a process with ``environment`` (this one's by default) is, and how
+    it is laid out (the module's docstring has the rule). ``user_home`` is that process's home
+    directory, when it is not this one's (``core.instance_scan``)."""
+    named = named_home(environment)
+    base = Path.home() if user_home is None else user_home
+    if named is not None and not _names_the_old_default(named, base):
+        return named, layout_of(named)
+    # No variable, or one naming ~/.aisquare itself by any spelling (a link to it, a trailing
+    # slash, resolved): the default home, read exactly as a process without the variable reads
+    # it (#31; the fleet hands its windows the home by both names, and a shell rc may keep the
+    # old one). Once the move made ~/.rlx it is that home, every path spelled from it, so each
+    # slot's Keychain item is named as the move copied it (the tester's blocker 1, round 4).
+    # Read by its own rule instead, such a variable made a NEW-layout ~/.aisquare on a fresh
+    # machine, which a plain process then read as OLD (a split store), and once `uninstall
+    # --purge` left ~/.aisquare a link to nothing it refused the default home as in the way
+    # (the reviewer's MAJOR 1, round 4).
+    new = base / HOME_NAME
+    if new.exists():
+        return new, NEW
+    old = base / OLD_HOME_NAME
+    if old.exists():
+        return old, OLD
+    return new, NEW
+
+
+def _names_the_old_default(named: Path, base: Path) -> bool:
+    """Whether ``named`` is ``base``'s ``~/.aisquare``: the same folder (two stats, links
+    followed, so a link to it, an alias or a trailing slash is it, and so is ``~/.rlx`` once
+    ``~/.aisquare`` links to it), or, when either is not there, the same spelling resolved
+    (``os.path.realpath``: each link that is there followed, the rest as spelled)."""
+    old = base / OLD_HOME_NAME
+    try:
+        one, other = os.stat(named), os.stat(old)
+    except OSError:
+        return os.path.realpath(named) == os.path.realpath(old)
+    return (one.st_dev, one.st_ino) == (other.st_dev, other.st_ino)
+
+
+def layout_of(root: Path) -> Layout:
+    """How the home at ``root`` is laid out, by what is at its top: :data:`NEW` with
+    ``rlx.db``, :data:`OLD` with any of :data:`OLD_LAYOUT_MARKERS` or an agent's accounts
+    folder, :data:`NEW` with neither (a home not made yet, or made and not used).
+
+    Read afresh each time: a ``stat`` for a new home, two for an old one with its store, all of
+    them for one with no marker yet. Nothing is kept, as a verdict kept by the folder's
+    modification time outlived a marker made within one tick of it (NTFS's ~15.6 ms, a Linux
+    jiffy): an old home given its ``rlx.db`` still read as old (#592's full matrix, Windows)."""
+    try:
+        if any((root / marker).exists() for marker in NEW_LAYOUT_MARKERS):
+            return NEW
+        if any((root / marker).exists() for marker in OLD_LAYOUT_MARKERS):
+            return OLD
+    except OSError:
+        return NEW  # under a folder this user may not enter: nothing of it can be read
+    if _has_old_accounts(root):
+        return OLD
+    return NEW  # nothing there yet, or made and not used: a new home
+
+
+def _has_old_accounts(root: Path) -> bool:
+    """Whether ``root`` has an agent's accounts folder at its top, as the old layout keeps them."""
+    try:
+        with os.scandir(root) as entries:
+            return any(
+                entry.name.endswith(OLD_ACCOUNTS_SUFFIX) and entry.is_dir() for entry in entries
+            )
+    except OSError:
+        return False
+
+
+def home_layout() -> Layout:
+    """How this process's home is laid out (:func:`home_of`)."""
+    return home_of()[1]
+
+
 def aisquare_home() -> Path:
-    """Return the aisquare home directory (without creating it).
+    """Return rlx's home directory (without creating it): :func:`home_of`'s.
 
     The path is taken verbatim and nothing constrains it to a native disk. This
     is the one place that choice is made, so its consequence is recorded here
@@ -410,15 +542,35 @@ def aisquare_home() -> Path:
     reports rather than refuses: being on a translated filesystem is unmeasured,
     not known-broken.
     """
-    override = os.environ.get(HOME_ENV_VAR)
-    if override:
-        return Path(override).expanduser()
-    return Path.home() / ".aisquare"
+    return home_of()[0]
+
+
+def rlx_home() -> Path:
+    """:func:`aisquare_home`, by the product's name."""
+    return aisquare_home()
+
+
+def _in_layout(new: tuple[str, ...], old: tuple[str, ...]) -> Path:
+    """The path of one thing under the home: ``new`` in the new layout, ``old`` in the old."""
+    root, layout = home_of()
+    return root.joinpath(*(new if layout == NEW else old))
 
 
 def cache_dir() -> Path:
     """Directory for disposable cached data."""
     return aisquare_home() / "cache"
+
+
+def agent_tmp_root() -> Path:
+    """Where each agent's own temporary directory is made (``services.agent_tmp``, #57), the
+    same name in both layouts. Short on purpose: a socket an agent's test binds under it must
+    fit ``sun_path`` (104 bytes on macOS)."""
+    return aisquare_home() / "tmp"
+
+
+def agent_tmp_dir(key: str) -> Path:
+    """One agent's own temporary directory: its ``TMPDIR`` (``TEMP`` and ``TMP`` on Windows)."""
+    return agent_tmp_root() / key
 
 
 def ci_cache_dir() -> Path:
@@ -445,7 +597,7 @@ def ci_descriptor_path(run_id: str) -> Path:
 
 def log_dir() -> Path:
     """Directory for capture and diagnostic logs."""
-    return aisquare_home() / "log"
+    return _in_layout(("logs",), ("log",))
 
 
 def config_path() -> Path:
@@ -455,7 +607,7 @@ def config_path() -> Path:
 
 def db_path() -> Path:
     """Path of the SQLite database holding context entries and projects."""
-    return aisquare_home() / "context.db"
+    return _in_layout(("rlx.db",), ("context.db",))
 
 
 def feature_use_path() -> Path:
@@ -466,7 +618,7 @@ def feature_use_path() -> Path:
 
 def usage_sweep_lock_path() -> Path:
     """The lock file one transcript sweep at a time holds (``services.usage_stats``)."""
-    return aisquare_home() / "usage-sweep.lock"
+    return _in_layout(("run", "locks", "usage-sweep.lock"), ("usage-sweep.lock",))
 
 
 def last_injection_path() -> Path:
@@ -481,28 +633,28 @@ def state_path() -> Path:
 
 def remote_state_path() -> Path:
     """``remote.json`` — the Remote Control server's token, password, switches and devices."""
-    return aisquare_home() / "remote.json"
+    return _in_layout(("remote", "remote.json"), ("remote.json",))
 
 
 def remote_audit_path() -> Path:
     """One line per write the Remote Control server let through (``ts sid endpoint summary``)."""
-    return aisquare_home() / "remote-audit.log"
+    return _in_layout(("remote", "audit.log"), ("remote-audit.log",))
 
 
 def remote_dist_dir() -> Path:
     """Default location of the built Remote Control page the server serves."""
-    return aisquare_home() / "remote-dist"
+    return _in_layout(("remote", "dist"), ("remote-dist",))
 
 
 def remote_needs_path() -> Path:
     """``remote-needs.json`` — the needs-you items a phone dismissed, and when the watcher
     first saw the ones it dates itself (a pane gone, tmux not answering)."""
-    return aisquare_home() / "remote-needs.json"
+    return _in_layout(("remote", "needs.json"), ("remote-needs.json",))
 
 
 def remote_push_path() -> Path:
     """``remote-push.json`` — the Web Push keys, each device's subscription, what was pushed."""
-    return aisquare_home() / "remote-push.json"
+    return _in_layout(("remote", "push.json"), ("remote-push.json",))
 
 
 def project_data_dir(project_id: str) -> Path:
@@ -744,13 +896,13 @@ def _open_below_windows(root: Path, names: Sequence[str]) -> int:
 
 def credentials_path() -> Path:
     """Path of the credentials file (API keys, tokens)."""
-    return aisquare_home() / "credentials"
+    return _in_layout(("accounts", "aisquare", "credentials"), ("credentials",))
 
 
 def agent_accounts_dir(name: str) -> Path:
     """Where the CLI keeps an agent's homes, one per slot: its accounts' ``dir_name``
     (``claude-accounts``, ``codex-accounts``), as ``core.claude_accounts.accounts_root`` asks."""
-    return aisquare_home() / name
+    return _in_layout(("accounts", name.removesuffix("-accounts")), (name,))
 
 
 def agents_registry_path() -> Path:
@@ -798,11 +950,305 @@ def truncation_marker_path() -> Path:
     return aisquare_home() / "store-was-truncated"
 
 
+# --- the home's layout, one helper per thing (#30) -------------------------------------------
+#
+# Every path under the home is built here, by a helper named for what it holds, so that the
+# layout lives in this one file: a module asks for ``launch_seals_dir()``, never joins
+# ``aisquare_home()`` with a name of its own.
+
+
+def shown(path: Path) -> str:
+    """``path`` as a person reads it: ``~/…`` under their home directory, else whole."""
+    try:
+        return "~/" + path.relative_to(Path.home()).as_posix()
+    except ValueError:
+        return str(path)
+
+
+def projects_dir() -> Path:
+    """Every project's own folder (:func:`project_data_dir`), one per project id."""
+    return aisquare_home() / "projects"
+
+
+def briefs_dir() -> Path:
+    """The work briefs' evidence, one folder per project (:func:`project_briefs_dir`)."""
+    return aisquare_home() / "briefs"
+
+
+def project_briefs_dir(project_id: str) -> Path:
+    """One project's briefs' evidence (:func:`brief_evidence_dir` is one brief's)."""
+    return briefs_dir() / project_id
+
+
+def reports_dir() -> Path:
+    """The command reports a person or an agent asked to keep (``services.command_reports``)."""
+    return aisquare_home() / "reports"
+
+
+def run_dir() -> Path:
+    """What a running rlx keeps while it runs: prompts on their way, typing leases, origins."""
+    return aisquare_home() / "run"
+
+
+def instances_dir() -> Path:
+    """The registry of the rlx instances running on this home (``core.instances``)."""
+    return _in_layout(("run", "instances"), ("instances",))
+
+
+def launch_seals_dir() -> Path:
+    """The fleet's launch records, one per agent (``core.launch_seal``)."""
+    return _in_layout(("fleet", "launch-seals"), ("launch-seals",))
+
+
+def launchers_dir() -> Path:
+    """The launchers the fleet writes for its agents (``core.launchers``)."""
+    return aisquare_home() / "launchers"
+
+
+def handoffs_dir() -> Path:
+    """The hand-off briefs a crossing switch writes (``services.handoff``)."""
+    return aisquare_home() / "handoffs"
+
+
+def fleet_dir() -> Path:
+    """The fleet's own files: its admission log."""
+    return aisquare_home() / "fleet"
+
+
+def tmux_conf_path() -> Path:
+    """The tmux config the fleet's server starts with (``core.tmux.bundled_conf``'s)."""
+    return _in_layout(("fleet", "tmux.conf"), ("fleet-tmux.conf",))
+
+
+def watch_dir() -> Path:
+    """What the watcher keeps: its lock, its pid, the details it files (``services.watch``)."""
+    return aisquare_home() / "watch"
+
+
+def captain_dir() -> Path:
+    """The captain's folder: its brain, its queue, its ui socket's fallback."""
+    return aisquare_home() / "captain"
+
+
+def personas_dir() -> Path:
+    """The user's personas (``core.personas``)."""
+    return aisquare_home() / "personas"
+
+
+def shared_memory_dir(root_name: str) -> Path:
+    """The memory an agent's accounts share, under its accounts' root (``root_name``)."""
+    return aisquare_home() / root_name / "memory"
+
+
+def persona_prompts_dir() -> Path:
+    """The persona prompts a launch writes for its agent: disposable, so under the cache."""
+    return cache_dir() / "persona-prompts"
+
+
+def screenshots_dir() -> Path:
+    """Where the board's screenshot key saves, unless told elsewhere (``cli.watch``)."""
+    return aisquare_home() / "screenshots"
+
+
+def bench_dir() -> Path:
+    """The usage sweep's benchmark scratch (``services.usage_stats``)."""
+    return aisquare_home() / "bench"
+
+
+def usage_share_lock_path() -> Path:
+    """The lock one usage shipment at a time holds (``core.sharing``)."""
+    return _in_layout(("run", "locks", "usage-share.lock"), ("usage-share.lock",))
+
+
+def active_ping_lock_path() -> Path:
+    """The lock one daily active ping at a time holds (``services.active_ping``)."""
+    return _in_layout(("run", "locks", "active-ping.lock"), ("active-ping.lock",))
+
+
+def broker_dir(home: Path) -> Path:
+    """The launches' broker folders under the home ``home``, as a sandbox's launch names it
+    (``services.store_broker``): ``broker`` in either layout."""
+    return home / "broker"
+
+
+def ngrok_token_path() -> Path:
+    """The ngrok authtoken saved in Settings → Remote (``services.ngrok_sdk``)."""
+    return _in_layout(("remote", "ngrok-authtoken"), ("ngrok-authtoken",))
+
+
+def ngrok_config_path(name: str) -> Path:
+    """Our ngrok config of one ngrok version (``services.ngrok_tunnel``)."""
+    return _in_layout(("remote", name), (name,))
+
+
+# --- from the old layout to the new (#31, H2) ------------------------------------------------
+
+OLD_STORE = "context.db"
+"""The store's name at an old home's top (``rlx.db`` in the new layout)."""
+
+MOVES: tuple[tuple[str, tuple[str, ...]], ...] = (
+    (OLD_STORE, ("rlx.db",)),
+    (f"{OLD_STORE}-wal", ("rlx.db-wal",)),
+    (f"{OLD_STORE}-shm", ("rlx.db-shm",)),
+    ("log", ("logs",)),
+    ("credentials", ("accounts", "aisquare", "credentials")),
+    ("launch-seals", ("fleet", "launch-seals")),
+    ("fleet-tmux.conf", ("fleet", "tmux.conf")),
+    ("instances", ("run", "instances")),
+    ("usage-sweep.lock", ("run", "locks", "usage-sweep.lock")),
+    ("usage-share.lock", ("run", "locks", "usage-share.lock")),
+    ("active-ping.lock", ("run", "locks", "active-ping.lock")),
+    ("remote.json", ("remote", "remote.json")),
+    ("remote-audit.log", ("remote", "audit.log")),
+    ("remote-dist", ("remote", "dist")),
+    ("remote-needs.json", ("remote", "needs.json")),
+    ("remote-push.json", ("remote", "push.json")),
+    ("ngrok-authtoken", ("remote", "ngrok-authtoken")),
+)
+"""Each name at an old home's top that the new layout keeps elsewhere, and where, as the
+helpers above place it (docs/home-layout.md's table): what the home's move renames
+(``services.home_migration``). An agent's accounts folder and each ngrok config of ours are
+moved too, by their shape (:func:`new_place`). The store's sidecars go with it, though a
+move checkpoints the store first and leaves none."""
+
+_NGROK_CONFIG_PREFIX = "remote-ngrok-v"
+"""How our ngrok configs are named at either layout's place for them
+(``services.ngrok_tunnel._our_config_name``)."""
+
+
+def new_place(name: str) -> tuple[str, ...] | None:
+    """Where the new layout keeps what an old home has at its top as ``name``, below the home;
+    ``None`` for a name both layouts keep at the top (``config.toml``, ``projects``, ``cache``,
+    ``run`` and the rest)."""
+    for old, new in MOVES:
+        if name == old:
+            return new
+    agent = name.removesuffix(OLD_ACCOUNTS_SUFFIX)
+    if agent != name and agent:
+        return ("accounts", agent)
+    if name.startswith(_NGROK_CONFIG_PREFIX) and name.endswith(".yml"):
+        return ("remote", name)
+    return None
+
+
+MOVE_JOURNAL: tuple[str, ...] = ("backups", "home-migration", "journal.json")
+"""Where the home's move keeps its journal, under the home in either layout
+(``services.home_migration``): it goes with the home's last rename."""
+
+
+def unfinished_home_move() -> Path | None:
+    """The journal of a move of this process's home that has not finished, or ``None``: what
+    every command but the move asks first, so none writes into a home half moved (the reviewer's
+    M3 on #31). A stat, and a read of a small file only while one is there. A variable that
+    names ``~/.aisquare`` itself is the default home, as the move reads it."""
+    return unfinished_home_move_at(home_of(_default_home_environment())[0])
+
+
+def unfinished_home_move_at(root: Path) -> Path | None:
+    """:func:`unfinished_home_move` of the home at ``root``: the journal there unless it says
+    the move is done. One that cannot be read is unfinished: a crash cannot be ruled out, and
+    the move says the way out (``services.home_migration.journal_refusal``).
+
+    Anything at the journal's path that cannot be read as a journal is unfinished (the
+    manager's ruling on N2, #2948): bytes that are not UTF-8 (``UnicodeDecodeError``, a
+    ``ValueError``), nesting too deep for the parser (``RecursionError``), a folder, a link to
+    nothing, a file that cannot be opened (mode 000, an I/O error). Let out of here, the first
+    two were a traceback from every command and the hook (round 4's tester). So is a folder on
+    the way inside the home that cannot be looked into (:func:`_maybe_a_journal`). Nothing
+    there is no move, and so is anything in a home whose root cannot be looked at, behind a
+    folder this user cannot enter: read as unfinished, it refused every command on such a home,
+    ``uninstall`` too, which keeps it and must never raise (round 19 of #257).
+    """
+    journal = root.joinpath(*MOVE_JOURNAL)
+    try:
+        text = read_regular_text(journal)
+    except ValueError:
+        return journal  # a journal that cannot be read is one that has not finished
+    except OSError:
+        return journal if _maybe_a_journal(root, journal) else None
+    import json
+
+    try:
+        data = json.loads(text)
+    except (ValueError, RecursionError):
+        return journal
+    steps = data.get("steps") if isinstance(data, dict) else None
+    return None if isinstance(steps, list) and "done" in steps else journal
+
+
+def read_regular_text(path: Path) -> str:
+    """``path``'s text, read only when it is a regular file: never through a link, and never a
+    FIFO, a device or a socket, whose open or read can block for good (the tester's NB1 on
+    #31: a FIFO at the move's journal hung every command and the hook). Opened without
+    blocking and without following a link, then asked by ``fstat``, so nothing can change in
+    between. ``OSError`` when it is not one or cannot be read; ``ValueError`` (a
+    ``UnicodeDecodeError``) for bytes that are not UTF-8."""
+    flags = os.O_RDONLY
+    for name in ("O_NONBLOCK", "O_NOFOLLOW", "O_BINARY"):
+        flags |= getattr(os, name, 0)
+    fd = os.open(path, flags)
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            raise OSError(errno.EINVAL, "not a regular file", str(path))
+        chunks: list[bytes] = []
+        while chunk := os.read(fd, 1 << 16):
+            chunks.append(chunk)
+    finally:
+        os.close(fd)
+    return b"".join(chunks).decode("utf-8")
+
+
+def _maybe_a_journal(root: Path, journal: Path) -> bool:
+    """Whether a journal may be at ``journal``, which could not be read: something ``lstat``
+    finds there (a link to nothing included), or a folder on the way inside the home that
+    cannot be looked into. Not there, or under a file, is no journal; and so is any path of a
+    home whose ROOT cannot be looked at (round 19 of #257; the manager's narrowing, #31 round
+    6: a backups/ at mode 000 hid a half-moved home)."""
+    try:
+        os.lstat(journal)
+    except (FileNotFoundError, NotADirectoryError):
+        return False
+    except OSError:
+        try:
+            os.lstat(root)
+        except OSError:
+            return False
+        return True
+    return True
+
+
+def _default_home_environment() -> dict[str, str] | None:
+    """This process's environment without the home variables when they name ``~/.aisquare``
+    itself (the fleet hands its windows the home by both names, resolved); ``None`` otherwise."""
+    named = named_home()
+    if named is None or not _names_the_old_default(named, Path.home()):
+        return None
+    return {k: v for k, v in os.environ.items() if k not in (RLX_HOME_ENV, HOME_ENV_VAR)}
+
+
+NEW_LAYOUT_FOLDERS: tuple[tuple[str, ...], ...] = (
+    ("cache",),
+    ("logs",),
+    ("accounts", "aisquare"),
+    ("fleet",),
+    ("run", "locks"),
+    ("remote",),
+)
+"""The folders a home in the new layout is made with (docs/home-layout.md): what is filed
+under them finds its folder there, whoever writes it first."""
+
+
 def ensure_home() -> Path:
-    """Create the aisquare home layout if missing and return its root."""
-    home = aisquare_home()
-    for directory in (home, cache_dir(), log_dir()):
-        directory.mkdir(parents=True, exist_ok=True)
+    """Create the home if missing, laid out as its layout says, and return its root: the new
+    layout's folders (:data:`NEW_LAYOUT_FOLDERS`), or the old layout's ``cache`` and ``log``."""
+    home, layout = home_of()
+    home.mkdir(parents=True, exist_ok=True)
+    if layout == NEW:
+        for parts in NEW_LAYOUT_FOLDERS:
+            home.joinpath(*parts).mkdir(parents=True, exist_ok=True)
+    else:
+        for directory in (cache_dir(), log_dir()):
+            directory.mkdir(parents=True, exist_ok=True)
     return home
 
 

@@ -27,7 +27,7 @@ curl -fsSL https://aisquare.studio/rlx/install.sh | sh
   conventions reach every new session, so it starts oriented, not cold.
 - **Everything is also a command**, for your scripts and for the agents.
 - **Local-first.** Your memory, boards and fleet live in a SQLite store under
-  `~/.aisquare` on your machine. rlx runs no daemon (the agents run in a tmux
+  `~/.rlx` on your machine. rlx runs no daemon (the agents run in a tmux
   server) and needs no cloud service of its own.
 
 ## Install
@@ -57,10 +57,10 @@ The package is `aisquare-cli`. Its command is `rlx`; `relax`, `asq` and
 1. **Project:** use the folder you are in, or choose another.
 2. **Coding agent:** Claude Code or Codex. Connect it: Welcome links its
    install page if it is missing, and offers the sign-in if it is signed out.
-3. **Fleet:** press *Start manager*, then *Open the manager* and answer the
-   agent's one-time question about trusting the folder, then *Start the
-   coders*: a manager and two coders, each a real session. **Type your goal to
-   the manager in plain words.**
+3. **Fleet:** press *Start fleet*: the manager's pane opens. Answer the
+   agent's one-time question about trusting the folder there, and the two
+   coders start on their own: a manager and two coders, each a real session.
+   **Type your goal to the manager in plain words.**
 
 Click an agent to drive its session. **Press `F12`** to hand focus back to the
 sidebar, where `w` returns to Welcome and `q` quits. **The agents keep
@@ -68,6 +68,30 @@ running**; open `rlx` again and it re-attaches to what it finds. To stop them
 spending tokens without losing them, *⚙ Settings ▸ Fleet ▸ Pause all…* exits
 each one and keeps its task, worktree and session; *Resume all…* brings each
 back where it was.
+
+In a Claude Code or Codex pane, press `Ctrl+J` to add a line. Claude Code also
+accepts a backslash followed by `Enter`. `Shift+Enter` works when your terminal
+reports it through the kitty keyboard protocol. In Terminal.app, `Shift+Enter`
+and `Option+Enter` with *Use Option as Meta key* can submit the prompt.
+
+### Manager wake schedule
+
+By default a fleet's manager is woken by every board write that concerns it. A busy
+fleet can wake it for urgent news only, and for routine news at most every N minutes:
+
+```sh
+rlx fleet manager-policy manager_wake schedule --project <project>
+rlx fleet manager-policy manager_pass_minutes 15 --project <project>
+```
+
+Urgent news wakes it at once: a question to it, a note to it from you, an agent's usage
+limit, a hand-over that failed, a first prompt not taken, an exit that needs it, and
+watch's urgent lines (a dialog, a crash). Routine news (results, task moves, agents'
+notes) waits until N minutes after its last prompt; it then reads it all in one turn.
+N is 15 unless set; 0 means routine news waits for an urgent wake or your next prompt.
+`team standby` holds until you speak again, with tasks in flight or not. Run
+`rlx fleet manager-policy --project <project>` to read the policy, and `--clear` with a
+key to restore its default.
 
 ## Accounts
 
@@ -135,12 +159,24 @@ rlx outcomes                         # what the agents got done this week, and w
 rlx doctor                           # is everything wired? (and how to fix anything)
 ```
 
+Agents on different accounts reach each other through rlx; Claude Code's own `/peers`
+and `SendMessage` stay within one account:
+
+```sh
+rlx --json fleet top                           # every project's live agents: project_id, label
+rlx fleet tell -P <project_id> <label> "done"  # a message to one of them
+```
+
+Within this project, `rlx fleet ls` and `rlx fleet tell <label> "done"` are enough. A
+waiting agent has the message typed at its prompt; a busy one gets it later, when its
+turn ends or at its next prompt.
+
 ## Requirements
 
 - macOS, Linux, or Windows through WSL2.
 - Python 3.11+ if you install by hand (the one-liner brings its own 3.13).
 - [Claude Code](https://claude.com/claude-code) or
-  [Codex](https://learn.chatgpt.com/docs/codex/cli) (0.164.0 or newer, tested
+  [Codex](https://developers.openai.com/codex/cli) (0.164.0 or newer, tested
   on 0.164.0, 0.166.0 and 0.167.0) for the agents, either or both, and
   tmux 3.2+ for the fleet.
 - Node 22.12+, optional, for browser tools like the Chrome DevTools MCP; the one-liner

@@ -507,6 +507,29 @@ def test_a_success_is_never_an_error_payload(
 # ── ls / status ──────────────────────────────────────────────────────────────
 
 
+def test_ls_marks_a_paused_agent_with_pause_and_a_waiting_one_with_a_muted_mark(
+    runner: CliRunner, resolved: Seen, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Q4 (the UX audit): one meaning per mark. ⏸ is paused, as Pause draws it; waiting, an
+    agent at rest at its prompt, is ``◦``, never a second ⏸ (the listing draws no colour; the
+    sidebar's is tested in test_ui_agent_mark_contrast.py)."""
+    agents = [
+        _status(_agent("manager", "manager", pane="%1"), "waiting"),
+        _status(_agent("coder-auth", pane="%7"), "paused"),
+    ]
+    _install(monkeypatch, "list_agents", agents)
+
+    result = runner.invoke(app, ["fleet", "ls"])
+
+    assert result.exit_code == 0, result.output
+    out = _plain(result.stdout)
+    assert "manager manager ◦ waiting %1" in out
+    assert "coder-auth coder ⏸ paused" in out
+    assert "⏯" not in out
+    raw = next(line for line in result.stdout.splitlines() if "◦ waiting" in line)
+    assert "⏸" not in raw, raw
+
+
 def test_ls_prints_the_session_header_and_one_row_per_agent(
     runner: CliRunner, resolved: Seen, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -523,7 +546,7 @@ def test_ls_prints_the_session_header_and_one_row_per_agent(
     assert result.exit_code == 0, result.output
     out = _plain(result.stdout)
     assert "api · amber-otter · asq-amber-otter" in out
-    assert "manager manager ⏸ waiting %1" in out
+    assert "manager manager ◦ waiting %1" in out
     assert "coder-auth coder ▶ working (worktree) %7" in out
     assert "tester-py311 tester 🔔 NEEDS YOU permission %9" in out
     assert "coder-old coder 💤 exited(1) %3" in out
@@ -1940,6 +1963,7 @@ def test_reap_json(runner: CliRunner, resolved: Seen, monkeypatch: pytest.Monkey
         "claims_released",
         "release_failures",
         "held",
+        "temp_dirs_removed",
     }
     assert [a["label"] for a in payload["ended"]] == ["coder-auth"]
     assert payload["claims_released"] == []
@@ -2413,7 +2437,7 @@ def test_ls_shows_the_persona_on_its_row_and_json_carries_it(
     assert human.exit_code == 0, human.output
     out = _plain(human.stdout)
     assert "coder-auth coder ▶ working · skeptic %7" in out
-    assert "tester-1 tester ⏸ waiting %9" in out
+    assert "tester-1 tester ◦ waiting %9" in out
     payload = json.loads(as_json.stdout)
     assert [entry["agent"]["persona"] for entry in payload["agents"]] == ["skeptic", None]
 

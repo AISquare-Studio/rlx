@@ -29,7 +29,7 @@ from typing import Any
 import httpx
 import pytest
 
-from aisquare.core import agents, launch_seal, outbox, prompt_origin, selfcli
+from aisquare.core import agents, launch_seal, outbox, paths, prompt_origin, selfcli
 from aisquare.core import claude_accounts as claude_accounts_core
 from aisquare.core.agent_adapters import codex_config, get_adapter
 from aisquare.core.agent_adapters.types import screen_of, store_dir, store_read_only
@@ -937,7 +937,7 @@ def test_real_codex_reaches_the_store_from_its_sandbox_and_rings_only_for_a_huma
         project = team.activate(workspace)
         for kept in store_read_only(store_dir()):
             kept.parent.mkdir(parents=True, exist_ok=True)
-        (store / "codex-accounts").mkdir(exist_ok=True)
+        paths.agent_accounts_dir("codex-accounts").mkdir(parents=True, exist_ok=True)
 
         def outputs() -> list[str]:
             """Each command's output, oldest first: every request replays the history."""
@@ -1025,7 +1025,7 @@ def test_real_codex_reaches_the_store_from_its_sandbox_and_rings_only_for_a_huma
             until(lambda: answered(seen), 30, "the sandboxed claim ran", pane)
             assert "claimed" in outputs()[-1], outputs()[-1]
             # Through the coder's own broker, which its launch runs outside the sandbox.
-            assert [d.name for d in (store / store_broker.DIR_NAME).iterdir()], "a broker"
+            assert [d.name for d in paths.broker_dir(store).iterdir()], "a broker"
 
             def sandboxed_calls(commands: list[str], what: str) -> list[str]:
                 """Each of ``commands`` (aisquare's arguments) run in the coder's sandbox,
@@ -1169,8 +1169,9 @@ def test_real_codex_reaches_the_store_from_its_sandbox_and_rings_only_for_a_huma
             until(lambda: at_rest(coder), 20, "waiting, at rest", pane)
             seen = len(outputs())
             probe = (
-                f"RUN touch {store / 'credentials'}; touch {store / 'codex-accounts' / 'x'};"
-                f" touch {store / 'config.toml'}; touch {store / 'fleet-tmux.conf'};"
+                f"RUN touch {paths.credentials_path()};"
+                f" touch {paths.agent_accounts_dir('codex-accounts') / 'x'};"
+                f" touch {store / 'config.toml'}; touch {paths.tmux_conf_path()};"
                 f" touch {store / 'agents.json'};"
                 f" touch {launch_seal._path(coder.id)}; echo probed"
             )
@@ -1274,7 +1275,7 @@ def test_real_codex_reaches_the_store_from_its_sandbox_and_rings_only_for_a_huma
                     f"'UPDATE {table} SET {column} = ? WHERE id = ?', (sys.argv[2], sys.argv[3]))"
                     "; c.commit(); print('rewrote', c.total_changes)"
                 )
-                db = str(store / "context.db")
+                db = str(paths.db_path())
                 return "RUN " + shlex.join([sys.executable, "-c", code, db, value, row])
 
             def sandboxed(told: str, what: str, first: Any = None) -> None:
@@ -1375,7 +1376,7 @@ def test_real_codex_reaches_the_store_from_its_sandbox_and_rings_only_for_a_huma
                 "fleet_agent SET socket_path = ?, pane_id = ? WHERE id = ?', sys.argv[2:5])"
                 "; c.commit(); print('rewrote', c.total_changes)"
             )
-            db = str(store / "context.db")
+            db = str(paths.db_path())
             pointed = [sys.executable, "-c", code, db, users_socket, users_pane, reviewer.id]
             sandboxed("RUN " + shlex.join(pointed), "the pane")
             # Its turn ends on its own; the row no longer names its pane to watch it by.
@@ -1483,7 +1484,7 @@ def test_real_codex_reaches_the_store_from_its_sandbox_and_rings_only_for_a_huma
                 "c.commit(); print('rewrote', c.total_changes)"
             )
             fake_id = f"agt_fake{os.getpid()}"
-            db = str(store / "context.db")
+            db = str(paths.db_path())
             reviewer = checker
 
             def no_fake_row() -> None:
@@ -1586,7 +1587,7 @@ def test_real_codex_reads_the_code_index_and_records_evidence_from_its_sandbox(
         project = team.activate(workspace)
         for kept in store_read_only(store_dir()):
             kept.parent.mkdir(parents=True, exist_ok=True)
-        (store / "codex-accounts").mkdir(exist_ok=True)
+        paths.agent_accounts_dir("codex-accounts").mkdir(parents=True, exist_ok=True)
 
         def outputs() -> list[str]:
             """Each command's output, oldest first: every request replays the history."""
@@ -1655,7 +1656,7 @@ def test_real_codex_reads_the_code_index_and_records_evidence_from_its_sandbox(
             found = re.findall(r"asq report ([0-9a-f]{32})", ran)
             assert found and "checked" in ran and "not sealed" not in ran, ran
             report_id = found[-1]
-            [launch] = [d for d in (store / store_broker.DIR_NAME).iterdir() if d.is_dir()]
+            [launch] = [d for d in paths.broker_dir(store).iterdir() if d.is_dir()]
             assert (launch / store_broker.REPORTS / report_id).is_dir(), "saved in the sandbox"
             assert (launch / store_broker.SEALS / report_id).is_file(), "sealed by the broker"
             assert not (store / "reports" / report_id).exists(), "the home's reports are not its"
@@ -2940,7 +2941,7 @@ def test_real_codex_fleet_from_before_launch_records_and_rows_its_sandbox_rewrot
         project = team.activate(workspace)
         for kept in store_read_only(store_dir()):
             kept.parent.mkdir(parents=True, exist_ok=True)
-        (store / "codex-accounts").mkdir(exist_ok=True)
+        paths.agent_accounts_dir("codex-accounts").mkdir(parents=True, exist_ok=True)
         srv = fleet.server(config.fleet)
         args = ["--dangerously-bypass-hook-trust", "--no-alt-screen"]
 
@@ -2977,7 +2978,7 @@ def test_real_codex_fleet_from_before_launch_records_and_rows_its_sandbox_rewrot
                 "import sqlite3, sys; c = sqlite3.connect(sys.argv[1]); "
                 f"c.execute({sql!r}, sys.argv[2:]); c.commit(); print('rewrote', c.total_changes)"
             )
-            argv = [sys.executable, "-c", code, str(store / "context.db"), *values]
+            argv = [sys.executable, "-c", code, str(paths.db_path()), *values]
             until(lambda: state(agent) == "waiting", 30, "waiting to be told")
             seen = len(outputs())
             told = "RUN " + shlex.join(argv)
@@ -3042,7 +3043,7 @@ def test_real_codex_fleet_from_before_launch_records_and_rows_its_sandbox_rewrot
                 "print('rewrote', c.total_changes)"
             )
             argv = [
-                sys.executable, "-c", code, str(store / "context.db"),
+                sys.executable, "-c", code, str(paths.db_path()),
                 third.id, fourth.id, third.label, fourth.label,
             ]  # fmt: skip
             until(lambda: state(third) == "waiting", 30, "coder-c waiting")
@@ -3530,7 +3531,7 @@ def test_real_codex_approval_and_question_are_answered_from_the_remote_page(
         project = team.activate(workspace)
         for kept in store_read_only(store_dir()):
             kept.parent.mkdir(parents=True, exist_ok=True)
-        (store / "codex-accounts").mkdir(exist_ok=True)
+        paths.agent_accounts_dir("codex-accounts").mkdir(parents=True, exist_ok=True)
         srv = fleet.server(config.fleet)
         runtime = make_runtime()
         runtime.set_allow_write(True)
@@ -4451,7 +4452,7 @@ def test_real_codex_manager_rewrites_its_state_file_from_its_sandbox_with_no_esc
         project = team.activate(workspace)
         for kept in store_read_only(store_dir()):
             kept.parent.mkdir(parents=True, exist_ok=True)
-        (store / "codex-accounts").mkdir(exist_ok=True)
+        paths.agent_accounts_dir("codex-accounts").mkdir(parents=True, exist_ok=True)
         state = paths.manager_state_file(project.id)
         theirs = store_dir() / "projects" / "prj_another" / "manager"
         theirs.mkdir(parents=True)

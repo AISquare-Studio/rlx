@@ -917,7 +917,7 @@ def test_one_table_names_the_terminal_for_doctor_and_for_the_clipboard() -> None
     assert {sign.name for sign in SIGNS if sign.osc52 == "drops"} == {"Terminal.app"}
     assert {sign.name for sign in SIGNS if sign.osc52 == "asks"} == {"iTerm2"}
     stale = {"KITTY_WINDOW_ID": "1", "TERM_PROGRAM": "Apple_Terminal"}
-    assert outer_terminal(stale) == ("kitty", True)
+    assert outer_terminal(stale) == ("kitty", None)
     assert osc52_terminal(stale) == "accepts"
 
 

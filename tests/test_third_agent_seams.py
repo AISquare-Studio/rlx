@@ -1777,6 +1777,10 @@ OPTIONAL = (
 )
 #: Where a file naming an agent is looked for: beside these, every file at the top.
 SCANNED = ("src", "tests", ".github", "plugins", ".agents", ".claude-plugin")
+#: Files made from CI's runs, which no one edits for an agent: ``.test_durations`` holds every
+#: test's id (``python -m tests.shards durations``), so it names the agent through its tests'
+#: ids (``[gemini-shaped]``) once it is refreshed after they were added (#47).
+GENERATED = (".test_durations",)
 
 
 def _contract() -> str:
@@ -1818,11 +1822,13 @@ def _optional(path: str) -> bool:
 
 def _files_naming_it(root: Path = ROOT) -> set[str]:
     """Every file under :data:`SCANNED` and at the top of the repository ``root`` that names
-    the Gemini-shaped agent, by path relative to it."""
+    the Gemini-shaped agent, by path relative to it; not a :data:`GENERATED` one."""
     found: set[str] = set()
     paths = [path for top in SCANNED for path in (root / top).rglob("*")]
     for path in [*paths, *root.iterdir()]:
         if not path.is_file() or "__pycache__" in path.parts or path.suffix == ".pyc":
+            continue
+        if path.relative_to(root).as_posix() in GENERATED:
             continue
         try:
             text = path.read_text("utf-8")
@@ -1877,6 +1883,18 @@ def test_the_files_that_name_it_are_looked_for_in_ci_the_plugins_and_the_top_too
     assert {path for path in named if not _optional(path)} == {
         path for path, allowed in planted.items() if not allowed
     }
+
+
+def test_the_test_times_ci_writes_are_no_file_an_agent_touches(tmp_path: Path) -> None:
+    """#47: ``.test_durations``, refreshed from CI's runs, lists the Gemini-shaped agent's
+    tests by id, and the check read that as a file the agent touched (every full-matrix leg
+    failed on it, run 46044139123). It is skipped by name; the same words in any other file at
+    the top are still found."""
+    times = '{\n    "tests/test_adapter_contract.py::test_x[gemini-shaped]": 0.007\n}\n'
+    (tmp_path / ".test_durations").write_text(times, encoding="utf-8")
+    (tmp_path / ".test_durations.old").write_text(times, encoding="utf-8")
+
+    assert _files_naming_it(tmp_path) == {".test_durations.old"}
 
 
 def test_a_third_agents_account_on_top_of_the_one_order_runs_it(
@@ -2626,8 +2644,8 @@ def test_its_stop_dialog_says_its_own_exit_command(third: AgentAdapter) -> None:
 
     question = StopAgentScreen(where, FleetAgentStatus(agent=row, state="waiting")).question()
 
-    assert f"{third.exit_command}, then the window is killed after" in question.plain
-    assert f"Force skips the {third.exit_command}." in question.plain
+    assert f"asked to quit (rlx types {third.exit_command}) and closed" in question.plain
+    assert "Force closes it at once." in question.plain
     assert "/exit" not in question.plain
 
 
@@ -2747,9 +2765,9 @@ def test_its_bulk_stop_and_pause_say_its_own_exit_command(
     every, managers = _bulk_about(monkeypatch, action, rows)
     reading = about_text(action, None)  # type: ignore[arg-type]
 
-    assert f"Each one is sent {third.exit_command}" in every, every
-    assert f"Each one is sent {third.exit_command}" in managers, managers
-    assert f"Each one is sent {OWN_EXIT}" in reading, reading
+    assert f"Each one is asked to quit (rlx types {third.exit_command})" in every, every
+    assert f"Each one is asked to quit (rlx types {third.exit_command})" in managers, managers
+    assert f"Each one is asked to quit (rlx types {OWN_EXIT})" in reading, reading
     assert "/exit" not in every + managers + reading
 
 
@@ -2770,9 +2788,9 @@ def test_a_bulk_of_agents_whose_exit_commands_differ_spells_none(
 
     every, managers = _bulk_about(monkeypatch, action, rows)
 
-    assert f"Each one is sent {OWN_EXIT}" in every, every
+    assert f"Each one is asked to quit (rlx types {OWN_EXIT})" in every, every
     assert claude.exit_command not in every and third.exit_command not in every, every
-    assert f"Each one is sent {third.exit_command}" in managers, managers
+    assert f"Each one is asked to quit (rlx types {third.exit_command})" in managers, managers
 
 
 def test_no_string_of_the_cli_spells_an_agents_exit_command() -> None:
@@ -2882,7 +2900,7 @@ def test_a_bulk_names_the_command_of_the_agents_it_acts_on_not_of_one_it_leaves(
 
     said = about_text("stop", plan)
 
-    assert f"Each one is sent {claude.exit_command}," in said, said
+    assert f"Each one is asked to quit (rlx types {claude.exit_command})" in said, said
 
 
 def test_a_bulk_receipt_says_the_exit_command_its_stop_sent(

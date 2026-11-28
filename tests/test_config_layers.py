@@ -271,6 +271,10 @@ def test_the_v1_snapshot_differs_from_today_only_by_the_headroom_defaults_and_th
             "import": {"engine": "auto", "api_model": "claude-opus-5"},
         },
         "experimental": {"captain": False},
+        # The rlx service's start at login (S2, #33): absent until a choice is made.
+        "service": {},
+        # The rlx service's tray icon (#34): on, rlx's backslash, the person's own terminal.
+        "tray": {"enabled": True, "icon": "backslash", "terminal": ""},
         # asq's daily release check (services.updates).
         "updates": {"check": True},
         # The symbol index (#285); its ignore list was [snapshot]'s until #399.
@@ -364,8 +368,12 @@ def test_the_v1_snapshot_differs_from_today_only_by_the_headroom_defaults_and_th
             "auto_stop": True,
             "sources": {},
         },
-        # Opt-in usage sharing (docs/usage-telemetry.md): off, the default.
-        "sharing": {"enabled": False},
+        # `rlx tidy`'s idle live coders' build output (the owner's disk tidy, #58), and how
+        # often the watcher runs its periodic job (#59).
+        "tidy": {"idle_build_hours": 24.0, "every_minutes": 60.0},
+        # Opt-in usage sharing (docs/usage-telemetry.md): off, the default. The daily active
+        # ping beside it (0.10.2, its own switch): on unless turned off.
+        "sharing": {"enabled": False, "active_ping": True},
     }
     then = _overlay(_V1_DEFAULTS, changed)
     assert set(RETIRED_SECTIONS) <= set(then)

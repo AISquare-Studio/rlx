@@ -42,20 +42,29 @@ def all_nodes() -> list[tuple[tuple[str, ...], Any]]:
     return list(_iter_nodes(root_command(), ()))
 
 
-def _placeholder(parameter: Any) -> str:
-    choices = getattr(parameter.type, "choices", None)
-    if choices:
-        first = choices[0]
-        return first.value if isinstance(first, Enum) else str(first)
-    # A number for a number: "sample" is a usage error, and the command's body never ran
-    # (`hook compact-check --cursor`, the sweep's USAGE_ONLY ratchet).
-    if getattr(parameter.type, "name", None) in (
+def _choices_and_number(parameter: Any) -> tuple[Any, bool]:
+    """The parameter's choices, and whether it takes a number. typer 0.29 gives a parameter
+    no click ``type``: what it takes is its ``type_descriptor``'s annotation."""
+    descriptor = getattr(parameter, "type_descriptor", None)
+    if descriptor is not None:
+        return descriptor.choices, descriptor.annotation in (int, float)
+    return getattr(parameter.type, "choices", None), getattr(parameter.type, "name", None) in (
         "int",
         "integer",
         "float",
         "int range",
         "float range",
-    ):
+    )
+
+
+def _placeholder(parameter: Any) -> str:
+    choices, number = _choices_and_number(parameter)
+    if choices:
+        first = choices[0]
+        return first.value if isinstance(first, Enum) else str(first)
+    # A number for a number: "sample" is a usage error, and the command's body never ran
+    # (`hook compact-check --cursor`, the sweep's USAGE_ONLY ratchet).
+    if number:
         return "0"
     return "sample"
 

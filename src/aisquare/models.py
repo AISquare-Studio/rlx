@@ -224,6 +224,10 @@ class DoctorCheck(BaseModel):
     button, the page, the row to press (R13, #146). ``fix`` stays the shell's: the CLI prints
     it, its commands make the page's buttons, and a manager asked to fix the row is handed
     it. ``None``: the page says the button or the manager that fixes it, never a command."""
+    offer: str | None = None
+    """An ok row's optional improvement, as the shell would run it (``rlx accounts statusline
+    --install``, ``gh auth login``): asq's Doctor makes it a quiet button in the folded passing
+    section, which opens it in a pane. Never a problem, never counted (0.10.2, #15)."""
 
 
 class PromptRecord(BaseModel):
@@ -2119,6 +2123,12 @@ class LaunchSpec(BaseModel):
     """What of the board the agent reads (``all``, ``relevant``, ``none``; P1 WS-2, #279),
     as its spawn resolved it, so a restart or switch keeps it. ``None`` on a spec recorded
     before it: the role's setting applies."""
+    tmp_key: str | None = None
+    """The agent's own temporary directory, ``<home>/tmp/<tmp_key>`` (``services.agent_tmp``,
+    #57): minted at its first spawn and replayed by every replacement (a restart, a switch,
+    a hand-over, a resume), so the agent keeps its ``TMPDIR`` and the files in it until it
+    really ends. A fork mints its own. ``None`` on a spec recorded before it: the next
+    spawn mints one."""
 
 
 class FleetAgent(BaseModel):
@@ -2322,9 +2332,9 @@ class FreshCounts(BaseModel):
     briefs: int = 0
     """Work briefs, with their numbered requirements: the board's, as its tasks are."""
     evidence: int = 0
-    """Files of the briefs' kept evidence, under ``~/.aisquare/briefs/<id>/``."""
+    """Files of the briefs' kept evidence, under ``~/.rlx/briefs/<id>/``."""
     manager_state: int = 0
-    """Files of the manager's own state (``~/.aisquare/projects/<id>/manager/``: its
+    """Files of the manager's own state (``~/.rlx/projects/<id>/manager/``: its
     ``state.md``, goal, decisions, open items, next step), which a blank manager must not
     read back."""
     entries: int | None = None

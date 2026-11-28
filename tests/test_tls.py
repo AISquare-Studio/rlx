@@ -40,6 +40,11 @@ REAL_HANDSHAKE = tls.handshake
 
 SRC = Path(__file__).resolve().parent.parent / "src" / "aisquare"
 
+#: A handshake with this suite's own TLS server: a hang guard, not a bound. These ask which
+#: store verified, never how fast; 5 s timed out on loaded windows-latest runners (CI runs
+#: 41682554543, 41696937358, 44142230657, 45639456505).
+_HANDSHAKE_S = 60.0
+
 
 class _Server(NamedTuple):
     url: str
@@ -194,11 +199,11 @@ def test_http_get_verifies_through_the_shared_context_where_the_default_paths_ha
 ) -> None:
     # The control, and the bug: a bare urlopen trusts only the (empty) default paths.
     with pytest.raises(urllib.error.URLError) as bare:
-        urllib.request.urlopen(https_server.url, timeout=5)
+        urllib.request.urlopen(https_server.url, timeout=_HANDSHAKE_S)
     assert isinstance(bare.value.reason, ssl.SSLCertVerificationError)
 
     _certifi_only(monkeypatch, https_server.ca_file)
-    status, body, _headers = service._http_get(https_server.url, {}, 5)
+    status, body, _headers = service._http_get(https_server.url, {}, _HANDSHAKE_S)
 
     assert status == 200 and json.loads(body) == LIVE_USAGE
     assert tls.trust_source() == tls.SOURCE_CERTIFI
@@ -226,7 +231,7 @@ def test_the_operators_bundle_wins_over_truststore_and_certifi(
 ) -> None:
     monkeypatch.setenv("SSL_CERT_FILE", str(https_server.ca_file))
     assert tls.trust_source() == tls.SOURCE_ENV
-    assert service._http_get(https_server.url, {}, 5)[0] == 200
+    assert service._http_get(https_server.url, {}, _HANDSHAKE_S)[0] == 200
 
 
 def test_truststore_is_preferred_and_certifi_is_the_fallback(
@@ -544,19 +549,18 @@ def test_a_stalled_handshake_holds_up_no_other_thread(https_server: _Server) -> 
     never answers held up every other thread's for its whole timeout. Each thread has its
     own context: the second handshake, to a peer that answers at once, does not wait."""
     import socket
-    import time
 
     silent = socket.socket()
     silent.bind(("127.0.0.1", 0))
-    silent.listen(1)  # takes the TCP connection, never answers the ClientHello
+    silent.listen(1)  # takes the TCP connection; the test reads the ClientHello, never answers
+    silent.settimeout(30.0)
     answering = int(https_server.url.split(":")[2].split("/")[0])
-    took: dict[str, float] = {}
+    let_go = threading.Event()
 
-    def shake(name: str, port: int, timeout: float) -> None:
-        began = time.monotonic()
-        with contextlib.suppress(OSError):  # the stalled one times out; the other may not verify
-            tls.handshake("127.0.0.1", port=port, timeout=timeout)
-        took[name] = time.monotonic() - began
+    def stall() -> None:
+        with contextlib.suppress(OSError):  # it ends when the test closes its peer
+            tls.handshake("127.0.0.1", port=silent.getsockname()[1], timeout=30.0)
+        let_go.set()
 
     # One handshake first, untimed: a process's first verification can be slow on its own.
     # On CI's Windows runner, in a shard where this was the first verification in its
@@ -566,17 +570,27 @@ def test_a_stalled_handshake_holds_up_no_other_thread(https_server: _Server) -> 
     # handshake up behind the stalled one (the mutant: one context for the process).
     with contextlib.suppress(OSError):
         tls.handshake("127.0.0.1", port=answering, timeout=30.0)
+    stalled = threading.Thread(target=stall, daemon=True)
+    stalled.start()
+    peer = None
     try:
-        stalled = threading.Thread(target=shake, args=("stalled", silent.getsockname()[1], 3.0))
-        stalled.start()
-        time.sleep(0.2)
-        shake("answered", answering, 5.0)
-        stalled.join(10)
+        peer, _ = silent.accept()
+        peer.settimeout(30.0)
+        # Its ClientHello is in and nothing answers it: that handshake is under way, holding
+        # its context's lock, which with one context for the process is every thread's.
+        assert peer.recv(1) == b"\x16", "precondition: the stalled handshake sent its ClientHello"
+        with contextlib.suppress(ssl.SSLCertVerificationError):  # answered; the CA is in no store
+            tls.handshake("127.0.0.1", port=answering, timeout=30.0)
+        still_stalled = not let_go.is_set()
     finally:
+        if peer is not None:
+            peer.close()  # the stalled handshake ends here, not at its timeout
         silent.close()
+        stalled.join(30)
 
-    assert took["stalled"] >= 2.5, took  # control: it really stalled
-    assert took["answered"] < 1.0, f"held up behind the stalled handshake: {took}"
+    # No clock: the answered handshake came back while the other was still waiting, which a
+    # context shared with it cannot do (it waits for that one's lock until its timeout).
+    assert still_stalled, "held up behind the stalled handshake: that one ended first"
 
 
 def test_a_malformed_proxy_port_is_a_warning_naming_https_proxy_not_a_crash(
@@ -938,13 +952,13 @@ def test_the_handshake_goes_through_https_proxy_as_requests_do(
         monkeypatch.delenv(name, raising=False)
 
     assert tls.https_proxy("127.0.0.1") == proxy
-    tls.handshake("127.0.0.1", port=port, timeout=5)
+    tls.handshake("127.0.0.1", port=port, timeout=_HANDSHAKE_S)
     # The request line's version is http.client's: HTTP/1.0 before Python 3.12, 1.1 since.
     assert [line.rsplit(" ", 1)[0] for line in seen] == [f"CONNECT 127.0.0.1:{port}"]
 
     monkeypatch.setenv("NO_PROXY", "127.0.0.1")  # the control: bypassed, it goes direct
     assert tls.https_proxy("127.0.0.1") is None
-    tls.handshake("127.0.0.1", port=port, timeout=5)
+    tls.handshake("127.0.0.1", port=port, timeout=_HANDSHAKE_S)
     assert len(seen) == 1
 
 

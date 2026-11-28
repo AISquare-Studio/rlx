@@ -23,8 +23,10 @@ from aisquare.cli.ui.sidebar import (
     project_subtitle,
     short_path,
 )
+from aisquare.cli.ui.views.app_settings import AppSettingsView
 from aisquare.models import ProjectInfo
 from aisquare.services import settings as settings_service
+from tests.settings_fields import reopen
 from tests.test_ui_shell import card_for, drive, fleet_app, refreshed, seed, settle, shown
 from tests.test_ui_shell import no_real_tmux as _no_real_tmux
 from tests.test_ui_shell import script as _script
@@ -92,10 +94,10 @@ def test_off_by_default_only_twins_show_their_directory(tmp_path: Path) -> None:
 
     always, lines = drive(go)
     assert always is False
-    # Each twin's codename after its directory: neither is the one its name gives (`api`).
+    # Each twin's directory, and no codename (Q3): neither card says amber-otter or ruby-fox.
     assert lines == {
-        "prj_w": _directory(tmp_path, "work/api") + " · amber-otter",
-        "prj_o": _directory(tmp_path, "oss/api") + " · ruby-fox",
+        "prj_w": _directory(tmp_path, "work/api"),
+        "prj_o": _directory(tmp_path, "oss/api"),
         "prj_u": None,
     }
 
@@ -173,11 +175,12 @@ def test_the_refresh_tick_never_reads_the_preference(
             await refreshed(app)
         ticked = _subtitles(app)["prj_u"]
         await _open_app_settings(app)
-        app.query_one("#reload-settings", Button).press()
-        await settle(app)
+        await reopen(pilot, app.query_one(AppSettingsView))  # there is no Reload (M5)
         return at_start, len(reads), ticked, _subtitles(app)["prj_u"]
 
     at_start, after_ticks, ticked, reloaded = drive(go)
-    assert at_start == 1 and after_ticks == 1, "read once, at the start"
+    # Read at the start, by the app and by home's Board tab as it is built (board.py reads its
+    # autoscroll; start opens home since L1), and never by a tick.
+    assert at_start == 2 and after_ticks == at_start, "read at the start only"
     assert ticked is None, "the ticks painted with the value the app holds"
     assert reloaded == _directory(tmp_path, "unique"), "Reload hands it over"

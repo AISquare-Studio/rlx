@@ -11,21 +11,23 @@ shared check says the directory is connected.
 from __future__ import annotations
 
 import asyncio
+import shutil
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any
 
 import pytest
 from textual.app import App, ComposeResult
 from textual.message import Message
-from textual.widgets import Button, Static
+from textual.widgets import Button, Collapsible, Static
 
 from aisquare.cli.ui.views.doctor import DoctorRefreshed, DoctorView, FixApplied
 from aisquare.core.selfcli import CliResult
 from aisquare.models import CheckStatus, DoctorCheck
 from aisquare.services import agents as agents_service
 from aisquare.services import diagnostics
-from tests.ui_workers import settle_page
+from tests.ui_workers import settle_page, settle_until
 
 
 @dataclass
@@ -95,7 +97,12 @@ def test_connect_is_one_click_and_the_planned_agents_have_no_button(
             await settle_page(host)
             await pilot.click(f"#{button_id}")
             await settle_page(host)
-            report = str(view.query_one("#doctor-report", Static).render())
+            # The passing rows fold behind one line (Q5): read both, as the page holds them.
+            report = (
+                str(view.query_one("#doctor-report", Static).render())
+                + "\n"
+                + str(view.query_one("#doctor-passed-list", Static).render())
+            )
             return before, _labels(view), report, host.received
 
     before, after, report, received = asyncio.run(drive())
@@ -119,3 +126,387 @@ def test_connect_is_one_click_and_the_planned_agents_have_no_button(
     rows: dict[str, DoctorCheck] = {check.name: check for check in refreshed[0].checks}
     assert rows["claude-code"].status is CheckStatus.ok, rows["claude-code"]
     assert rows["cursor"].status is CheckStatus.ok and rows["cursor"].fix is None
+
+
+# --- Q5: problems first, the passing checks folded --------------------------------------
+
+
+@dataclass
+class Spy:
+    """Every ``aisquare`` call a fix makes, answered ok."""
+
+    calls: list[list[str]] = field(default_factory=list)
+
+    def __call__(self, args: Sequence[str], *, cwd: Path | None = None) -> CliResult:
+        self.calls.append(list(args))
+        return CliResult(argv=list(args), returncode=0, stdout="{}", stderr="")
+
+
+def _row(name: str, status: CheckStatus, fix: str | None = None) -> DoctorCheck:
+    return DoctorCheck(name=name, status=status, detail=f"{name} detail", fix=fix)
+
+
+def test_the_failing_check_comes_first_and_the_passing_ones_fold_behind_one_line() -> None:
+    checks = [
+        _row("python", CheckStatus.ok),
+        _row("git", CheckStatus.ok),
+        _row("database", CheckStatus.fail),
+        _row("tmux", CheckStatus.ok),
+    ]
+
+    async def drive() -> tuple[str, str, bool, bool, str]:
+        view = DoctorView(run=Spy(), refresh=lambda cwd: checks)
+        host = Host(view)
+        async with host.run_test(size=(120, 40)):
+            view.show(checks)
+            await settle_page(host)
+            report = str(view.query_one("#doctor-report", Static).render())
+            fold = view.query_one("#doctor-passed", Collapsible)
+            folded = fold.collapsed
+            title = str(fold.title)
+            fold.collapsed = False  # unfold it, as a click on its title does
+            await settle_page(host)
+            listed = view.query_one("#doctor-passed-list", Static)
+            return report, title, folded, listed.region.height > 0, str(listed.render())
+
+    report, title, folded, shown, listed = asyncio.run(drive())
+
+    assert report.splitlines()[0].startswith("✗ database:"), report
+    assert "python" not in report and "git" not in report and "tmux" not in report
+    assert (title, folded) == ("3 passed", True)
+    assert shown, "unfolded, the passing checks show"
+    assert [line.split(":")[0] for line in listed.splitlines() if line] == [
+        "✓ python",
+        "✓ git",
+        "✓ tmux",
+    ]
+
+
+def test_with_every_check_passing_the_report_says_so_and_folds_them() -> None:
+    checks = [_row("python", CheckStatus.ok), _row("git", CheckStatus.ok)]
+
+    async def drive() -> tuple[str, str]:
+        view = DoctorView(run=Spy(), refresh=lambda cwd: checks)
+        host = Host(view)
+        async with host.run_test(size=(120, 40)):
+            view.show(checks)
+            await settle_page(host)
+            return (
+                str(view.query_one("#doctor-report", Static).render()),
+                str(view.query_one("#doctor-passed", Collapsible).title),
+            )
+
+    assert asyncio.run(drive()) == ("No problems found.", "2 passed")
+
+
+# --- M3: the new one-click fixes ---------------------------------------------------------
+
+
+LIMITED = _row(
+    "claude-account-limits",
+    CheckStatus.warn,
+    "Move one to an account with headroom: rlx fleet switch --project amber-otter coder-1; "
+    "or wait — Claude Code continues by itself at the reset",
+)
+STALE_WATCHER = _row("fleet watcher", CheckStatus.warn, "rlx watch --stop; then rlx watch --detach")
+
+
+@pytest.mark.parametrize(
+    ("check", "label", "argv"),
+    [
+        (
+            LIMITED,
+            "Move coder-1 to an account with room",
+            ["fleet", "switch", "--project", "amber-otter", "coder-1"],
+        ),
+        (STALE_WATCHER, "Stop the watcher", ["watch", "--stop"]),
+        (STALE_WATCHER, "Start the watcher", ["watch", "--detach"]),
+    ],
+)
+def test_each_new_fix_is_one_click_that_runs_its_command(
+    check: DoctorCheck, label: str, argv: list[str]
+) -> None:
+    run = Spy()
+
+    async def drive() -> dict[str, str]:
+        view = DoctorView(run=run, refresh=lambda cwd: [check])
+        host = Host(view)
+        async with host.run_test(size=(160, 50)) as pilot:
+            view.show([check])
+            await settle_page(host)
+            labels = _labels(view)
+            button_id = next(key for key, shown in labels.items() if shown == label)
+            view.query_one(f"#{button_id}").scroll_visible(animate=False)
+            await settle_page(host)
+            await pilot.click(f"#{button_id}")
+            await settle_page(host)
+            return labels
+
+    labels = asyncio.run(drive())
+
+    assert label in labels.values(), labels
+    assert ["--json", *argv] in run.calls, run.calls
+
+
+# --- #15: quiet offers, run in a pane of their own ----------------------------------------
+
+
+PRIVATE_SOCKET = "asq-test-doctor-pane"
+FIX_PANE = "%9"
+
+
+@dataclass
+class PaneWorld:
+    """The fleet's server a private socket whose every argv fails; ``open_window`` replaced by
+    a recorder, and the pane answered dead at once with ``status``."""
+
+    opened: list[dict[str, Any]] = field(default_factory=list)
+    killed: list[str] = field(default_factory=list)
+    status: int = 0
+    gone: bool = False
+    """The pane vanished rather than ended: tmux knows it no more."""
+
+
+@pytest.fixture
+def pane_world(monkeypatch: pytest.MonkeyPatch) -> PaneWorld:
+    from aisquare.core import tmux as tmux_core
+    from aisquare.core.tmux import Completed, PaneFacts, TmuxServer, WindowInfo
+    from aisquare.services import fleet as fleet_service
+    from aisquare.services import onboarding
+
+    world = PaneWorld()
+    # A pane can open here whatever the runner (Windows has no uid, a runner may lack tmux):
+    # the window itself is the stand-in below.
+    monkeypatch.setattr(onboarding, "pane_available", lambda: True)
+    monkeypatch.setattr(
+        tmux_core, "_tmux", lambda argv, stdin: Completed(1, "", "no server (a UI test)\n")
+    )
+    monkeypatch.setattr(fleet_service, "server", lambda config=None: TmuxServer(PRIVATE_SOCKET))
+
+    def open_window(server: Any, session: str, **kwargs: Any) -> WindowInfo:
+        world.opened.append({"session": session, **kwargs, "command": list(kwargs["command"])})
+        return WindowInfo(
+            session=session,
+            window_id="@9",
+            name=kwargs["name"],
+            pane_id=FIX_PANE,
+            dead=False,
+            dead_status=None,
+            current_command="gh",
+            activity=False,
+        )
+
+    def facts(server: Any, pane_id: str) -> PaneFacts | None:
+        if world.gone:
+            return None
+        return PaneFacts(
+            pane_id=pane_id,
+            width=80,
+            height=24,
+            cursor_x=0,
+            cursor_y=0,
+            cursor_visible=True,
+            alternate_on=False,
+            history_size=0,
+            dead=True,
+            dead_status=world.status,
+            in_mode=False,
+            current_command="gh",
+            title="",
+        )
+
+    monkeypatch.setattr(fleet_service, "open_window", open_window)
+    monkeypatch.setattr(TmuxServer, "pane_facts_or_raise", facts)
+    monkeypatch.setattr(TmuxServer, "kill_window", lambda server, pane: world.killed.append(pane))
+    return world
+
+
+def _offer(name: str, offer: str) -> DoctorCheck:
+    return DoctorCheck(name=name, status=CheckStatus.ok, detail=f"{name} detail", offer=offer)
+
+
+def test_an_ok_rows_offer_is_a_quiet_button_beside_it_in_the_fold_and_no_problem(
+    pane_world: PaneWorld,
+) -> None:
+    """In the fold with its row (#15, seq 212): hidden while the fold is, shown with it."""
+    checks = [_offer("status line", "rlx accounts statusline --install")]
+
+    async def drive() -> tuple[str, str, list[str], str, bool, bool, list[str]]:
+        view = DoctorView(run=Spy(), refresh=lambda cwd: checks)
+        host = Host(view)
+        async with host.run_test(size=(120, 40)):
+            view.show(checks)
+            await settle_page(host)
+            button = view.query_one("#fix-0", Button)
+            folded = button.region.height > 0
+            fold = view.query_one("#doctor-passed", Collapsible)
+            fold.collapsed = False
+            await settle_page(host)
+            return (
+                str(view.query_one("#doctor-report", Static).render()),
+                str(view.query_one("#doctor-passed-list", Static).render()),
+                [str(b.label) for b in view.query("#doctor-offers Button").results(Button)],
+                str(button.variant),
+                folded,
+                button.region.height > 0,
+                [str(b.label) for b in view.query("#doctor-fixes Button").results(Button)],
+            )
+
+    report, passed, offers, variant, shown_folded, shown_open, loud = asyncio.run(drive())
+
+    assert report == "No problems found.", "an offer is never a problem"
+    assert "→ Install status line below, if you want it" in passed
+    assert offers == ["Install status line"] and variant == "default"
+    assert loud == [], "not among the problems' buttons"
+    assert (shown_folded, shown_open) == (False, True), "folded with its row, then shown"
+
+
+def test_with_the_fold_open_a_problems_button_stays_above_the_passing_rows(
+    pane_world: PaneWorld,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The tester of #15, round 3: opened, the fold's passing rows pushed the problem's own
+    button (Add browser tools) below all of them. It sits with the problems now."""
+    # Claude Code installed, as that button asks: on Windows the suite puts no stand-in
+    # ``claude`` on PATH, and a runner has no real one (the full matrix of #15 round 5).
+    monkeypatch.setattr(shutil, "which", lambda name: f"/usr/bin/{name}")
+    add = diagnostics.BROWSER_TOOLS_ADD
+    checks = [
+        DoctorCheck(
+            name="browser tools",
+            status=CheckStatus.warn,
+            detail="no browser MCP",
+            fix=f"Add the Chrome DevTools MCP to Claude Code: {add}",
+        ),
+        *(DoctorCheck(name=f"check {n}", status=CheckStatus.ok, detail="fine") for n in range(12)),
+    ]
+
+    async def drive() -> tuple[list[str], int, int]:
+        view = DoctorView(run=Spy(), refresh=lambda cwd: checks)
+        host = Host(view)
+        async with host.run_test(size=(120, 60)):
+            view.show(checks)
+            await settle_page(host)
+            view.query_one("#doctor-passed", Collapsible).collapsed = False
+            await settle_page(host)
+            loud = list(view.query("#doctor-fixes Button").results(Button))
+            fold = view.query_one("#doctor-passed", Collapsible)
+            return [str(b.label) for b in loud], loud[0].region.y, fold.region.y
+
+    labels, button_y, fold_y = asyncio.run(drive())
+
+    assert labels == ["Add browser tools"]
+    assert button_y < fold_y, (button_y, fold_y)
+
+
+@pytest.mark.parametrize(
+    ("check", "title", "command"),
+    [
+        (
+            _offer("status line", "rlx accounts statusline --install"),
+            "Install status line",
+            None,  # ours, as this install runs it
+        ),
+        (_offer("gh", "gh auth login"), "Sign in to GitHub", ["gh", "auth", "login"]),
+    ],
+)
+def test_a_pane_fix_opens_its_command_in_a_pane_and_the_checks_run_again_when_it_ends(
+    pane_world: PaneWorld,
+    monkeypatch: pytest.MonkeyPatch,
+    check: DoctorCheck,
+    title: str,
+    command: list[str] | None,
+) -> None:
+    from aisquare.core import selfcli
+
+    monkeypatch.setattr(shutil, "which", lambda name: f"/usr/bin/{name}")
+    refreshed: list[Path | None] = []
+
+    def refresh(cwd: Path | None) -> list[DoctorCheck]:
+        refreshed.append(cwd)
+        return [check]
+
+    async def drive() -> str:
+        view = DoctorView(run=Spy(), refresh=refresh)
+        host = Host(view)
+        async with host.run_test(size=(120, 40)) as pilot:
+            view.show([check])
+            await settle_page(host)
+            view.query_one("#doctor-passed", Collapsible).collapsed = False  # its row's fold
+            await settle_page(host)
+            await pilot.click("#fix-0")
+            await settle_until(host, lambda: bool(refreshed))
+            await settle_page(host)
+            return str(view.query_one("#doctor-status", Static).render())
+
+    status = asyncio.run(drive())
+
+    (opened,) = pane_world.opened
+    assert opened["session"] == "asq-doctor-fix" and opened["cwd"] == Path.home()
+    want = command or selfcli.argv_for(["accounts", "statusline", "--install"])
+    assert opened["command"] == want
+    assert pane_world.killed == [FIX_PANE], "its window closed once it ended"
+    assert status == f"✓ {title}" and refreshed, "and the checks ran again"
+
+
+def test_a_pane_that_cannot_open_says_why_and_runs_nothing(
+    pane_world: PaneWorld, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from aisquare.services import fleet as fleet_service
+
+    monkeypatch.setattr(shutil, "which", lambda name: f"/usr/bin/{name}")
+
+    def refuse(*args: Any, **kwargs: Any) -> Any:
+        raise OSError("no tmux here")
+
+    monkeypatch.setattr(fleet_service, "open_window", refuse)
+    check = _offer("gh", "gh auth login")
+
+    async def drive() -> tuple[str, str]:
+        view = DoctorView(run=Spy(), refresh=lambda cwd: [check])
+        host = Host(view)
+        async with host.run_test(size=(120, 40)) as pilot:
+            view.show([check])
+            await settle_page(host)
+            view.query_one("#doctor-passed", Collapsible).collapsed = False
+            await settle_page(host)
+            await pilot.click("#fix-0")
+            await settle_until(host, lambda: type(host.screen).__name__ != "FixPaneScreen")
+            await settle_page(host)
+            said = str(view.query_one("#doctor-status", Static).render())
+            return type(host.screen).__name__, said
+
+    screen, status = asyncio.run(drive())
+
+    assert screen != "FixPaneScreen"
+    assert status == "✗ Sign in to GitHub: rlx could not open a pane for it here"
+    assert "no tmux here" not in status, "tmux's own words are no answer for the person"
+
+
+def test_a_pane_that_vanishes_is_no_success(
+    pane_world: PaneWorld, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Gone, not ended (killed by hand, the server stopped): what it did is not known."""
+    monkeypatch.setattr(shutil, "which", lambda name: f"/usr/bin/{name}")
+    pane_world.gone = True
+    check = _offer("gh", "gh auth login")
+    refreshed: list[Path | None] = []
+
+    def refresh(cwd: Path | None) -> list[DoctorCheck]:
+        refreshed.append(cwd)
+        return [check]
+
+    async def drive() -> str:
+        view = DoctorView(run=Spy(), refresh=refresh)
+        host = Host(view)
+        async with host.run_test(size=(120, 40)) as pilot:
+            view.show([check])
+            await settle_page(host)
+            view.query_one("#doctor-passed", Collapsible).collapsed = False
+            await settle_page(host)
+            await pilot.click("#fix-0")
+            await settle_until(host, lambda: bool(refreshed))
+            await settle_page(host)
+            return str(view.query_one("#doctor-status", Static).render())
+
+    assert asyncio.run(drive()) == "✗ Sign in to GitHub: its pane closed before it finished"

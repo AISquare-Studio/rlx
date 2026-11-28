@@ -78,12 +78,13 @@ ManagersOnly = Annotated[
 
 _STATE_CHIP = {
     "working": "▶ working",
-    "waiting": "⏸ waiting",
+    # One meaning per mark, as the sidebar's (Q4): ⏸ is paused, and waiting a muted ◦.
+    "waiting": "◦ waiting",
     "attention": "🔔 NEEDS YOU",
     "limited": "⏳ limited",
     "exited": "💤 exited",
     "lost": "✗ lost",
-    "paused": "⏯ paused",
+    "paused": "⏸ paused",
     "unknown": "· unknown",
 }
 
@@ -364,7 +365,9 @@ def spawn(
 
     Arguments after the options are passed to the agent, as with `rlx launch`
     — which is also why `--json` must come BEFORE `spawn`: after the role it
-    belongs to the agent.
+    belongs to the agent. A role's own flags for each agent go in
+    fleet.roles.<role>.agent_args.codex or .claude-code; Codex takes --effort
+    as its reasoning effort.
     """
     target = _project(project)
     try:
@@ -430,6 +433,64 @@ def spawn(
         console.print(f"  {'✓' if note in receipt.shared else '⚠'} {note}")
 
 
+@app.command("manager-policy")
+def manager_policy(
+    key: Annotated[str | None, typer.Argument(help="manager_wake or manager_pass_minutes.")] = None,
+    value: Annotated[str | None, typer.Argument(help="The value to set.")] = None,
+    project: Annotated[str | None, typer.Option("--project", help="Fleet project or ID.")] = None,
+    clear: Annotated[bool, typer.Option("--clear", help="Restore the key's default.")] = False,
+) -> None:
+    """Read, set or clear how the fleet's manager is woken (#551): on every board write that
+    concerns it (manager_wake every_write, the default), or urgent news at once and routine
+    news at most every manager_pass_minutes minutes (schedule; 15 unless set)."""
+    from aisquare.core.store import store_session
+    from aisquare.services import manager_seat
+
+    target = _project(project)
+    if key is not None and key not in manager_seat.KEYS:
+        raise typer.BadParameter(f"unknown key {key!r}: manager_wake or manager_pass_minutes")
+    if key is None and (clear or value is not None):
+        raise typer.BadParameter("name the key to set or clear")
+    if clear and value is not None:
+        raise typer.BadParameter("--clear takes no value")
+    validated: str | None = None
+    if key is not None and value is not None:
+        try:
+            validated = manager_seat.validate(key, value)
+        except ValueError as exc:
+            raise typer.BadParameter(str(exc)) from exc
+    with store_session() as store:
+        if key is not None and clear:
+            store.clear_project_setting(target.id, key)
+        elif key is not None and validated is not None:
+            store.set_project_setting(target.id, key, validated)
+        policy = manager_seat.policy(store, target.id)
+    if get_state().json_output:
+        typer.echo(
+            json.dumps(
+                {
+                    "project_id": target.id,
+                    manager_seat.WAKE: policy.wake,
+                    manager_seat.PASS_MINUTES: policy.minutes,
+                    "invalid": list(policy.invalid),
+                }
+            )
+        )
+        return
+    typer.echo(
+        f"{_display_name(target)}: {manager_seat.WAKE}={policy.wake} "
+        f"{manager_seat.PASS_MINUTES}={policy.minutes}"
+    )
+    if policy.invalid:
+        typer.echo(f"Using the defaults of invalid settings: {', '.join(policy.invalid)}", err=True)
+    if policy.scheduled and policy.minutes == 0:
+        typer.echo(
+            f"{manager_seat.PASS_MINUTES} is 0: routine news waits for an urgent wake or the "
+            "person's next prompt.",
+            err=True,
+        )
+
+
 @app.command("ls")
 def ls(
     project: ProjectRef = None,
@@ -479,7 +540,7 @@ def restart(
             help="Permission for the replacement: WRITE:APPROVALS mapped per agent "
             "(workspace:auto, read_only:auto…) or the agent's own (Claude Code: auto, "
             "acceptEdits, …); default: the one the agent was launched with, or the role's "
-            "for an agent spawned before that was recorded (#144).",
+            "for an agent spawned before that was recorded.",
         ),
     ] = None,
     model: Annotated[
@@ -510,7 +571,7 @@ def restart(
     manager killed with ctrl+c comes back knowing its intake and its coders.
     A running agent is stopped first and handed over as `fleet switch` hands
     one over: its claims wait for the replacement and no exit is announced.
-    The replacement is launched as the agent was (#144) — binary, permission
+    The replacement is launched as the agent was — binary, permission
     mode, arguments — not as the role's config reads today; --permission-mode
     changes the mode, and later restarts keep it.
 
@@ -1570,6 +1631,7 @@ def reap(
                     "claims_released": list(report.claims_released),
                     "release_failures": list(report.release_failures),
                     "held": [_row_json(row) for row in report.held],
+                    "temp_dirs_removed": [str(p) for p in report.temp_dirs_removed],
                 }
             )
         )
@@ -1596,6 +1658,8 @@ def reap(
         console.print(f"  ⚠ {row.agent.label}  LEFT LIVE — {row.reason}")
     for path in report.worktrees_removed:
         console.print(f"  🗑 {path}")
+    for path in report.temp_dirs_removed:
+        console.print(f"  🗑 {path} (an ended agent's temporary directory)")
     for root, branch in report.branches_deleted:
         console.print(f"  🗑 branch {branch} in {root}")
     for root, branch in report.branches_kept:
@@ -1712,7 +1776,7 @@ def adopt(
         int, typer.Option("--limit", help="With --list: how many.", min=1, max=50)
     ] = adopt_service.LIST_LIMIT,
 ) -> None:
-    """Bring a coding-agent conversation you started by hand under the fleet (#290).
+    """Bring a coding-agent conversation you started by hand under the fleet.
 
     It resumes on its own agent (a Claude Code session, a Codex thread), on the account whose
     directory holds its transcript (a slot, or the agent's plain home) and in the directory

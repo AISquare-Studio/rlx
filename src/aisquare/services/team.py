@@ -33,6 +33,7 @@ from typing import Any, Final, Literal, NamedTuple, NoReturn
 
 from aisquare.core import (
     agent_sessions,
+    event_time,
     experimental,
     harness,
     insights,
@@ -52,10 +53,12 @@ from aisquare.core.store import (
     AmbiguousIdError,
     ContextStore,
     Relevance,
+    SessionNameRow,
     store_session,
     unmet_needs,
 )
 from aisquare.core.tmux import TmuxError
+from aisquare.core.version import PRODUCT_NAME
 from aisquare.models import (
     CLOSED_STATUSES,
     FleetAgent,
@@ -65,7 +68,7 @@ from aisquare.models import (
     TeamSession,
     TeamTask,
 )
-from aisquare.services import install_route, mcp_host, model_memory
+from aisquare.services import install_route, manager_seat, mcp_host, model_memory
 from aisquare.services import project as project_service
 
 #: The fail-open reads of the fleet row say here what they swallowed. Nothing
@@ -467,10 +470,13 @@ class Standby:
 def standby_of(store: ContextStore, me: TeamSession) -> Standby | None:
     """``me``'s standby while it holds, else ``None``.
 
-    It holds while nothing is in flight on its board (:func:`work_in_flight`), and ends for
-    good when work comes back after it began (:data:`WORK_RETURNS_KINDS`): a fleet at work
-    always reaches its manager. The person's next prompt ends it too
-    (:func:`standby_turn_began`)."""
+    One its manager asked for (``team standby``, ``explicit``) holds with tasks in flight,
+    until ``--off`` or its person's next prompt (:func:`standby_turn_began`): a fleet of
+    35 agents always has one, and the standby never held (#551). One watch inferred from a
+    question to its person (``asked``) holds while nothing is in flight on its board
+    (:func:`work_in_flight`), and ends for good when work comes back after it began
+    (:data:`WORK_RETURNS_KINDS`): a fleet at work reaches a manager that did not ask for
+    quiet. The person's next prompt ends it too."""
     raw = store.get_meta(STANDBY_META + me.id)
     if not raw:
         return None
@@ -480,6 +486,8 @@ def standby_of(store: ContextStore, me: TeamSession) -> Standby | None:
     except (ValueError, KeyError, TypeError):
         store.delete_meta(STANDBY_META + me.id)
         return None
+    if standby.why == "explicit":
+        return standby
     returned = store.filtered_events(me.project_id, since_iso=standby.since.isoformat(), limit=200)
     if any(e.kind in WORK_RETURNS_KINDS and e.created_at > standby.since for e in returned):
         store.delete_meta(STANDBY_META + me.id)
@@ -559,6 +567,227 @@ def manager_wakes(
     return standby is None or not held_in_standby(event)
 
 
+# --- a scheduled manager (#551, #41) ---------------------------------------------------------
+
+SCHEDULED_DELTA_LIMIT = 50
+"""A scheduled manager's delta page (``services.manager_seat``): woken for routine news at most
+every N minutes, it reads that news in one turn rather than :data:`_DELTA_LIMIT` lines a turn.
+Its prompt's delta is cut to :data:`_SCHEDULED_DELTA_BUDGET` too, and its Stop reason clips
+its lines to its budget (:func:`_render_wakeup`)."""
+
+_SCHEDULED_DELTA_BUDGET = 8_000
+"""What a scheduled manager's prompt delta may cost, in characters, under the cap Claude Code
+puts on a hook's output (:data:`HOOK_OUTPUT_CAP`); the lines past it wait for the next page."""
+
+URGENT_KINDS: frozenset[str] = frozenset(
+    {"question", "note", "limited", "handover_failed", "prompt_unsent", "agent_exited", "watch"}
+)
+"""The kinds a scheduled manager can be woken for at once (:func:`_urgent` decides), asked IN
+the query: an urgent line behind a page of results is found all the same."""
+
+_URGENT_PAGE = 200
+
+DUE_META = "manager-due:"
+"""``team_meta`` key prefix, then a scheduled manager's session id: the board seq through which
+its routine news is due (:func:`_due_through`). It says how far routine news is due, never what
+was read: the delta's cursor is the one read position, and a due line stays due until the
+delta has passed it, a page at a time."""
+
+
+@dataclass(frozen=True)
+class Pending:
+    """What is past a manager's cursor for it (:func:`pending_wake`). ``now``: the first event
+    that wakes it now; ``held``: routine news a schedule holds until it is due; ``scheduled``:
+    whether its project's policy is ``schedule`` (``services.manager_seat``)."""
+
+    now: TeamEvent | None = None
+    held: bool = False
+    scheduled: bool = False
+
+
+def schedule_of(store: ContextStore, me: TeamSession) -> tuple[manager_seat.Policy, str] | None:
+    """The policy and fleet project of ``me`` when it is the manager, in the live ``manager``
+    row, of a fleet project whose policy is ``schedule``; else ``None``: every board write
+    wakes it, as every manager was woken before the policy. A manager launched by hand, which
+    no row holds, has no fleet project to read a policy from."""
+    if me.role != MANAGER_ROLE:
+        return None
+    row = store.fleet_agent_for_session(me.id)
+    if row is None or row.ended_at is not None or row.label != MANAGER_ROLE:
+        return None
+    policy = manager_seat.policy(store, row.project_id)
+    return (policy, row.project_id) if policy.scheduled else None
+
+
+def pending_wake(store: ContextStore, me: TeamSession) -> Pending:
+    """What wakes the manager ``me`` now, the one rule its doors read: the nudge
+    (``services.fleet._nudge``), the Stop hook and its deferral.
+
+    Under ``every_write`` (the default): the first event of its delta's window that
+    :func:`manager_wakes` counts, as always. Under ``schedule``: the first urgent event past
+    its cursor (:func:`_urgent`), looked for past the window; else the first routine one (what
+    :func:`manager_wakes` counts) that is due (:func:`_due_through`). Routine news that is not
+    due yet is ``held``: a nudge records it for the tickers to send once it is."""
+    standby = standby_of(store, me)
+    scheduled = schedule_of(store, me)
+    if scheduled is None:
+        candidates = _wake_candidates(store, me)
+        return Pending(next((e for e in candidates if manager_wakes(store, e, me, standby)), None))
+    policy, project = scheduled
+    urgent = _first_urgent(store, me, project)
+    if urgent is not None:
+        return Pending(urgent, scheduled=True)
+    window = _wake_candidates(store, me, limit=SCHEDULED_DELTA_LIMIT * 3 + 1)
+    routine = [event for event in window if manager_wakes(store, event, me, standby)]
+    if not routine:
+        return Pending(scheduled=True)
+    through = _due_through(store, me, policy, standby, routine[-1].seq)
+    due = next((event for event in routine if event.seq <= through), None)
+    return Pending(due, held=due is None, scheduled=True)
+
+
+def _first_urgent(store: ContextStore, me: TeamSession, project: str) -> TeamEvent | None:
+    """The first event past ``me``'s cursor that wakes it at once (:func:`_urgent`), read a page
+    of :data:`URGENT_KINDS` at a time until the board ends."""
+    names = _own_names(store, me)
+    cursor = me.cursor
+    while True:
+        page = store.events_since(
+            me.project_id,
+            cursor,
+            exclude_session=me.id,
+            include_kinds=URGENT_KINDS,
+            exclude_actor=me.id,
+            limit=_URGENT_PAGE,
+        )
+        found = next((e for e in page if _urgent(store, e, me, project, names)), None)
+        if found is not None or len(page) < _URGENT_PAGE:
+            return found
+        cursor = page[-1].seq
+
+
+def _urgent(
+    store: ContextStore, event: TeamEvent, me: TeamSession, project: str, names: frozenset[str]
+) -> bool:
+    """Whether ``event`` wakes ``me``, the scheduled manager of fleet ``project``, at once:
+
+    - a question to it: by its session id, short or full, or a name of its own (``names``);
+      or to ``manager``, or to no one, for its fleet (:func:`_for_its_fleet`);
+    - a note from no session (its person, at a terminal or on the phone) addressed to it so;
+    - ``limited``, ``handover_failed``, ``prompt_unsent``, an exit that wakes
+      (:func:`exit_wakes`) and a watch line standby does not hold (a dialog, an agent asking,
+      a crash): each for its fleet.
+
+    An agent's note, a result, a task's move, a question to another agent and watch's routine
+    lines are routine: they wait for their due time (:func:`pending_wake`)."""
+    kind = event.kind
+    if kind in ("question", "note"):
+        if kind == "note" and event.session_id is not None:
+            return False
+        to = (event.to_role or "").strip().lower()
+        if to and to != MANAGER_ROLE:
+            return to in names
+        if kind == "note" and not to:
+            return False
+        return _for_its_fleet(store, event, project)
+    if kind == "agent_exited":
+        meta = event.meta if event.meta is not None else _exit_meta_from_text(event.text)
+        if not exit_wakes(meta):
+            return False
+    elif kind == "watch":
+        if held_in_standby(event):
+            return False
+    elif kind not in ("limited", "handover_failed", "prompt_unsent"):
+        return False
+    return _for_its_fleet(store, event, project)
+
+
+def _own_names(store: ContextStore, me: TeamSession) -> frozenset[str]:
+    """What a question names ``me`` by, and ``me`` alone: its session id, full and short, and
+    its own names (:func:`addressee_names`), less ``manager``, which every manager on a hub
+    answers to (:func:`_for_its_fleet` decides that one)."""
+    own = {me.id.lower(), short_id(me.id).lower(), *addressee_names(store, me.id)}
+    return frozenset(own - {MANAGER_ROLE})
+
+
+def _for_its_fleet(store: ContextStore, event: TeamEvent, project: str) -> bool:
+    """Whether ``event`` is for the manager of fleet ``project``, on a board the managers of
+    several fleets may read (a hub): the fleet its writer stamped on it
+    (``manager_seat.EVENT_PROJECT``); else that of the fleet row of the session it came from;
+    else every fleet's, as before the stamp."""
+    stamped = event.meta.get(manager_seat.EVENT_PROJECT) if event.meta is not None else None
+    if isinstance(stamped, str):
+        return stamped == project
+    row = store.fleet_agent_for_session(event.session_id) if event.session_id else None
+    return row is None or row.project_id == project
+
+
+def _due_through(
+    store: ContextStore,
+    me: TeamSession,
+    policy: manager_seat.Policy,
+    standby: Standby | None,
+    newest: int,
+) -> int:
+    """The board seq through which ``me``'s routine news is due, ``newest`` the last routine
+    line past its cursor. Raised to the board's head when routine news falls due: no
+    standby holds, and ``policy.minutes`` have passed since its last prompt (each prompt
+    reads the whole delta, so it is when it last read the board). 0 while a standby holds;
+    never raised under 0 minutes, where routine news waits for an urgent wake or its person."""
+    if standby is not None:
+        return 0
+    key = DUE_META + me.id
+    raw = store.get_meta(key) or ""
+    through = int(raw) if raw.isdecimal() else 0
+    if newest <= through or policy.minutes <= 0:
+        return through
+    last = me.prompted_at or me.started_at
+    if _now() - last < timedelta(minutes=policy.minutes):
+        return through
+    through = store.latest_seq(me.project_id)
+    store.set_meta(key, str(through))
+    return through
+
+
+def _scheduled_manager_named(store: ContextStore, board_id: str, name: str) -> str | None:
+    """The fleet project of the scheduled manager on ``board_id`` that ``name`` (lower case)
+    names by its session id or a name of its own (:func:`_own_names`), or ``None``: a question
+    or a person's note to it wakes it at once, whichever fleet the writer is in. One read
+    in a home where no fleet has a schedule."""
+    if "schedule" not in store.project_settings(manager_seat.WAKE).values():
+        return None
+    for session in store.team_sessions(board_id):
+        if session.ended_at is not None or session.role != MANAGER_ROLE:
+            continue
+        if name in _own_names(store, session):
+            scheduled = schedule_of(store, session)
+            return scheduled[1] if scheduled is not None else None
+    return None
+
+
+def _manager_stamp(
+    store: ContextStore, kind: str, writer: str | None, to_role: str | None, project: str
+) -> dict[str, object] | None:
+    """The ``meta`` that says which fleet's manager a question or a person's note to
+    ``manager`` is for (:func:`_for_its_fleet`): ``project``, as the nudge picked it
+    (:func:`_nudge_target`), when a live ``manager`` row is there. ``None`` for any other
+    write, and for one no fleet's manager was picked for."""
+    to = (to_role or "").strip().lower()
+    if not (kind == "question" and to in ("", MANAGER_ROLE)) and not (
+        kind == "note" and writer is None and to == MANAGER_ROLE
+    ):
+        return None
+    if store.fleet_agent_by_label(project, MANAGER_ROLE, live_only=True) is None:
+        return None
+    return {manager_seat.EVENT_PROJECT: project}
+
+
+def _fleet_stamp(agent: FleetAgent | None) -> dict[str, object] | None:
+    """The ``meta`` of a fleet's system event (a limit, a failed hand-over): the fleet of
+    the agent's row, whose manager it is for (:func:`_for_its_fleet`)."""
+    return {manager_seat.EVENT_PROJECT: agent.project_id} if agent is not None else None
+
+
 class TeamDisabledError(RuntimeError):
     """Raised when a team command runs with the orchestrator disabled (AISQUARE_TEAM=0)."""
 
@@ -584,8 +813,8 @@ class DeliveryUnconfirmedError(RuntimeError):
 
     def __init__(self, ref: str, board_name: str) -> None:
         super().__init__(
-            f"write {ref} was not confirmed on board {board_name} — "
-            "not reporting success; check `aisquare log` before retrying"
+            f"write {ref} was not confirmed on board {board_name} — not reporting success"
+            + prog.shell_advice("; check `aisquare log` before retrying")  # asq attaches (R13)
         )
         self.ref = ref
         self.board_name = board_name
@@ -1498,11 +1727,19 @@ def board_data_in(
     )
 
 
+OPEN_STATUSES: frozenset[TaskStatus] = frozenset({"todo", "doing", "review", "blocked"})
+"""Every status but :data:`CLOSED_STATUSES`: the tasks a paged board reads at each tick."""
+
+
 class BoardRead(NamedTuple):
     """What a painted board shows: :func:`board_data`'s four, the ``fleet switch`` of each
     limited session's chip (:func:`fleet_switches`), and each session's fleet row's label, live
     or ended (:func:`fleet_labels`), which names it as asq's left pane does
-    (``cli.board_names``, #140)."""
+    (``cli.board_names``, #140); then the status of each task the read names, by id, and how
+    many tasks are in each of :data:`CLOSED_STATUSES` (one left out has none).
+
+    A paged read (:func:`board_read`'s ``sessions`` or ``closed=False``) holds only what a
+    board's tick shows, and ``statuses`` and ``closed`` say what it does not hold (#44)."""
 
     project: ProjectInfo
     sessions: list[TeamSession]
@@ -1510,6 +1747,8 @@ class BoardRead(NamedTuple):
     events: list[TeamEvent]
     switches: dict[str, str]
     fleet_labels: dict[str, str] = {}  # noqa: RUF012 — a NamedTuple default, never mutated
+    statuses: dict[str, str] = {}  # noqa: RUF012 — a NamedTuple default, never mutated
+    closed: dict[str, int] = {}  # noqa: RUF012 — a NamedTuple default, never mutated
 
 
 def board_read(
@@ -1519,6 +1758,9 @@ def board_read(
     since_seq: int | None = None,
     project: ProjectInfo | None = None,
     exclude_kinds: Collection[str] = (),
+    closed: bool = True,
+    sessions: Collection[str] | None = None,
+    task_ids: Collection[str] = (),
 ) -> BoardRead:
     """:func:`board_data` for a board that paints its sessions, with their chips' switches,
     in its one store session.
@@ -1528,18 +1770,163 @@ def board_read(
     connection, the migration check and the presence pass, on the event loop, at every 2 s
     tick of every visible board for as long as a session stayed limited, which is hours
     (review of #259, round 23). ``exclude_kinds`` as in :func:`board_data`.
+
+    **Paged, at each tick (#44).** By default it reads every task and session the project
+    ever had, as :func:`board_data` does. A board's tick asks for less, and it shows the
+    same:
+
+    - ``closed=False``: the open tasks alone (:data:`OPEN_STATUSES`), the done archive
+      counted (``closed``) and read when it is unfolded.
+    - ``sessions``: the live sessions, these, those the events read name and those the tasks
+      read are claimed by, and every session called what one of them is called
+      (:func:`board_sessions`), not every session ever.
+    - ``statuses`` holds the status of every task read, every task their ``needs`` name,
+      every task the events read name, and ``task_ids``: what a line shows of a task it
+      names, the feed's earlier lines' among them, which the board passes.
     """
     _require_enabled()
     with store_session() as store:
-        read = _read_board(
+        if closed and sessions is None:
+            read = _read_board(
+                store,
+                cwd,
+                events=events,
+                since_seq=since_seq,
+                project=project,
+                exclude_kinds=exclude_kinds,
+            )
+            tasks = read[2]
+            return BoardRead(
+                *read,
+                fleet_switches(store, read[1]),
+                fleet_labels(store, read[1]),
+                {task.id: str(task.status) for task in tasks},
+                _closed_counts(tasks),
+            )
+        return _paged_board(
             store,
             cwd,
             events=events,
             since_seq=since_seq,
             project=project,
             exclude_kinds=exclude_kinds,
+            closed=closed,
+            sessions=sessions or (),
+            task_ids=task_ids,
         )
-        return BoardRead(*read, fleet_switches(store, read[1]), fleet_labels(store, read[1]))
+
+
+def _closed_counts(tasks: Sequence[TeamTask]) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for task in tasks:
+        if task.status in CLOSED_STATUSES:
+            counts[task.status] = counts.get(task.status, 0) + 1
+    return counts
+
+
+def _paged_board(
+    store: ContextStore,
+    cwd: Path | None,
+    *,
+    events: int,
+    since_seq: int | None,
+    project: ProjectInfo | None,
+    exclude_kinds: Collection[str],
+    closed: bool,
+    sessions: Collection[str],
+    task_ids: Collection[str],
+) -> BoardRead:
+    """:func:`board_read`'s paged read: what one tick of a board shows, and no more (#44)."""
+    resolved = project if project is not None else _project(store, cwd)
+    if since_seq is None:
+        fetched = store.recent_events(resolved.id, exclude_kinds=exclude_kinds, limit=events)
+    else:
+        fetched = store.events_since(
+            resolved.id, since_seq, exclude_kinds=exclude_kinds, limit=events
+        )
+    if closed:
+        tasks = store.team_tasks(resolved.id)
+        counts = _closed_counts(tasks)
+    else:
+        tasks = store.team_tasks_in(resolved.id, OPEN_STATUSES)
+        counts = store.team_task_counts(resolved.id, CLOSED_STATUSES)
+    statuses: dict[str, str] = {task.id: task.status for task in tasks}
+    named = {*task_ids, *(event.task_id for event in fetched if event.task_id)}
+    named.update(need for task in tasks for need in task.needs)
+    statuses.update(store.team_task_statuses(resolved.id, named - statuses.keys()))
+    wanted = {*sessions, *(event.session_id for event in fetched if event.session_id)}
+    wanted.update(task.claimed_by for task in tasks if task.claimed_by)
+    read_sessions, labels = board_sessions(store, resolved.id, wanted)
+    return BoardRead(
+        resolved,
+        read_sessions,
+        tasks,
+        fetched,
+        fleet_switches(store, read_sessions),
+        labels,
+        statuses,
+        counts,
+    )
+
+
+def board_sessions(
+    store: ContextStore, project_id: str, ids: Collection[str]
+) -> tuple[list[TeamSession], dict[str, str]]:
+    """The sessions a paged board reads (#44), in :meth:`ContextStore.team_sessions`' order,
+    with their fleet rows' labels (:func:`fleet_labels`): the live ones, those in ``ids``, and
+    of their namesakes the few that decide what the board calls them.
+
+    ``cli.board_names`` tells sessions of one name apart by all of them: the live one, else the
+    newest started, keeps the name, and every other gets the time it started, or its short id
+    where another of the name started in that minute. So an earlier round's agent of the same
+    label, ended and named by nothing on the board, still decides whether the board shows its
+    namesake as ``coder-1`` or ``coder-1 (14:02)``. Every namesake is read by the columns that
+    decide it (:meth:`ContextStore.session_name_rows`), and only those that do are read whole:
+    the one that keeps a name, and those that started in a minute one read here started in.
+    Names are told apart within a name, never across, so each is named as a read of every
+    session would name it."""
+    read = store.board_sessions(project_id, ids)
+    labels = fleet_labels(store, read)
+    names = {board_name(session, labels) for session in read}
+    have = {session.id for session in read}
+    namesakes = store.session_ids_called(project_id, names) - have
+    if not namesakes:
+        return read, labels
+    their_labels = _fleet_labels_of(store, namesakes)
+    every = {**labels, **their_labels}
+    rows = store.session_name_rows(project_id, have | namesakes)
+    groups: dict[str, list[SessionNameRow]] = {}
+    for row in rows:
+        name = every.get(row.id) or row.label or row.role
+        if name in names:
+            groups.setdefault(name, []).append(row)
+    wanted: set[str] = set()
+    for group in groups.values():
+        # As ``cli.board_names`` keeps a name: sorted stably, in team_sessions' order.
+        kept, *others = sorted(group, key=lambda row: (not row.ended, row.started_at), reverse=True)
+        wanted.add(kept.id)
+        minutes = {event_time.clock_minute(row.started_at) for row in others if row.id in have}
+        wanted.update(
+            row.id for row in others if event_time.clock_minute(row.started_at) in minutes
+        )
+    wanted -= have
+    if not wanted:
+        return read, labels
+    order = {row.id: index for index, row in enumerate(rows)}
+    more = store.team_sessions_seen_since(project_id, None, ids=sorted(wanted))
+    sessions = sorted([*read, *more], key=lambda session: order.get(session.id, -1))
+    labels.update({sid: label for sid, label in their_labels.items() if sid in wanted})
+    return sessions, labels
+
+
+def _fleet_labels_of(store: ContextStore, session_ids: Collection[str]) -> dict[str, str]:
+    """:func:`fleet_labels`, by id: a read that fails costs the names, never the board."""
+    try:
+        found = store.fleet_labels_for_sessions(sorted(session_ids))
+    except Exception as exc:
+        _log.warning("the board's namesakes are named by their own labels (%s)", exc)
+        return {}
+    return {sid: label.removeprefix(RETIRED_LABEL) for sid, label in found.items()}
 
 
 def _read_board(
@@ -2017,8 +2404,7 @@ def set_role(role: str, session_ref: str, cwd: Path | None = None) -> TeamSessio
 
 
 class StandbyRefused(ValueError):
-    """``team standby`` asked of what it cannot hold: a session that is not a manager, or a
-    board with work in flight (a standby would end at once, :func:`standby_of`)."""
+    """``team standby`` asked of what it cannot hold: a session that is not a manager."""
 
 
 @dataclass(frozen=True)
@@ -2032,8 +2418,9 @@ class StandbyChange:
 
 def set_standby(session_ref: str, *, on: bool) -> StandbyChange:
     """``team standby`` (R12): a manager waiting on its person is not woken by watch's routine
-    lines until its person's next prompt, ``--off``, or work going back into flight on its
-    board; everything urgent still wakes it (:func:`held_in_standby`). ``--off`` ends it."""
+    lines, nor (under a ``schedule``, ``services.manager_seat``) by routine news, until its
+    person's next prompt or ``--off``, with tasks in flight or not (#551); everything urgent
+    still wakes it (:func:`held_in_standby`, :func:`pending_wake`). ``--off`` ends it."""
     _require_enabled()
     with store_session() as store:
         session = _resolve_session(store, session_ref)
@@ -2051,11 +2438,6 @@ def set_standby(session_ref: str, *, on: bool) -> StandbyChange:
             raise StandbyRefused(
                 f"standby is a manager's: {short_id(session.id)} is a {session.role}, and "
                 "nothing wakes it but notes addressed to it"
-            )
-        if work_in_flight(store, session.project_id):
-            raise StandbyRefused(
-                "a task on your board is being worked on or tested, and standby holds only "
-                "while none is: wait for it, or stay awake for it"
             )
         return StandbyChange(session, begin_standby(store, session, why="explicit"), was)
 
@@ -2144,23 +2526,33 @@ def add_note(
                 # ref for every reader here.
                 _out_of_board(f"--task {task_ref}: that task belongs to another project's board")
             task_id = task.id
+        writer = session.id if session else None
+        wakes = kind in ("result", "question") or _addressed_to_manager(to_role)
+        manager = _nudge_target(store, writer, board.id, cwd) if wakes else board.id
         event = _emit(
             store,
             board.id,
             kind,
             text,
-            session_id=session.id if session else None,
+            session_id=writer,
             task_id=task_id,
             to_role=to_role,
+            meta=_manager_stamp(store, kind, writer, to_role, manager),
         )
         _route_up(store, event)
-        wakes = kind in ("result", "question") or _addressed_to_manager(to_role)
-        manager = (
-            _nudge_target(store, session.id if session else None, board.id, cwd)
-            if wakes
-            else board.id
+        to = (to_role or "").strip().lower()
+        named = (
+            _scheduled_manager_named(store, board.id, to)
+            if to
+            and to != MANAGER_ROLE
+            and (kind == "question" or (kind == "note" and writer is None))
+            else None
         )
     stored = _record_delivery(event, board)
+    if named is not None and not (kind == "question" and named == manager):
+        # Named by its session id or its own name, a scheduled manager in another fleet on a
+        # hub, or the one a person's note names: urgent for it (`_urgent`), and woken now.
+        _nudge_manager(named, reason=f"{kind}_to_manager", board=board.id)
     if kind in ("result", "question"):
         _nudge_manager(manager, reason=kind, board=board.id)
     elif _addressed_to_manager(to_role):
@@ -2601,6 +2993,17 @@ def stopped_because(task: TeamTask) -> str | None:
     prefix = f"{task.title} — "
     text = events[-1].text
     return text[len(prefix) :] if text.startswith(prefix) else None
+
+
+def task_history(task: TeamTask, *, limit: int = 200) -> list[TeamEvent]:
+    """Every event that names ``task``, oldest first, the newest ``limit`` of them: what the
+    board's reader shows under a task (B2). A read, as :func:`stopped_because` is, and it fails
+    open the same way: a store that cannot be read costs the history, never the board."""
+    try:
+        with store_session() as store:
+            return store.filtered_events(task.project_id, task_id=task.id, limit=limit)
+    except Exception:
+        return []
 
 
 def last_feedback(task: TeamTask) -> str | None:
@@ -3459,6 +3862,7 @@ def hook_prompt_heartbeat(
         # delivered: dropped after it, a run of audit lines was the whole page, prompt
         # after prompt, with a coder's result behind it (review of #240, finding 11).
         reads, relevant = _board_reading(store, session)
+        page = _delta_page(store, session)
         events = store.events_since(
             session.project_id,
             session.cursor,
@@ -3466,7 +3870,7 @@ def hook_prompt_heartbeat(
             exclude_kinds=HUMAN_BOARD_KINDS,
             exclude_actor=session.id,
             relevant=relevant,
-            limit=_DELTA_LIMIT * 3 + 1,
+            limit=page * 3 + 1,
         )
         if not events or not orchestrator.delta_enabled() or not reads:
             # Nothing delivered is still something read: the cursor moves past it, the
@@ -3476,18 +3880,45 @@ def hook_prompt_heartbeat(
             cursor = read_to if read_to > session.cursor else None
             store.touch_session(session.id, cursor=cursor, state="working")
             return collision + briefing
-        truncated = len(events) > _DELTA_LIMIT
-        shown = events[:_DELTA_LIMIT]
-        store.touch_session(session.id, cursor=shown[-1].seq, state="working")
+        truncated = len(events) > page
+        shown = events[:page]
         authors = authors_of(store.team_sessions(session.project_id))
         board = _board_of(store, session.project_id).name
         # One read, and only when a line names a task: this runs on every prompt.
         numbers = store.task_numbers(session.project_id) if any(e.task_id for e in shown) else {}
+        if page != _DELTA_LIMIT:
+            shown, truncated = _within_budget(shown, truncated, authors, board, numbers)
+        store.touch_session(session.id, cursor=shown[-1].seq, state="working")
         return (
             collision
             + briefing
             + _render_delta(shown, authors, truncated=truncated, board=board, numbers=numbers)
         )
+
+
+def _delta_page(store: ContextStore, session: TeamSession) -> int:
+    """How many lines ``session``'s delta shows: :data:`SCHEDULED_DELTA_LIMIT` for a scheduled
+    manager (:func:`schedule_of`), :data:`_DELTA_LIMIT` for everyone else, as always."""
+    if session.role == MANAGER_ROLE and schedule_of(store, session) is not None:
+        return SCHEDULED_DELTA_LIMIT
+    return _DELTA_LIMIT
+
+
+def _within_budget(
+    shown: list[TeamEvent],
+    truncated: bool,
+    authors: Mapping[str, str],
+    board: str,
+    numbers: Mapping[str, int],
+) -> tuple[list[TeamEvent], bool]:
+    """``shown`` less the lines past :data:`_SCHEDULED_DELTA_BUDGET`, and whether any wait: they
+    stay past the cursor, for the next page."""
+    while len(shown) > 1:
+        delta = _render_delta(shown, authors, truncated=truncated, board=board, numbers=numbers)
+        if len(delta) <= _SCHEDULED_DELTA_BUDGET:
+            break
+        shown, truncated = shown[:-1], True
+    return shown, truncated
 
 
 def _brief_when_a_team_forms(store: ContextStore, session: TeamSession, cwd: Path | None) -> str:
@@ -3587,7 +4018,11 @@ def hook_stop(
         if session.role == MANAGER_ROLE:
             try:
                 decision = _manager_wakeup(store, session, stop_hook_active=stop_hook_active)
-                if decision is None and stop_hook_active:
+                if decision is None and (
+                    stop_hook_active or schedule_of(store, session) is not None
+                ):
+                    # A scheduled manager's turn ends with routine news held, too: the nudge
+                    # records it for the tickers, after the prompt that began the turn.
                     deferred = _deferred_wake_reason(store, session)
                     if deferred is not None:
                         manager = _own_manager_row(store, session)
@@ -3717,7 +4152,11 @@ def _count(raw: str | None) -> int:
 
 
 def _wake_candidates(
-    store: ContextStore, me: TeamSession, relevant: Relevance | None = None
+    store: ContextStore,
+    me: TeamSession,
+    relevant: Relevance | None = None,
+    *,
+    limit: int = _DELTA_LIMIT * 3 + 1,
 ) -> list[TeamEvent]:
     """The board since a manager's cursor, exactly as its next prompt would read it.
 
@@ -3729,7 +4168,8 @@ def _wake_candidates(
     LIMIT, a run of audit lines was the whole page at every Stop, and the result behind
     it woke nobody until something else was written (review of #240, finding 11).
     ``relevant`` is ``me``'s board context (:func:`_board_reading`), applied in the query
-    as the prompt's delta applies it: a manager reads everything.
+    as the prompt's delta applies it: a manager reads everything. ``limit``: a scheduled
+    manager's delta reads a longer page (:data:`SCHEDULED_DELTA_LIMIT`).
     """
     return store.events_since(
         me.project_id,
@@ -3738,17 +4178,16 @@ def _wake_candidates(
         exclude_kinds=HUMAN_BOARD_KINDS,
         exclude_actor=me.id,
         relevant=relevant,
-        limit=_DELTA_LIMIT * 3 + 1,
+        limit=limit,
     )
 
 
 def wake_pending(store: ContextStore, me: TeamSession) -> bool:
-    """Whether news a manager wakes for is past its cursor, unread (:func:`manager_wakes`):
+    """Whether news a manager wakes for now is past its cursor, unread (:func:`pending_wake`):
     what every nudge is due for, a write's own and one owed since a write tmux refused
     (``services.fleet.deliver_owed_nudge``). Every write that nudges is one of these events,
     so a write that is not (its own result, an echo, a line standby holds) wakes nobody."""
-    standby = standby_of(store, me)
-    return any(manager_wakes(store, event, me, standby) for event in _wake_candidates(store, me))
+    return pending_wake(store, me).now is not None
 
 
 def _deferred_wake_reason(store: ContextStore, me: TeamSession) -> str | None:
@@ -3774,17 +4213,30 @@ def _deferred_wake_reason(store: ContextStore, me: TeamSession) -> str | None:
     """
     if not orchestrator.delta_enabled():
         return None
-    standby = standby_of(store, me)
-    for event in _wake_candidates(store, me):
-        if manager_wakes(store, event, me, standby):
-            return f"deferred:{event.kind}"
-    return None
+    pending = pending_wake(store, me)
+    if pending.now is not None:
+        return f"deferred:{pending.now.kind}"
+    # A scheduled manager's routine news, not due yet: the nudge records it for the tickers
+    # to send once it is (`services.fleet._nudge`), the news it woke for read or not.
+    return "held: routine news" if pending.held else None
 
 
 def _manager_wakeup(
     store: ContextStore, me: TeamSession, *, stop_hook_active: bool
 ) -> StopDecision | None:
-    """Keep a manager going on fresh board decisions (:func:`manager_wakes`), or ``None``."""
+    """Keep a manager going on fresh board decisions (:func:`manager_wakes`), or ``None``.
+    A scheduled one (:func:`schedule_of`) only on what wakes it now (:func:`pending_wake`),
+    shown with its delta's page (:data:`SCHEDULED_DELTA_LIMIT`)."""
+    if schedule_of(store, me) is not None:
+        if pending_wake(store, me).now is None:
+            return None
+        return _wakeup(
+            store,
+            me,
+            stop_hook_active=stop_hook_active,
+            wakes=lambda _event: True,
+            page=SCHEDULED_DELTA_LIMIT,
+        )
     standby = standby_of(store, me)
     return _wakeup(
         store,
@@ -3803,6 +4255,7 @@ def _wakeup(
     act: str | None = None,
     relevant: Relevance | None = None,
     keep: Callable[[TeamEvent], bool] | None = None,
+    page: int = _DELTA_LIMIT,
 ) -> StopDecision | None:
     """Keep ``me`` going on the board since its cursor when an event there ``wakes`` it, or
     ``None`` to let it wait: the manager's wake-up (§7.3) and every other role's turn-end
@@ -3824,7 +4277,7 @@ def _wakeup(
     """
     if stop_hook_active or not orchestrator.delta_enabled():
         return None
-    events = _wake_candidates(store, me, relevant)
+    events = _wake_candidates(store, me, relevant, limit=page * 3 + 1)
     if keep is not None:
         events = [event for event in events if keep(event)]
     if not any(wakes(event) for event in events):
@@ -3833,8 +4286,8 @@ def _wakeup(
     used = _count(store.get_meta(key))
     if used >= continuation_cap():
         return None
-    truncated = len(events) > _DELTA_LIMIT
-    shown = events[:_DELTA_LIMIT]
+    truncated = len(events) > page
+    shown = events[:page]
     authors = authors_of(store.team_sessions(me.project_id))
     board = _board_of(store, me.project_id).name
     numbers = store.task_numbers(me.project_id) if any(e.task_id for e in shown) else {}
@@ -4067,6 +4520,7 @@ def hook_stop_failure(
                     handing_over=handing_over,
                 ),
                 session_id=session.id,
+                meta=_fleet_stamp(agent),
             )
         refreshed = store.get_session(session.id) or session
     if manager is not None:  # not already limited, and no hand-over coming
@@ -4199,9 +4653,16 @@ def hook_handover_failed(
     if not orchestrator.team_enabled():
         return
     with store_session() as store:
-        _emit(store, project_id, "handover_failed", text, session_id=session_id)
         session = store.get_session(session_id) if session_id is not None else None
         agent = store.fleet_agent_for_session(session_id) if session_id is not None else None
+        _emit(
+            store,
+            project_id,
+            "handover_failed",
+            text,
+            session_id=session_id,
+            meta=_fleet_stamp(agent),
+        )
         manager = (
             agent.project_id
             if agent is not None
@@ -4220,15 +4681,22 @@ def hook_note(project_id: str, text: str, *, session_id: str | None = None) -> N
         _emit(store, project_id, "note", text, session_id=session_id)
 
 
-def watch_event(board_id: str, text: str, *, urgent: bool = True) -> None:
+def watch_event(
+    board_id: str, text: str, *, urgent: bool = True, project_id: str | None = None
+) -> None:
     """``aisquare watch``'s one line for a project with new items (P2-W2, #284): kind
     ``watch``, addressed to the manager, so it wakes it (:func:`wake_class`) and a working
     manager is handed it at its turn's end. Counts and a path, never an excerpt. ``urgent``
-    (``meta``) says whether a manager in standby is woken for it (:func:`held_in_standby`)."""
+    (``meta``) says whether a manager in standby is woken for it (:func:`held_in_standby`);
+    ``project_id``, the fleet whose items they are, which fleet's manager on a hub it is for
+    (:func:`_for_its_fleet`)."""
     if not orchestrator.team_enabled():
         return
+    meta: dict[str, object] = {"urgent": urgent}
+    if project_id is not None:
+        meta[manager_seat.EVENT_PROJECT] = project_id
     with store_session() as store:
-        _emit(store, board_id, "watch", text, to_role=MANAGER_ROLE, meta={"urgent": urgent})
+        _emit(store, board_id, "watch", text, to_role=MANAGER_ROLE, meta=meta)
 
 
 def hook_notice(project_id: str, text: str, *, session_id: str | None = None) -> None:
@@ -4635,12 +5103,25 @@ def render_board(
     *,
     names: Mapping[str, str] | None = None,
 ) -> str:
-    """The human/board view (``asq board``), without the protocol contract. With ``names``
-    (``cli.board_names.read_board_names``), what ``aisquare board`` prints for a person, each
-    session is named as asq's left pane names its agent (#140); without, as an agent reads it
-    (the MCP board): by its short id and role, which ``--as`` takes."""
+    """The board without the protocol contract. With ``names``
+    (``cli.board_names.read_board_names``), what ``aisquare board`` prints: each session named
+    as asq's left pane names its agent (#140) — for a person, a text board of its own
+    (:func:`_human_board`, B1 #14); for an agent (:func:`read_by_an_agent`), the
+    ``<aisquare-team>`` block it always read there, byte for byte. Without ``names``, as an
+    agent reads it through MCP: the same block, each session by its short id and role, which
+    ``--as`` takes."""
     from aisquare.services import claude_accounts as accounts_service  # lazy: no import cycle
 
+    if names is not None and not read_by_an_agent():
+        return _human_board(
+            project,
+            sessions,
+            tasks,
+            events,
+            names=names,
+            labels=accounts_service.slot_labels,
+            links=_link_marks(project.id),
+        )
     return _render_board(
         project,
         sessions,
@@ -4651,6 +5132,165 @@ def render_board(
         links=_link_marks(project.id),
         names=names,
     )
+
+
+def read_by_an_agent() -> bool:
+    """Whether what this process prints is read by an agent: a command a sandboxed agent's
+    broker runs for it (:func:`brokered`), or one run inside an agent — a fleet window, a
+    process Claude Code started, a Codex tool shell (``core.prompt_origin.origin_sender``, the
+    rule a ``fleet tell``'s origin is told by). The protocol sends agents to ``aisquare
+    board``, and what they read there stays the ``<aisquare-team>`` block (B1 #14)."""
+    from aisquare.core import prompt_origin  # lazy: read once per board command
+
+    return brokered() or prompt_origin.origin_sender() != prompt_origin.HUMAN
+
+
+#: A session's state in words, as the boards a person reads write it: the text board here,
+#: and beside the sidebar's mark in the TUI's team block (``cli.watch.state_chip``).
+STATE_WORDS: Final = {
+    "working": "working",
+    "waiting": "waiting for input",
+    "attention": "NEEDS YOU",
+    "limited": "limited",
+    "switching": "switching accounts",
+}
+#: A task's status as the human board words it.
+_HUMAN_STATUS: Final = {
+    "todo": "to do",
+    "doing": "doing",
+    "review": "in review",
+    "blocked": "blocked",
+    "done": "done",
+}
+#: The widest a name column grows on the human board: a longer name pushes its row only.
+_HUMAN_NAME_CELLS: Final = 24
+
+
+def _padded(text: str, cells: int) -> str:
+    """``text`` padded to ``cells`` terminal cells: a name with an emoji or a wide character
+    in it takes two cells a character, where ``str.ljust`` counts one."""
+    from rich.cells import cell_len  # lazy: a person's board alone measures, never a hook
+
+    return text + " " * max(0, cells - cell_len(text))
+
+
+def _off_ladder(session: TeamSession) -> bool:
+    """Whether ``session``'s model is off its role's ladder and none the owner chose (#16)."""
+    if not session.model:
+        return False
+    role = base_role(session.role)
+    if not harness.model_mismatch(role, session.model, agent=session.agent):
+        return False
+    return bool(
+        harness.model_mismatch(
+            role,
+            session.model,
+            agent=session.agent,
+            chosen=model_memory.chosen_models(session),
+        )
+    )
+
+
+def _human_board(
+    project: ProjectInfo,
+    sessions: list[TeamSession],
+    tasks: list[TeamTask],
+    events: list[TeamEvent],
+    *,
+    names: Mapping[str, str],
+    labels: Mapping[int, str] | Callable[[], Mapping[int, str]] | None,
+    links: Mapping[str, str] | None,
+) -> str:
+    """``aisquare board`` for a person (B1 #14): a title, then the team, the open tasks and the
+    recent updates, each a section under a plain heading, in columns — no ``<aisquare-team>``
+    block, which is how an agent's board is fenced in its prompt.
+
+    One row per agent: its name (``names``), its state in words, its account once several are
+    in play, its model, its persona, how long ago it was seen and its focus. A task by its
+    number, its status in words, its title, who has it, what it waits on and its link mark.
+    An update by its time, dated when it is not today's (``core.event_time``), then the line the
+    agents' text writes for it, named (:func:`event_line`); a text of several lines keeps them,
+    under the first.
+    """
+    from rich.cells import cell_len  # lazy: a person's board alone measures, never a hook
+
+    now = _now()
+    numbers = {t.id: t.number for t in tasks if t.number is not None}
+    lines = [f"{PRODUCT_NAME} board — {project.root.name or project.id}", ""]
+    live = [s for s in sessions if s.ended_at is None]
+    accounts = len({s.account for s in live if s.account})
+    if callable(labels):
+        labels = labels() if accounts > 1 else None
+    if live:
+        lines.append(f"team — {len(live)} live")
+        shown = {s.id: names.get(s.id) or board_name(s) for s in live}
+        name_cells = min(_HUMAN_NAME_CELLS, max(cell_len(name) for name in shown.values()))
+        state_cells = max(cell_len(STATE_WORDS.get(s.state, s.state)) for s in live)
+        for session in live:
+            facts: list[str] = []
+            label = account_label(session.account, labels)
+            if label and accounts > 1:
+                facts.append(label)
+            if session.model:
+                facts.append(
+                    f"{session.model} ⚠ off-ladder" if _off_ladder(session) else session.model
+                )
+            if session.persona:
+                facts.append(f"persona {session.persona}")
+            seen = f"{age_text(session.last_seen_at, now)} ago"
+            if now - session.last_seen_at > _STALE_AFTER:
+                seen += " (stale)"
+            facts.append(seen)
+            if session.focus:
+                facts.append(f"focus: {' '.join(session.focus.split())}")
+            state = STATE_WORDS.get(session.state, session.state)
+            lines.append(
+                f"  {_padded(shown[session.id], name_cells)}  {_padded(state, state_cells)}  "
+                + " · ".join(facts)
+            )
+    else:
+        lines.append("team — nobody live right now")
+    open_tasks = [t for t in tasks if t.status in ("todo", "doing", "review", "blocked")]
+    if tasks:
+        counts = " · ".join(
+            f"{sum(1 for t in tasks if t.status == status)} {_HUMAN_STATUS[status]}"
+            for status in ("todo", "doing", "review", "blocked", "done")
+            if any(t.status == status for t in tasks)
+        )
+        lines += ["", f"tasks — {counts}"]
+        statuses = {t.id: t.status for t in tasks}
+        listed = open_tasks[:_BOARD_TASKS]
+        marks = [f"#{t.number}" if t.number is not None else t.id for t in listed]
+        mark_cells = max((len(mark) for mark in marks), default=0)
+        status_cells = max((len(_HUMAN_STATUS[t.status]) for t in listed), default=0)
+        for task, mark in zip(listed, marks, strict=True):
+            row = f"  {mark:<{mark_cells}}  {_HUMAN_STATUS[task.status]:<{status_cells}}  "
+            row += task.title
+            if task.claimed_by:
+                row += f" — {names.get(task.claimed_by) or short_id(task.claimed_by)}"
+            waiting = unmet_needs(task, statuses)
+            if waiting:
+                row += " ⧗ waits on " + ", ".join(
+                    f"#{numbers[need]}" if need in numbers else need[-8:] for need in waiting
+                )
+            if links and task.id in links:
+                row += f" {links[task.id]}"
+            lines.append(row)
+        if len(open_tasks) > _BOARD_TASKS:
+            # A person's: the command at a shell, as every hint a person reads (R13a).
+            more = prog.shell_advice(f" — `{prog.word()} task list`")
+            lines.append(f"  … {len(open_tasks) - _BOARD_TASKS} more{more}")
+    if events:
+        lines += ["", "recent updates"]
+        roles = {s.id: s.role for s in sessions}
+        stamps = [event_time.stamp(event.created_at, now=now) for event in events]
+        stamp_cells = max(len(stamp) for stamp in stamps)
+        under = " " * (2 + stamp_cells + 2)
+        for event, stamp in zip(events, stamps, strict=True):
+            first, *rest = event_line(event, roles, numbers, names).split("\n")
+            lines.append(f"  {stamp:>{stamp_cells}}  {first}")
+            lines.extend(f"{under}{line}" for line in rest)
+    return "\n".join(lines)
 
 
 def _render_board(
@@ -4669,10 +5309,10 @@ def _render_board(
     links: Mapping[str, str] | None = None,
     names: Mapping[str, str] | None = None,
 ) -> str:
-    """The board, and for ``me`` the protocol and its role's cycle, whose fleet commands
-    name ``fleet`` (:func:`_cycle_project`). ``briefing`` is a session's first injection's
-    alone — SessionStart's, or the prompt's that joins a session the board did not know
-    (review of #201, R1-F3): it adds ``me``'s persona after the role cycle. Never on the
+    """The board as an agent reads it, and for ``me`` the protocol and its role's cycle, whose
+    fleet commands name ``fleet`` (:func:`_cycle_project`). ``briefing`` is a session's first
+    injection's alone — SessionStart's, or the prompt's that joins a session the board did not
+    know (review of #201, R1-F3): it adds ``me``'s persona after the role cycle. Never on the
     board command, never on a later prompt, so no factual surface carries persona text
     (§3.1).
     ``persona_note`` is the one line saying why no attached persona was read. ``cwd`` is the

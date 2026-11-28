@@ -135,7 +135,6 @@ from aisquare.core.locking import holding
 from aisquare.models import LaunchSpec
 
 _log = logging.getLogger(__name__)
-DIR_NAME = "launch-seals"
 VERSION = 1
 """The version of :class:`LaunchRecord` this aisquare writes; a newer one is refused."""
 
@@ -302,7 +301,7 @@ _SEEN: dict[str, SessionFacts] = {}
 
 def seals_dir() -> Path:
     """Where the records of the launches ``fleet spawn`` made are kept."""
-    return paths.aisquare_home() / DIR_NAME
+    return paths.launch_seals_dir()
 
 
 def digest(agent_id: str) -> str:
@@ -864,3 +863,68 @@ def native_id(value: str | None) -> str | None:
     if value is None or not _UUID.fullmatch(value):
         return None
     return value
+
+
+# --- the home's move (#31, H2) -----------------------------------------------------------------
+
+_INDEX_FILE = re.compile(r"project-[0-9a-f]{64}\.json")
+
+
+def reissue(move: Callable[[object], object]) -> tuple[list[str], list[str]]:
+    """Write every record kept here again with ``move`` applied to what it holds: the home's
+    move (``services.home_migration``) hands each path under the old home its place in the new
+    one, and leaves every other value as it is. Each record is written by :func:`write`, each
+    window as :func:`placed` writes one, the census and each project's index under their
+    locks, as they always are; one ``move`` leaves as it was is not written. Nothing about
+    what a record places changes but where under the home it names, and what reads it back
+    (``services.fleet._replay_refusal``, :func:`read`) is the same check as before, never
+    loosened: a record of a path elsewhere still names that path.
+
+    Returns ``(failed, skipped)``: why each file that could not be written was not, and each
+    one left as it was because it cannot be read (as the fleet already refuses it). Run only
+    from the move, in a quiet home: no spawn or hook writes here meanwhile."""
+    failed: list[str] = []
+    skipped: list[str] = []
+    try:
+        entries = sorted(seals_dir().iterdir())
+    except OSError as exc:
+        return [f"{seals_dir()} could not be listed ({exc.strerror or exc})"], skipped
+    for entry in entries:
+        name = entry.name
+        try:
+            if _RECORD_FILE.fullmatch(name):
+                record = LaunchRecord.model_validate_json(entry.read_text(encoding="utf-8"))
+                if digest(record.id) != entry.stem:
+                    skipped.append(f"{name}: it names another row")
+                    continue
+                moved = LaunchRecord.model_validate(move(record.model_dump(mode="json")))
+                if moved != record and (why := write(moved)) is not None:
+                    failed.append(why)
+            elif _WINDOW_FILE.fullmatch(name):
+                window = WindowPlace.model_validate_json(entry.read_text(encoding="utf-8"))
+                placed_at = WindowPlace.model_validate(move(window.model_dump(mode="json")))
+                if placed_at != window:
+                    write_replacing(
+                        entry, placed_at.model_dump_json(indent=1) + "\n", keep_mode=False
+                    )
+            elif name == _census_path().name:
+                with _locked(entry):
+                    census = LegacyCensus.model_validate_json(entry.read_text(encoding="utf-8"))
+                    taken = LegacyCensus.model_validate(move(census.model_dump(mode="json")))
+                    if taken != census:
+                        write_replacing(
+                            entry, taken.model_dump_json(indent=1) + "\n", keep_mode=False
+                        )
+            elif _INDEX_FILE.fullmatch(name):
+                with _locked(entry):
+                    index = ProjectSessions.model_validate_json(entry.read_text(encoding="utf-8"))
+                    kept = ProjectSessions.model_validate(move(index.model_dump(mode="json")))
+                    if kept != index:
+                        write_replacing(
+                            entry, kept.model_dump_json(indent=1) + "\n", keep_mode=False
+                        )
+        except (UnicodeDecodeError, ValidationError) as exc:
+            skipped.append(f"{name}: {type(exc).__name__}")
+        except OSError as exc:
+            failed.append(f"{entry} could not be rewritten ({exc.strerror or exc})")
+    return failed, skipped

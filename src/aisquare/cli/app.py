@@ -27,6 +27,7 @@ from aisquare.cli import (
     enforce,
     explainability,
     fleet,
+    home,
     hook,
     launch,
     persona,
@@ -35,6 +36,7 @@ from aisquare.cli import (
     remote,
     root,
     serve,
+    service,
     task,
     team,
     watcher,
@@ -43,6 +45,8 @@ from aisquare.cli import config as config_cli
 from aisquare.cli import instances as instances_cli
 from aisquare.cli import metrics as metrics_cli
 from aisquare.cli import outcomes as outcomes_cli
+from aisquare.cli import tidy as tidy_cli
+from aisquare.cli.common import fail
 from aisquare.cli.global_flags import DISPATCHED_WORDS, GlobalFlagsGroup
 from aisquare.core import feature_use, sharing
 from aisquare.core.state import RuntimeState, get_state, set_state
@@ -110,20 +114,70 @@ def main_callback(
     )
     set_state(state)
     ctx.obj = state
+    if ctx.invoked_subcommand not in _THROUGH_A_MOVE and not _only_asks(ctx):
+        _refuse_a_half_moved_home(ctx.invoked_subcommand)
     if ctx.invoked_subcommand is None:
         _no_arguments(ctx)
     else:
         _count_command(ctx)
 
 
+#: The commands that run while the home's move is unfinished: the move itself, and the upgrade,
+#: which runs it (#31).
+_THROUGH_A_MOVE = frozenset({"move-home", "upgrade"})
+
+
+def _only_asks(ctx: typer.Context) -> bool:
+    """Whether the command line only asks (a help page, an uninstall's dry run): it changes
+    nothing, so it runs on a home part-way through its move too (the reviewer's nits)."""
+    words = list(ctx.meta.get(DISPATCHED_WORDS, []))
+    if _asks_for_help(words):
+        return True
+    return ctx.invoked_subcommand == "uninstall" and "--dry-run" in words
+
+
+def _refuse_a_half_moved_home(command: str | None) -> None:
+    """Start no command on a home whose move a crash stopped (its journal still open): one
+    would make a new empty store in the old layout's place, and the move could then never be
+    finished (the reviewer's M3 on #31). A hook does nothing and says nothing, so no agent is
+    held up by it; everything else is refused, naming the way out."""
+    from aisquare.core import paths
+    from aisquare.core import program as prog
+
+    journal = paths.unfinished_home_move()
+    if journal is None:
+        return
+    if command == "hook":
+        raise typer.Exit(0)
+    from aisquare.services import home_migration
+
+    unreadable = home_migration.journal_refusal(journal)
+    if unreadable is not None:
+        fail(unreadable, error="home_mid_move")
+    word = prog.word()
+    fail(
+        f"rlx's home is part-way through its move to the new layout (a run of the move "
+        f"stopped): `{word} move-home` finishes it, or `{word} move-home --rollback` puts it "
+        "back",
+        error="home_mid_move",
+        hint=f"{word} move-home",
+    )
+
+
 #: Commands that tools run for the user, on every prompt or for the life of a session: what
 #: they do is not a choice of the user's, so they are not counted as features used. And
-#: ``uninstall``, whose plan must change no file of the home and whose purge removes it.
-_NOT_FEATURES = frozenset({"hook", "serve", "inject", "uninstall"})
+#: ``uninstall``, whose plan must change no file of the home and whose purge removes it. And
+#: ``service``, whose ``run`` the OS or ``start`` runs for weeks: counted, it sent the daily
+#: active ping on every day it was up, which the ruling on #32 (Q2) keeps out (#1743). And
+#: ``move-home``, the home's move, which ``rlx upgrade`` runs and which writes nothing into a
+#: home it refuses to move (#31).
+_NOT_FEATURES = frozenset({"hook", "serve", "inject", "uninstall", "service", "move-home"})
 
 
-#: The detached shipper itself: not a feature, and it must not start another.
+#: The detached shipper and the detached pinger themselves: not features, and neither may start
+#: another.
 _SHIPPER = "cli.metrics.ship"
+_PINGER = "cli.metrics.ping"
 
 
 #: The hidden aliases of a group (registered below with the group's own app): counted under the
@@ -180,14 +234,29 @@ def command_path(ctx: typer.Context) -> str | None:
 def _count_command(ctx: typer.Context) -> None:
     """Count this command in the local feature counters: an append to a spool file, failing
     open (``core.feature_use``). Not one run in the launch of an agent whose usage is not
-    shared (:func:`_launch_usage_shared`)."""
+    shared (:func:`_launch_usage_shared`). Also the day's anonymous active ping
+    (:func:`_ping_today`), whoever runs the command: once the command is done, so that the
+    command that turns the ping off (``config set sharing.active_ping false``) sends none."""
     try:
         path = command_path(ctx)
-        if path is not None and path != _SHIPPER:
+        if path is not None and path not in (_SHIPPER, _PINGER):
             if _launch_usage_shared():
                 feature_use.record(path)
             sharing.start_background_ship()  # a detached `metrics ship`, once in 6 h if on
+            ctx.call_on_close(_ping_today)
     except Exception:  # a counter never costs a command
+        return
+
+
+def _ping_today() -> None:
+    """Start the detached ``metrics ping`` if today's anonymous active ping is due: a feature
+    command or the app opening is a day rlx is used. Imported here and not at the top, so a
+    hook, which never gets here, never loads it (``services.active_ping``)."""
+    try:
+        from aisquare.services import active_ping
+
+        active_ping.start_background()
+    except Exception:  # the ping never costs a command
         return
 
 
@@ -235,6 +304,7 @@ def _no_arguments(ctx: typer.Context) -> None:
     if not fleet.interactive_terminal():
         typer.echo(ctx.get_help())
         raise typer.Exit(2)
+    _ping_today()
     fleet.ui()
 
 
@@ -266,6 +336,7 @@ launch.register(app)  # needs context_settings to forward agent args
 command_reports.register(app)  # `exec` forwards everything after -- to the command
 app.command("serve")(serve.serve)
 app.add_typer(remote.app, name="remote")
+app.add_typer(service.app, name="service")
 app.add_typer(fleet.app, name="fleet")
 app.add_typer(watcher.app, name="watch")
 app.add_typer(code.app, name="code")
@@ -275,7 +346,11 @@ app.add_typer(persona.app, name="persona")
 app.add_typer(captain.app, name="captain", hidden=True)
 app.command("ui")(fleet.ui)
 app.command("instances")(instances_cli.instances)
+app.command("tidy")(tidy_cli.tidy)
 app.add_typer(hook.app, name="hook", hidden=True)
+# `rlx upgrade` moves a home from before 0.10.2, in the new install, by this (#31). Not a
+# `home` group: "the rlx home" in prose would then read as a command (test_program_name).
+app.command("move-home", hidden=True)(home.migrate_home)
 # Visible: unlike the roadmap groups above, every leaf here does something on a
 # stock machine — `enable` is the one command that turns tracing on, and the
 # rest report or wire it. A surface an operator has to be told exists is not an

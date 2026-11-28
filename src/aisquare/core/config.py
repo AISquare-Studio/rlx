@@ -18,6 +18,7 @@ import errno
 import os
 import re
 import shutil
+import stat
 import tomllib
 from collections.abc import Callable, Iterator, Sequence
 from contextlib import contextmanager
@@ -126,7 +127,7 @@ class ExplainabilitySettings(BaseModel):
 
     The key itself is NOT here. ``config.toml`` is a readable settings file
     people paste into issues; a workspace credential lives in
-    ``~/.aisquare/explainability-key`` at mode 600, or in
+    ``~/.rlx/explainability-key`` at mode 600, or in
     ``EXPLAINABILITY_API_KEY``.
     """
 
@@ -192,9 +193,16 @@ class ExperimentalSettings(BaseModel):
     persona is absent and the voice page does not serve. ``AISQUARE_EXPERIMENTAL_CAPTAIN``
     wins over this field either way; ``core.experimental.captain_enabled`` is the one
     reader of both.
+
+    ``remote``: Remote, the fleet on a phone (#46). ``None`` until decided: read then as on
+    for a home where Remote was set up before it had a switch, else off
+    (``core.experimental.remote_enabled``, the one reader, with
+    ``AISQUARE_EXPERIMENTAL_REMOTE``). ``true`` and ``false`` are a choice made, kept by a
+    reset as ``[service]`` is, so an off is never turned back on behind the person's back.
     """
 
     captain: bool = False
+    remote: bool | None = None
 
 
 class RoleLaunchProfile(BaseModel):
@@ -711,7 +719,7 @@ def _written_whole(data: dict[str, Any]) -> bool:
 
     Such a release keeps a higher ``config_version`` it finds (it does not know the
     version's steps, and must not undo them), so a version-2 file one of them saved again
-    — an older install sharing ``~/.aisquare``, or a move back and forth — says 2 while
+    — an older install sharing ``~/.rlx``, or a move back and forth — says 2 while
     holding every value that release's defaults gave it. A version cannot record that, nor
     can a marker this build writes: those releases keep a key they do not know. The
     file's values can. Those releases always wrote ``profile``, ``api_url`` and
@@ -976,6 +984,24 @@ class WatchSettings(BaseModel):
     sources: dict[str, WatchSource] = Field(default_factory=dict)
 
 
+class TidySettings(BaseModel):
+    """``[tidy]`` — ``rlx tidy``, which frees the disk rlx's ended agents and sessions left
+    (the owner's disk tidy, #58).
+
+    ``idle_build_hours``: a LIVE coder that has waited this long with no task in doing loses
+    the ``CACHEDIR.TAG`` build output in its worktree (regenerable: its next build is slower,
+    not wrong). ``0`` turns that rule off; nothing else here depends on it.
+
+    ``every_minutes``: how often ``aisquare watch`` runs tidy's periodic job (#59), at most:
+    the same rules as ``rlx tidy``, one pass at a time on the machine, waking nobody. ``0``
+    turns it off; ``rlx tidy`` by hand is unchanged. At most a week (10080), and a number:
+    an infinite one would overflow the cadence's clock (reviewer #3894).
+    """
+
+    idle_build_hours: float = Field(default=24, ge=0)
+    every_minutes: float = Field(default=60, ge=0, le=10080, allow_inf_nan=False)
+
+
 class CodeSettings(BaseModel):
     """``[code]`` — the per-project symbol index behind ``aisquare code`` (#285).
 
@@ -1102,7 +1128,7 @@ class AccountsSettings(BaseModel):
 
     ``share`` (P2-W7, #198), empty by default, names what every account has in common, by
     the parts each agent declares (``AgentAccounts.share_parts``): for Claude Code ``memory``
-    (one auto-memory directory per project under ``~/.aisquare/claude-shared/memory``,
+    (one auto-memory directory per project under ``~/.rlx/claude-shared/memory``,
     passed to each launch), ``skills``, ``agents``, ``commands`` and ``claude_md``, and
     ``plugins`` (experimental); for Codex ``agents_md`` and ``skills``. A linked part makes
     each managed slot's entry a link to the plain home's, its own kept beside it. A name an
@@ -1134,6 +1160,32 @@ class UpdatesSettings(BaseModel):
     """
 
     check: bool = True
+
+
+TrayIcon = Literal["backslash", "mark", "template"]
+"""What the tray shows (``core.glyph.ICONS``)."""
+
+
+class TraySettings(BaseModel):
+    """``[tray]`` — the rlx service's menu bar icon (macOS) or tray icon (Linux), #34: App
+    settings ▸ User preferences ▸ *Tray*.
+
+    ``enabled`` on, the default: a running service shows it, where the OS has a place for
+    one (macOS's menu bar in the login session; a StatusNotifierItem host on Linux) and the
+    ``tray`` extra is installed. Off, the running service takes it down within half a minute
+    (``service_tray.TrayPart`` follows the file).
+
+    ``icon``: ``backslash`` (rlx's ``\\`` in its blue, the default), ``mark`` (the whole
+    ``r\\x``) or ``template`` (the backslash painted by macOS as its other menu bar icons).
+
+    ``terminal``: the terminal app *Open rlx* starts it in; ``""``, the default, the
+    person's own (macOS: the app that opens a ``.command`` file; Linux: ``xdg-terminal-exec``,
+    ``$TERMINAL``, then the first of the common ones found).
+    """
+
+    enabled: bool = True
+    icon: TrayIcon = "backslash"
+    terminal: str = ""
 
 
 class UiSettings(BaseModel):
@@ -1202,24 +1254,45 @@ DONT_ASK_STOP = "stop"
 """The kind ``[ui] confirm_stop`` stands for in ``dont_ask``: the Stop box's."""
 
 
+class ServiceSettings(BaseModel):
+    """``[service]`` — the rlx service (``rlx service``, S1) and its start at login (S2, #33).
+
+    ``start_at_login`` is the person's choice, absent until one is made: ``rlx init`` and the
+    installers add the login item only while it is absent (and for the default home alone),
+    and write ``true``; ``rlx service install`` and App settings' *Start rlx at login* write
+    ``true``, ``rlx service uninstall`` and the switch turned off ``false``. A login item
+    removed in the OS's own settings is never added back while it says ``true``: only an
+    explicit install adds it (``services.service_login``).
+    """
+
+    start_at_login: bool | None = None
+
+
 class SharingSettings(BaseModel):
     """``[sharing]`` — opt-in anonymous usage sharing (docs/usage-telemetry.md).
 
-    ``enabled`` is the switch, **off by default**: nothing leaves this machine until it is
+    ``enabled`` is the switch, **off by default**: no usage leaves this machine until it is
     turned on (Settings ▸ Usage & stats, or ``aisquare metrics share on``). Turned on, daily
     counts of usage (tokens, sessions, which commands) are sent to AISquare, never names, paths,
     remotes, prompts or arguments. ``DO_NOT_TRACK=1``, ``AISQUARE_NO_TELEMETRY=1`` and ``CI``
     force it off whatever this says (``core.sharing.forced_off_reason``).
+
+    ``active_ping`` is the switch of the daily active ping (``services.active_ping``), which is
+    separate from sharing and sent whether sharing is on or off: on each local day rlx is used,
+    one anonymous POST of the date, the version, the OS, the architecture and the install
+    method, with no identifier. On unless turned off (Settings ▸ Usage & stats, or
+    ``aisquare config set sharing.active_ping false``); the same three variables stop it.
 
     The installation's random id, its salt for the repository hashes and what has been sent
     are kept beside the other runtime state (``state.json``), not here.
     """
 
     enabled: bool = False
+    active_ping: bool = True
 
 
 class AppConfig(BaseModel):
-    """Root configuration object persisted at ``~/.aisquare/config.toml``."""
+    """Root configuration object persisted at ``~/.rlx/config.toml``."""
 
     profile: str = "default"
     agents: AgentSettings = Field(default_factory=AgentSettings)
@@ -1237,9 +1310,12 @@ class AppConfig(BaseModel):
     experimental: ExperimentalSettings = Field(default_factory=ExperimentalSettings)
     persona: PersonaSettings = Field(default_factory=PersonaSettings)
     watch: WatchSettings = Field(default_factory=WatchSettings)
+    tidy: TidySettings = Field(default_factory=TidySettings)
     code: CodeSettings = Field(default_factory=CodeSettings)
     ui: UiSettings = Field(default_factory=UiSettings)
+    tray: TraySettings = Field(default_factory=TraySettings)
     sharing: SharingSettings = Field(default_factory=SharingSettings)
+    service: ServiceSettings = Field(default_factory=ServiceSettings)
 
 
 #: Sections an older build read and this one does not, each with why. An unknown section
@@ -1396,6 +1472,13 @@ def holds_a_setting(path: Path | None = None) -> bool:
     except (OSError, tomllib.TOMLDecodeError, UnicodeDecodeError):
         return True
     _migrate(data)
+    # [service] is not a reset's to undo (``services.settings.reset_settings`` keeps it): a
+    # file that holds nothing else holds no setting a reset would undo. Nor is a decided
+    # [experimental] remote (#46), which a reset keeps too; a value that is no choice is.
+    data.pop("service", None)
+    experimental = data.get("experimental")
+    if isinstance(experimental, dict) and isinstance(experimental.get("remote"), bool):
+        del experimental["remote"]
     return bool(_overrides(data, system_defaults()))
 
 
@@ -1710,7 +1793,7 @@ def save_config(
     the state is visible before a write meets it.
 
     This restriction applies ONLY when a link was followed. An ordinary first
-    write still creates ``~/.aisquare`` — that path never involved a pointer to
+    write still creates ``~/.rlx`` — that path never involved a pointer to
     somewhere else.
 
     Returns the path the CALLER asked for, not the resolved one: commands echo it
@@ -1787,7 +1870,7 @@ def save_config(
     # and the QUIETEST caller is the one a torn write hurt: ``cli/launch.py``
     # treats an unreadable config as "launching untraced" by design. The temp
     # is removed on any failure rather than left next to the file an operator
-    # reads. POSIX rename semantics hold because ~/.aisquare is a native disk;
+    # reads. POSIX rename semantics hold because ~/.rlx is a native disk;
     # on a DrvFs /mnt/c or \\wsl.localhost path the guarantee softens, and
     # nothing in this code can tell which kind of path it is on. On NTFS the
     # rename is refused while another process has the config open, even only
@@ -1796,8 +1879,9 @@ def save_config(
     # recipe gets the retry, not only this one.
     try:
         # keep_mode: a config the operator tightened to 0600 stays 0600 — the
-        # rewrite used to reset it to the umask default.
-        write_replacing(written, payload, keep_mode=True)
+        # rewrite used to reset it to the umask default. But not a mode its owner
+        # cannot read (_a_mode_to_keep).
+        write_replacing(written, payload, keep_mode=_a_mode_to_keep(written))
     except OSError as exc:
         if written == target:
             raise
@@ -1816,6 +1900,19 @@ def save_config(
         except TypeError:  # an OSError subclass with an unusual signature
             raise OSError(exc.errno, detail, str(written)) from exc
     return target
+
+
+def _a_mode_to_keep(written: Path) -> bool:
+    """Whether a rewrite of ``written`` keeps its mode: not one its owner cannot read, which
+    only ``init --reinit --yes`` writes over (``discard_unreadable``). Kept, the defaults it
+    wrote over a ``chmod 000`` file were as unreadable as that file, so whatever reads them
+    next, the login item's choice among them, still could not; and once the mode was fixed, a
+    login item the person had taken away was added back (tester of #33, round 4, KEPT-1).
+    Written as a new file is, at the umask's mode, they can be read."""
+    try:
+        return bool(os.stat(written).st_mode & stat.S_IRUSR)
+    except OSError:
+        return True  # gone since: nothing to keep, and write_replacing knows
 
 
 #: The UTC stamp a reset's backup is named with: ``config.toml.bak-20261014T031700Z``, the
@@ -1837,11 +1934,19 @@ def reset_config(path: Path | None = None) -> Path | None:
     Through a symlink the file it points at is copied aside and emptied, never the link
     moved: moved, the next save would put a regular file where it was, the severed
     dotfiles link :func:`save_config` takes care never to make.
+
+    But ``[service]``, which the reset leaves in place (:func:`_kept_by_a_reset`): the
+    person's choice about the rlx service's login item, not a setting of rlx's. Forgotten,
+    the next ``rlx init`` would add back an item they had turned off (the manager's decision
+    on #33). And ``[experimental] remote`` once decided, for the same reason: undecided again,
+    a home where Remote was set up would read as on, an off undone behind the person's back
+    (#46). The new file holds those and ``config_version`` alone.
     """
     target = path or paths.config_path()
     written = Path(os.path.realpath(target))
     if not written.is_file() or not holds_a_setting(target):
         return None
+    kept = _kept_by_a_reset(written)
     stamp = datetime.now(UTC).strftime(_BACKUP_STAMP)
     backup = target.with_name(f"{target.name}.bak-{stamp}")
     counter = 1
@@ -1854,4 +1959,90 @@ def reset_config(path: Path | None = None) -> Path | None:
         # copy2: the mode too, so a config tightened to 0600 is not copied out readable.
         despite_windows_contention(lambda: shutil.copy2(written, backup))
         write_replacing(written, "", keep_mode=True)
+    if kept is not None:
+        body = tomli_w.dumps(kept.model_dump(mode="json", exclude_none=True))
+        write_replacing(written, body, keep_mode=True)
+        with contextlib.suppress(OSError):  # the mode the user's file had, 0600 kept 0600
+            written.chmod(stat.S_IMODE(backup.stat().st_mode))
     return backup
+
+
+class _KeptExperimental(BaseModel):
+    """What a reset leaves of ``[experimental]``: Remote's switch, once decided (#46)."""
+
+    remote: bool
+
+
+class _KeptByAReset(BaseModel):
+    """What a reset leaves in ``config.toml``: its version, ``[service]``, and
+    ``[experimental] remote``, each only when the file held it."""
+
+    config_version: int = CONFIG_VERSION
+    service: ServiceSettings | None = None
+    experimental: _KeptExperimental | None = None
+
+
+def _kept_by_a_reset(written: Path) -> _KeptByAReset | None:
+    """What of the file at ``written`` a reset leaves in place: its ``[service]`` table's
+    ``start_at_login`` and its ``[experimental] remote``, when it holds them, read from its
+    text when the file does not parse (:func:`salvaged_start_at_login`,
+    :func:`salvaged_remote`): the reset rlx recommends for a broken file must not lose an off
+    (tester of #33, round 2). ``None`` when it holds neither."""
+    try:
+        raw = despite_windows_contention(written.read_bytes)
+    except OSError:
+        return None
+    try:
+        data = _parse_toml(raw)
+    except (tomllib.TOMLDecodeError, UnicodeDecodeError):
+        login, remote = salvaged_start_at_login(raw), salvaged_remote(raw)
+    else:
+        login = _a_choice(data, "service", "start_at_login")
+        remote = _a_choice(data, "experimental", "remote")
+    if login is None and remote is None:
+        return None
+    return _KeptByAReset(
+        service=None if login is None else ServiceSettings(start_at_login=login),
+        experimental=None if remote is None else _KeptExperimental(remote=remote),
+    )
+
+
+def _a_choice(data: dict[str, Any], table: str, key: str) -> bool | None:
+    """``[table] key`` of a parsed file when it is a ``true`` or ``false``, else ``None``."""
+    section = data.get(table)
+    if not isinstance(section, dict) or not isinstance(section.get(key), bool):
+        return None
+    return bool(section[key])
+
+
+_SERVICE_TABLE = re.compile(r"^\s*\[\s*service\s*\]\s*(?:#.*)?$")
+_EXPERIMENTAL_TABLE = re.compile(r"^\s*\[\s*experimental\s*\]\s*(?:#.*)?$")
+_A_TABLE = re.compile(r"^\s*\[")
+_START_AT_LOGIN = re.compile(r"^\s*start_at_login\s*=\s*(true|false)\s*(?:#.*)?$")
+_REMOTE = re.compile(r"^\s*remote\s*=\s*(true|false)\s*(?:#.*)?$")
+
+
+def salvaged_start_at_login(raw: bytes) -> bool | None:
+    """``[service] start_at_login`` read line by line from a ``config.toml`` that does not parse
+    as a whole (a syntax error elsewhere, bytes that are not UTF-8): ``None`` when it holds no
+    such line. What a reset or ``init --reinit --yes`` of a broken file carries over."""
+    return _salvaged(raw, _SERVICE_TABLE, _START_AT_LOGIN)
+
+
+def salvaged_remote(raw: bytes) -> bool | None:
+    """``[experimental] remote`` read as :func:`salvaged_start_at_login` reads its line (#46)."""
+    return _salvaged(raw, _EXPERIMENTAL_TABLE, _REMOTE)
+
+
+def _salvaged(raw: bytes, table: re.Pattern[str], key: re.Pattern[str]) -> bool | None:
+    """The ``true`` or ``false`` of the first line matching ``key`` under the table header
+    matching ``table``, read line by line; ``None`` when there is none."""
+    inside = False
+    for line in raw.decode("utf-8", errors="replace").splitlines():
+        if table.match(line):
+            inside = True
+        elif _A_TABLE.match(line):
+            inside = False
+        elif inside and (found := key.match(line)):
+            return found.group(1) == "true"
+    return None

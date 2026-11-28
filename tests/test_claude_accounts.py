@@ -34,6 +34,7 @@ from aisquare.cli import accounts as accounts_cli
 from aisquare.cli import launch as launch_cli
 from aisquare.cli.app import app
 from aisquare.core import claude_accounts as core
+from aisquare.core import paths
 from aisquare.core import tmux as tmux_core
 from aisquare.core.spawn import IDENTITY_ENV_VARS
 from aisquare.core.tmux import Completed, TmuxServer
@@ -282,7 +283,9 @@ def test_under_a_managed_slot_slot_1_is_the_plain_claude_not_the_slot(
     assert core.CONFIG_DIR_VAR not in back and core.TMPDIR_VAR not in back
     command, carried = service.carry_environment(["x"])
     assert core.CONFIG_DIR_VAR not in carried and core.TMPDIR_VAR not in carried
-    assert command[1:5] == ["-u", core.CONFIG_DIR_VAR, "-u", core.TMPDIR_VAR]
+    assert command[1:7] == [
+        "-u", paths.RLX_HOME_ENV, "-u", core.CONFIG_DIR_VAR, "-u", core.TMPDIR_VAR
+    ]  # fmt: skip
 
 
 def test_under_a_managed_slot_slot_1_is_the_launching_shells_own_claude(
@@ -831,14 +834,16 @@ def test_the_sign_in_window_runs_our_own_run_command_with_this_processs_environm
     # …and the two account variables this process does NOT have are unset for the
     # child, so the server's retained values cannot decide what slot 1 means.
     tail = new_session[new_session.index("--") + 1 :]
-    assert tail[1:5] == ["-u", core.CONFIG_DIR_VAR, "-u", core.TMPDIR_VAR]
+    assert tail[1:7] == [
+        "-u", paths.RLX_HOME_ENV, "-u", core.CONFIG_DIR_VAR, "-u", core.TMPDIR_VAR
+    ]  # fmt: skip
     # The STEM, not the spelling: `carry_environment` resolves this through
     # `shutil.which("env")`, which on Windows finds Git's `env.EXE` — an
     # `endswith("env")` asserts the POSIX spelling of a program the product
     # looks up on both.
     assert Path(tail[0]).stem.lower() == "env"
-    assert tail[5:] == service.sign_in_command(account)
-    assert tail[5:] == [sys.executable, "-m", "aisquare", "accounts", "run", "2"]
+    assert tail[7:] == service.sign_in_command(account)
+    assert tail[7:] == [sys.executable, "-m", "aisquare", "accounts", "run", "2"]
 
 
 def test_the_window_command_carries_set_variables_and_unsets_the_others(tmp_path: Path) -> None:
@@ -857,8 +862,8 @@ def test_the_window_command_carries_set_variables_and_unsets_the_others(tmp_path
         "AISQUARE_HOME": str(home),
         core.CONFIG_DIR_VAR: str(config),
     }
-    assert command[1:3] == ["-u", core.TMPDIR_VAR]
-    assert command[3:] == service.sign_in_command(account)
+    assert command[1:5] == ["-u", paths.RLX_HOME_ENV, "-u", core.TMPDIR_VAR]
+    assert command[5:] == service.sign_in_command(account)
     plain, env = service.sign_in_window_command(
         account,
         {
@@ -867,7 +872,10 @@ def test_the_window_command_carries_set_variables_and_unsets_the_others(tmp_path
             core.TMPDIR_VAR: str(tmpdir),
         },
     )
-    assert plain == service.sign_in_command(account)  # nothing to unset: no env wrapper
+    # Nothing of the account's to unset; RLX_HOME, which this process has none of, is
+    # (#30: a tmux server's stale one would win over the home the window is handed).
+    assert plain[1:3] == ["-u", paths.RLX_HOME_ENV]
+    assert plain[3:] == service.sign_in_command(account)
     assert env[core.TMPDIR_VAR] == str(tmpdir)
 
 

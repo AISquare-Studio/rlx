@@ -30,6 +30,7 @@ import os
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from datetime import datetime
 from pathlib import Path
+from types import MappingProxyType
 from typing import Any
 
 from aisquare.core import agents, harness, ledger
@@ -661,6 +662,8 @@ class GeminiShapedAccounts:
     sign_out = "inside Gemini (/auth)"
     shares_settings = False
     keychain_login = False  # a file in its home: SSH may start the fleet's server for it
+    plan_units: Mapping[str, float] = MappingProxyType({})
+    reserves_for_person = False
     # Its config dir is a ``.gemini`` in each slot's home: a folder of skills and one context
     # file, linked the way every agent's are (``core.account_sharing``); no memory to merge.
     share_parts: tuple[SharePart, ...] = (
@@ -1064,6 +1067,11 @@ class GeminiShapedAdapter:
             else PermissionIntent.for_role(role)
         )
         return list(self.permission_args(intent, role, native).args)
+
+    def args_refusal(
+        self, args: Sequence[str], *, may_prompt: bool, home: Path | None = None
+    ) -> str | None:
+        return None
 
     def label_args(self, label: str) -> LaunchPart:
         return LaunchPart(env={"CLI_TITLE": label})  # its title is a variable, not a flag

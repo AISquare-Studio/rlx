@@ -1916,6 +1916,16 @@ class AgentAdapter(Protocol):
         """A fleet spawn's flags from the role's native permission settings, and its label."""
         ...
 
+    def args_refusal(
+        self, args: Sequence[str], *, may_prompt: bool, home: Path | None = None
+    ) -> str | None:
+        """Why the agent would not start on ``args``, one list of a fleet launch's, which the
+        fleet refuses naming the list before a window opens; ``None`` leaves them to the agent.
+        ``may_prompt``: a word after the options there may be the agent's prompt. ``home``: the
+        agent's home the launch runs under, once its account is chosen (a Codex profile is a
+        file there); ``None`` before, where what only the home can say is not asked."""
+        ...
+
     def label_args(self, label: str) -> LaunchPart:
         """What shows the fleet label in the agent's UI (Claude Code's ``--name``); empty
         where it has none."""
@@ -2440,6 +2450,16 @@ class AgentAccounts(Protocol):
     :meth:`keychain_item`'s, asked only when this is ``True``. ``False`` for an agent whose
     login is a file in its home (Codex's ``auth.json``): it starts the server from SSH, and
     that server is marked as one an SSH login started."""
+    plan_units: Mapping[str, float]
+    """Capacity units per plan, as :meth:`subscription` names it (lower case), which the
+    balanced account pick weighs (``services.claude_accounts.balanced_pick``): Claude Code's
+    ``max 20x`` four, ``max 5x`` one, ``pro`` a fifth. A plan it does not name counts one
+    unit; empty for an agent whose plans are not weighed, every account of it one unit."""
+    reserves_for_person: bool
+    """The balanced pick keeps part of the week of the account the person uses for their own
+    sessions (the status line's, else the agent's first account): Claude Code's, whose
+    sessions ``asq-statusline`` reports. ``False`` for an agent whose accounts are all the
+    fleet's to spend."""
 
     def keychain_item(self, account: ClaudeAccount) -> str | None:
         """The service name of the login Keychain item ``account``'s login is kept in on macOS,

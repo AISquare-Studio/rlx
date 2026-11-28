@@ -1444,3 +1444,12 @@ def test_the_cli_list_names_no_agent_when_one_agent_is_listed(
     assert listed.exit_code == 0, listed.output
     assert f"{SESSION[:8]}  {row.account}  " in listed.stdout, listed.stdout
     assert "claude-code" not in listed.stdout, listed.stdout
+
+
+def test_fleet_adopt_help_names_no_internal_ref(runner: CliRunner) -> None:
+    """The person reads ``--help``: it said "under the fleet (#290)", an issue number of ours
+    (the manager's add-on to #6, as #12 dropped ``(#144)``)."""
+    shown = runner.invoke(app, ["fleet", "adopt", "--help"])
+    assert shown.exit_code == 0, shown.output
+    assert "under the fleet" in shown.stdout, "the premise: the command's own line"
+    assert "(#" not in shown.stdout, shown.stdout

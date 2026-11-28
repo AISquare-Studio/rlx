@@ -446,3 +446,39 @@ def test_the_persons_items_are_seen_and_never_on_the_managers_line(
     assert (
         watcher.tick(NOW + timedelta(minutes=1)).new == [] and len(_watch_events(project.id)) == 1
     )
+
+
+def test_each_tick_sends_the_scheduled_managers_held_wakes_alone(
+    project: ProjectInfo, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#41: a scheduled manager's routine news held until due is sent by watch's tick too,
+    with nothing new to deliver, so a fleet run with neither the rlx service nor asq hears
+    it; watch sends no other held nudge (``scheduled_only``)."""
+    asked: list[bool] = []
+
+    def retry(*, scheduled_only: bool = False) -> int:
+        asked.append(scheduled_only)
+        return 0
+
+    monkeypatch.setattr(fleet_service, "retry_deferred_nudges", retry)
+    _watcher(project, Fleet(agents=[])).tick(NOW)
+    assert asked == [True]
+
+
+def test_each_tick_sweeps_the_ended_agents_own_temp_dirs_and_a_failure_costs_nothing(
+    project: ProjectInfo, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#57: the watcher's tick is one of the end paths that remove an ended agent's own
+    TMPDIR (``agent_tmp.sweep_ended``), so a fleet run from the CLI cleans up too. Quietly: a sweep
+    that raises costs the tick nothing."""
+    from aisquare.services import agent_tmp
+
+    swept: list[int] = []
+
+    def sweep_ended() -> list[Path]:
+        swept.append(1)
+        raise OSError("a store that cannot be read")
+
+    monkeypatch.setattr(agent_tmp, "sweep_ended", sweep_ended)
+    report = _watcher(project, Fleet(agents=[])).tick(NOW)
+    assert swept == [1] and report is not None

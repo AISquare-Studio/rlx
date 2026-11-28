@@ -13,8 +13,10 @@ from __future__ import annotations
 import asyncio
 import threading
 from pathlib import Path
+from typing import Any
 
 import pytest
+from textual.app import App
 from textual.pilot import Pilot
 from textual.widgets import Checkbox, Input, Select, Static
 
@@ -28,6 +30,7 @@ from aisquare.cli.ui.sidebar import (
     StartCaptain,
 )
 from aisquare.cli.ui.spawn import SpawnDialog
+from aisquare.cli.ui.views.app_settings import AppSettingsView
 from aisquare.cli.ui.views.captain import WHAT_IS_UP
 from aisquare.cli.ui.views.settings_captain import ABOUT, CaptainToggle, captain_agent
 from aisquare.core import experimental
@@ -39,6 +42,7 @@ from tests import test_captain_say as say_suite
 from tests import test_ui_shell as ui_suite
 from tests.captain_screens import INPUT_BOX, REAL_TRUST
 from tests.fleet_fakes import list_agents_as
+from tests.settings_fields import reopen
 from tests.test_captain_say import Captain, Clock
 from tests.test_captain_sidebar import until
 from tests.test_captain_view import _captain, _open_view, drive
@@ -57,7 +61,7 @@ async def _settings(pilot: Pilot[None]) -> CaptainToggle:
     app = fleet_app(pilot)
     await pilot.click(app.query_one(SettingsRow))
     await settle_page(app)
-    await pilot.click("#hub-captain")
+    await pilot.click("#hub-experimental")
     await settle_page(app)
     return app.query_one(CaptainToggle)
 
@@ -120,8 +124,8 @@ def test_ticking_the_captain_box_shows_the_captain_at_once_and_unticking_hides_i
 def test_reset_all_and_reload_move_the_box_and_the_shell_with_the_file(
     tmp_path: Path, script: Script, captain_off: None
 ) -> None:
-    """The box sits in App settings' form now (#41), whose Reset all and Reload re-read the
-    file: the box and the shell follow it. Reset all with the captain ticked put the file's
+    """The box sits in App settings' form now (#41), whose Reset all and reopening re-read
+    the file: the box and the shell follow it. Reset all with the captain ticked put the file's
     captain back to off while the box stayed ticked and the captain's slot stayed until a restart;
     a ``config set`` from a shell, then Reload, left both as they were."""
     seed(tmp_path, ("prj_aaa", "alpha", "amber-otter"))
@@ -147,7 +151,7 @@ def test_reset_all_and_reload_move_the_box_and_the_shell_with_the_file(
         config = load_config()
         config.experimental.captain = True  # what `config set experimental.captain true` writes
         save_config(config)
-        await pilot.click("#reload-settings")
+        await reopen(pilot, app.query_one(AppSettingsView))  # no Reload (M5)
         await settle_page(app)
         await refreshed(app)
         return ticked, reset, seen()
@@ -184,7 +188,7 @@ def test_the_captains_agent_is_chosen_beside_its_box_and_saved_at_once(
         config = load_config()
         config.team.profiles["captain"] = RoleLaunchProfile(agent="codex")  # `team bind`
         save_config(config)
-        await pilot.click("#reload-settings")
+        await reopen(pilot, app.query_one(AppSettingsView))  # no Reload (M5)
         await settle_page(app)
         return str(select.value), chosen, cleared, captain_agent(load_config())
 
@@ -331,6 +335,27 @@ def test_start_captain_opens_the_spawn_dialog_with_the_captain_chosen(
 # --- the message box ------------------------------------------------------------------------
 
 
+Said = tuple[str, str, float | None]
+"""One toast as it was raised: its message, severity and timeout."""
+
+
+def _spy_on_toasts(app: App[Any]) -> list[Said]:
+    """Every ``app.notify`` call from now on, as it is made (#3682): a toast's timeout, 5 s,
+    can end before a starved runner reads ``app._notifications``, so what was said is kept at
+    the call. Each toast is still shown as before."""
+    said: list[Said] = []
+    notify = app.notify
+
+    def spy(message: str, **kwargs: Any) -> None:
+        said.append(
+            (str(message), str(kwargs.get("severity", "information")), kwargs.get("timeout"))
+        )
+        notify(message, **kwargs)
+
+    app.notify = spy  # type: ignore[method-assign]
+    return said
+
+
 async def _say(pilot: Pilot[None], line: str) -> tuple[list[str], str]:
     """Type ``line`` into the captain view's box and press Enter; what was said, and what the
     box holds once the send has answered."""
@@ -397,3 +422,32 @@ def test_a_typed_what_is_up_is_a_message_like_any(
         assert f"sent to the captain: {WHAT_IS_UP}" in told, told
     else:
         assert left == WHAT_IS_UP, "back in the box to send again"
+
+
+def test_a_tick_of_the_captain_box_is_taken_back_by_ctrl_z(
+    tmp_path: Path, script: Script, captain_off: None
+) -> None:
+    """M5: the box is kept as it is ticked, said with its Undo key; ctrl+z on the page puts the
+    file's captain back off, and the shell follows."""
+    seed(tmp_path, ("prj_aaa", "alpha", "amber-otter"))
+
+    async def body(pilot: Pilot[None]) -> tuple[bool, bool, bool, bool, list[Said]]:
+        app = fleet_app(pilot)
+        said = _spy_on_toasts(app)
+        await refreshed(app)
+        toggle = await _settings(pilot)
+        box = toggle.query_one("#captain-toggle", Checkbox)
+        box.focus()
+        await _tick(pilot, box)
+        ticked = load_config().experimental.captain
+        await pilot.press("ctrl+z")
+        await settle_page(app)
+        await refreshed(app)
+        return ticked, load_config().experimental.captain, box.value, app.captain_on, said
+
+    ticked, undone, shown, shell, said = drive(body)
+    assert ticked is True
+    assert (undone, shown, shell) == (False, False, False), "off on disk, on the box, the shell"
+    saved = [call for call in said if call[0] == "Saved the captain: on · Undo: ctrl+z"]
+    assert saved, said
+    assert all(severity == "information" for _, severity, _ in saved), said

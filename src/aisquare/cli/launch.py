@@ -67,7 +67,7 @@ from aisquare.core.config import (
 )
 from aisquare.core.console import stderr_console
 from aisquare.core.store import ContextStore, is_locked_error, store_session
-from aisquare.services import agent_launch, delivery, explainability_ops
+from aisquare.services import agent_launch, agent_tmp, delivery, explainability_ops
 from aisquare.services import claude_accounts as claude_accounts_service
 from aisquare.services import explainability as explainability_service
 from aisquare.services import team as team_service
@@ -335,7 +335,7 @@ def _persona_system_prompt(
         return []
     block = "\n".join(personas.briefing(persona)) + "\n"
     digest = hashlib.sha256(block.encode("utf-8")).hexdigest()[:12]
-    path = paths.aisquare_home() / "cache" / "persona-prompts" / f"{name}-{digest}.md"
+    path = paths.persona_prompts_dir() / f"{name}-{digest}.md"
     adapter = selected.adapter
     home = agent_launch._launch_home(selected, env)
     seam = adapter.system_prompt_args(path, block, args, home, cwd=Path.cwd())
@@ -396,6 +396,8 @@ def _exec(binary: str, argv: list[str], env: dict[str, str]) -> None:
         with launchers.waiting(Path(binary).stem):
             status = subprocess.call([binary, *argv[1:]], env=env)
         raise SystemExit(status)
+    # It becomes its agent: recorded, so the home's move does not run under it (#31).
+    launchers.execing(Path(binary).stem)
     os.execve(binary, argv, env)
 
 
@@ -732,6 +734,11 @@ def launch(
         fail(profile.refusal, error="env_file_unreadable", detail=profile.refusal)
     env.update(profile.env)
     env.update(profile.file_env)
+    # The agent's own temporary directory (#57), made before this launch takes its identity
+    # (a fleet window's key holds only where no launch id is inherited) and before the
+    # sandbox and broker steps, which read this process's TMPDIR as the agent's. A TMPDIR
+    # the binding or `--env` sets is the operator's: kept.
+    temp_note = agent_tmp.prepare(env, explicit={*profile.env, *profile.file_env})
     parent_run = agent_launch.launch_identity(env, selected, project.root if project else None)
     # WHICH ACCOUNT, decided in exactly one place (#145): the flag, else the
     # role's `team bind --account`, else the project's default, else the
@@ -1063,6 +1070,8 @@ def launch(
         fail(str(exc), error="sandbox_writes_aisquare")
     if broker_note:
         stderr_console().print(broker_note, markup=False)
+    if temp_note is not None:  # said once the launch goes ahead, never before a refusal
+        stderr_console().print(temp_note, style="dim", markup=False)
     # Text.assemble rather than "[bold]{role}[/bold]": this is the one line that
     # styles a single token instead of the whole line, and it interpolates a
     # role name, a binary path and a project name. A Text carries its styling

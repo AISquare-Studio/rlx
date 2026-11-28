@@ -24,6 +24,7 @@ IMPLEMENTED: set[tuple[str, ...]] = {
     ("status",),
     ("doctor",),
     ("upgrade",),
+    ("move-home",),  # what `upgrade` runs in the new install (#31)
     ("uninstall",),
     ("log",),
     ("note",),
@@ -37,6 +38,7 @@ IMPLEMENTED: set[tuple[str, ...]] = {
     ("reports", "stats"),
     ("reports", "seal"),
     ("serve",),
+    ("service",),  # tests/test_rlx_service.py; `run` runs until stopped, `start` a real process
     ("captain", "serve"),
     ("captain",),
     ("captain", "say"),
@@ -62,6 +64,7 @@ IMPLEMENTED: set[tuple[str, ...]] = {
     ("logout",),
     ("whoami",),
     ("instances",),
+    ("tidy",),
     ("auth", "status"),
     ("auth", "token"),
     ("ui",),
@@ -86,6 +89,7 @@ IMPLEMENTED: set[tuple[str, ...]] = {
             "top",
             "gate",
             "adopt",
+            "manager-policy",
         )
     ),
     ("code", "find"),
@@ -226,7 +230,7 @@ IMPLEMENTED: set[tuple[str, ...]] = {
     ),
     *(
         ("metrics", command)
-        for command in ("show", "list", "tokens", "ledger", "stats", "backfill", "ship")
+        for command in ("show", "list", "tokens", "ledger", "stats", "backfill", "ship", "ping")
     ),
     *(("metrics", "share", command) for command in ("on", "off", "status", "preview", "reset-id")),
     *(

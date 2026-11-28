@@ -737,6 +737,9 @@ def _starts_with_a_hand_over(
         assert isinstance(app, ui_app.FleetApp)
         app.exit = lambda *_args, **_kwargs: None  # type: ignore[method-assign]
         app.notify = lambda *_args, **_kwargs: None  # type: ignore[method-assign]
+        # Welcome mounted and hidden, as a start built it before #45 (it is built when first
+        # shown now): its look and list are among the starts.
+        await app.content.add_content(app._new_welcome())
         await app.on_accounts_selected(AccountsSelected())
         await settle_page(app)
         try:
@@ -757,7 +760,10 @@ def _starts_with_a_hand_over(
             accounts.session = SimpleNamespace(source="file")  # type: ignore[assignment]
             # label and disabled: what the fleet summary line reads (P3-W2a, #287).
             signed_in = SimpleNamespace(
-                signed_in=True, label="2", account=SimpleNamespace(slot=2, disabled=False)
+                signed_in=True,
+                label="2",
+                identity=None,
+                account=SimpleNamespace(slot=2, disabled=False, alias=None, agent="claude-code"),
             )
             accounts.overview = SimpleNamespace(accounts=[signed_in])  # type: ignore[assignment]
             accounts.refresh_readings()

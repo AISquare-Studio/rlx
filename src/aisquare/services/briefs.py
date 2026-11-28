@@ -221,7 +221,7 @@ def _private_dirs(directory: Path) -> None:
     ``briefs/`` and ``briefs/<project>/`` would list brief ids to every local user. A
     level an earlier build made wider is narrowed. POSIX bits; on Windows the copies
     themselves are restricted (:func:`_keep_copy`)."""
-    root = paths.aisquare_home() / "briefs"
+    root = paths.briefs_dir()
     root.parent.mkdir(parents=True, exist_ok=True)
     level = root
     for part in (None, *directory.relative_to(root).parts):

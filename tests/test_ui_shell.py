@@ -17,9 +17,11 @@ ring on the first frame.
 from __future__ import annotations
 
 import asyncio
+import itertools
 import json
 import logging
 import os
+import re
 import shutil
 import sqlite3
 import sys
@@ -29,7 +31,7 @@ from collections.abc import Awaitable, Callable, Iterator, Sequence
 from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Any, TypeVar
+from typing import Any, Self, TypeVar
 
 import pytest
 from textual import Logger, events
@@ -137,7 +139,17 @@ from aisquare.services import settings as settings_service
 from aisquare.services.captain import state as captain_state
 from tests import guard_paint, toast_log
 from tests.fleet_fakes import list_agents_as
-from tests.pane_harness import FakePane, FakeTmux, asks_a_server, move, press, release, socket_of
+from tests.pane_harness import (
+    FakePane,
+    FakeTmux,
+    asks_a_server,
+    bracketed_paste,
+    move,
+    post_terminal_input,
+    press,
+    release,
+    socket_of,
+)
 from tests.ui_workers import released, settle_page, settle_until, settle_until_held, watch_until
 
 T = TypeVar("T")
@@ -368,6 +380,25 @@ def fleet_app(pilot: Pilot[None]) -> FleetApp:
     return app
 
 
+async def to_the_sidebar(app: FleetApp) -> None:
+    """The sidebar on screen, the keyboard in it, for a test that clicks one of its rows: below
+    ``Panes.ONE_PANE_BELOW`` columns one side shows at a time (L2), and start shows home's view,
+    or Welcome with no project listed. From 70 columns up both sides show, and this changes
+    nothing."""
+    app.query_one(Panes).show_sidebar()
+    await settle(app)
+
+
+async def from_welcome(pilot: Pilot[None]) -> FleetApp:
+    """The shell on Welcome with nothing selected, where a test about something other than how
+    rlx starts begins. Start opens home since L1, the last-used project's Manager tab
+    (tests/test_manager_tab_is_home.py); ``w`` comes back here, as this does."""
+    app = fleet_app(pilot)
+    await app.action_welcome()
+    await settle(app)
+    return app
+
+
 _needs_tmux = pytest.mark.skipif(shutil.which("tmux") is None, reason="tmux is not installed")
 
 
@@ -493,7 +524,7 @@ def test_agent_rows_show_role_icon_state_chip_and_exit_status(
     rows, chips = drive(go)
     assert [r.split()[1] for r in rows] == ["manager", "coder-auth", "tester-1", "scout-1"]
     manager, coder, tester, scout = rows
-    assert manager.startswith("🧭") and manager.rstrip().endswith("⏸")
+    assert manager.startswith("🧭") and manager.rstrip().endswith("◦")  # waiting (Q4)
     assert coder.startswith("🔨") and coder.rstrip().endswith("▶")
     assert tester.startswith("🧪") and tester.rstrip().endswith("💤 exited(3)")  # #138: the word
     assert scout.startswith("🤖") and "🔔" in scout  # unknown role: the custom icon
@@ -552,7 +583,7 @@ def test_an_agent_row_gives_way_in_its_label_never_in_its_account_and_session_us
     width, rows = drive(go, headroom=session_use((1, 42.0), (3, 87.0)))
     assert width == 30
     manager, long, coder, scout, tester = (row.strip() for row in rows)
-    assert manager.startswith("🧭 manager") and manager.endswith("⏸ #1·42%")
+    assert manager.startswith("🧭 manager") and manager.endswith("◦ #1·42%")
     assert long.endswith("▶ #3·87%"), long  # the whole suffix…
     assert "…" in long and "coder-01k8zq7mab" not in long  # …and the label gave way
     assert long.startswith("🔨 coder-01k8")
@@ -592,7 +623,7 @@ def test_a_persona_badge_never_takes_the_session_figure_off_an_agent_row(
     width, rows = drive(go, headroom=session_use((1, 42.0), (3, 87.0)), size=size)
     assert width == 30
     manager, coder = (row.strip() for row in rows)
-    assert manager.startswith("🧭 manager") and "⏸ #1·42% · sk" in manager, manager
+    assert manager.startswith("🧭 manager") and "◦ #1·42% · sk" in manager, manager
     assert "#1·42…" not in manager
     assert coder.startswith("🔨 coder-auth"), coder
     assert coder.endswith("▶ #3·87%") or "▶ #3·87% · " in coder, coder
@@ -710,6 +741,9 @@ def test_in_a_90_column_terminal_the_agent_view_gives_way_in_its_label_first(
     script["prj_b"] = [row("prj_b", "coder-01m5d34v", "coder", "attention", 2, 1)]
     # Slots 1 and 4 unaliased: the registry's built-in names, "plain claude" and "account 4".
     monkeypatch.setattr(accounts_service, "slot_labels", lambda store=None: {2: "work", 3: "max"})
+    monkeypatch.setattr(
+        accounts_service, "display_labels", lambda statuses=None: {2: "work", 3: "max"}
+    )
 
     async def bar(pilot: Pilot[None], agent_id: str, *, wider_than: int = 0) -> tuple[int, str]:
         app = fleet_app(pilot)
@@ -751,7 +785,7 @@ def test_in_a_90_column_terminal_the_agent_view_gives_way_in_its_label_first(
     assert seen["agt_a_coder-01k8zq7m"][1] == "🔨 coder-01…  ▶ working  max · 42%…"
     # Too narrow even at the label's floor: the floor, then the line cut at its end.
     assert seen["agt_b_coder-01m5d34v"][1] == "🔨 coder-…  🔔 attention  work · 4…"
-    assert seen["agt_a_tester-01m5d34v"][1] == "🧪 tester…  ⏸ waiting  account 4 ·…"
+    assert seen["agt_a_tester-01m5d34v"][1] == "🧪 tester…  ◦ waiting  account 4 ·…"
     assert seen["agt_a_coder-01m5d34v"][1] == "🔨 coder-…  ▶ working  plain claud…"
     width, wide = seen["wide"]
     assert width > 60 and wide.startswith("🔨 coder-01k8zq7m  ▶ working  max · 42%  claude"), wide
@@ -781,6 +815,7 @@ def test_at_90_columns_the_manager_tab_cuts_its_info_line_and_shows_its_hint_who
     detail = fleet_service.trust_prompt_detail(tmp_path / "a [deep] folder" / "repo")
     script["prj_a"] = [row.model_copy(update={"session": session, "detail": detail})]
     monkeypatch.setattr(accounts_service, "slot_labels", lambda store=None: {2: "work"})
+    monkeypatch.setattr(accounts_service, "display_labels", lambda statuses=None: {2: "work"})
 
     def rows(widget: Widget) -> list[str]:
         width, height = widget.outer_size
@@ -856,6 +891,7 @@ def test_the_headers_name_the_agent_only_beside_another_agents_accounts_and_afte
         row.model_copy(update={"agent": row.agent.model_copy(update={"agent": "claude-code"})})
     ]
     monkeypatch.setattr(accounts_service, "slot_labels", lambda store=None: {2: "work"})
+    monkeypatch.setattr(accounts_service, "display_labels", lambda statuses=None: {2: "work"})
     frame = [_accounts_frame("claude-code")]
 
     def rows(widget: Widget) -> list[str]:
@@ -888,12 +924,13 @@ def test_the_headers_name_the_agent_only_beside_another_agents_accounts_and_afte
     named, agent_width, agent_line, manager_width, manager_line = alone
     # 37 cells before R17's Pause took 2: the account and its use whole all the same.
     assert (named, agent_width, manager_width) == (False, 35, 57)
-    assert agent_line == ["🧭 manager  ⏸ waiting  work · 42% …"], agent_line
-    assert manager_line == ["🧭 manager  ⏸ waiting  work · 42%  %1"], manager_line  # 0.9.2's
+    # 0.9.2's, less the pane id 0.10.2 took out of the headers (Q2): nothing left to cut.
+    assert agent_line == ["🧭 manager  ◦ waiting  work · 42%"], agent_line
+    assert manager_line == ["🧭 manager  ◦ waiting  work · 42%"], manager_line
     named, _, agent_line, _, manager_line = mixed
     assert named is True
-    assert agent_line == ["🧭 manager  ⏸ waiting  work · 42% …"], agent_line
-    assert manager_line == ["🧭 manager  ⏸ waiting  work · 42%  claude-code  %1"], manager_line
+    assert agent_line == ["🧭 manager  ◦ waiting  work · 42% …"], agent_line
+    assert manager_line == ["🧭 manager  ◦ waiting  work · 42%  claude-code"], manager_line
     assert alone_again == alone
 
 
@@ -948,10 +985,11 @@ def test_the_card_names_the_project_not_its_codename_and_a_path_tells_twins_apar
         "🗂 api",
         "🗂 unique",
     ]
-    # The two `api` projects are told apart by their path, then their codename, which `api`
-    # does not give; the unique one, with no codename, is not decorated.
-    assert cards["prj_w"][1] and cards["prj_w"][2].endswith("work/api · amber-otter")
-    assert cards["prj_o"][1] and cards["prj_o"][2].endswith("oss/api · ruby-fox")
+    # The two `api` projects are told apart by their path alone: no codename on a card (Q3);
+    # the unique one is not decorated. In the platform's own spelling: on Windows the suite's
+    # temp root is outside the home (#54), so the path is not the home's `~/...`.
+    assert cards["prj_w"][1] and cards["prj_w"][2].replace("\\", "/").endswith("work/api")
+    assert cards["prj_o"][1] and cards["prj_o"][2].replace("\\", "/").endswith("oss/api")
     assert cards["prj_u"][1] is False and cards["prj_u"][2] == ""
 
 
@@ -1014,7 +1052,7 @@ def test_disclosure_collapses_the_agent_rows_without_selecting(
     script["prj_a"] = [status("prj_a", "manager", "manager", "waiting")]
 
     async def go(pilot: Pilot[None]) -> tuple[list[bool], list[str], str | None]:
-        app = fleet_app(pilot)
+        app = await from_welcome(pilot)
         card = card_for(app, "prj_a")
         rows = card.query_one("#agents")
         glyphs = [shown(card.query_one(Disclosure))]
@@ -1042,7 +1080,7 @@ def test_clicking_a_project_opens_its_project_view_once(tmp_path: Path, script: 
     seed(tmp_path, ("prj_a", "alpha", None), ("prj_b", "beta", None))
 
     async def go(pilot: Pilot[None]) -> tuple[str | None, list[str], int, bool]:
-        app = fleet_app(pilot)
+        app = await from_welcome(pilot)
         before = app.content.current
         await pilot.click(card_for(app, "prj_b").query_one(ProjectTitle))
         await settle(app)
@@ -1366,7 +1404,7 @@ def test_clicking_an_agent_opens_its_agent_view(tmp_path: Path, script: Script) 
     ]
 
     async def go(pilot: Pilot[None]) -> tuple[str | None, str, str | None, bool, bool]:
-        app = fleet_app(pilot)
+        app = await from_welcome(pilot)
         before = app.content.current
         await pilot.click(row_for(app, "agt_a_coder-auth"))
         await settle(app)
@@ -1387,17 +1425,109 @@ def test_clicking_an_agent_opens_its_agent_view(tmp_path: Path, script: Script) 
     assert coder_selected and not manager_selected
 
 
-def test_plus_opens_onboarding(tmp_path: Path, script: Script) -> None:
+def test_plus_opens_its_menu_and_add_a_project_onboards(tmp_path: Path, script: Script) -> None:
+    """M6 (the UX audit): the ``+`` beside Fleet is a menu, *Add a project…* first, which onboards
+    as the ``+`` did on its own; Esc closes it with nothing done. The ``+`` key still onboards
+    at once."""
+    from aisquare.cli.ui.adopt_picker import ADD_A_PROJECT, ADOPT_A_CONVERSATION, AddMenu
+
     seed(tmp_path, ("prj_a", "alpha", None))
 
-    async def go(pilot: Pilot[None]) -> tuple[str | None, str | None]:
-        app = fleet_app(pilot)
-        before = app.content.current
+    async def go(pilot: Pilot[None]) -> dict[str, object]:
+        app = await from_welcome(pilot)  # nothing open (start opens home since L1)
+        seen: dict[str, object] = {"before": app.content.current}
         await pilot.click("#add-project")
         await settle(app)
-        return before, app.content.current
+        menu = app.screen
+        assert isinstance(menu, AddMenu)
+        options = menu.query_one(OptionList)
+        seen["entries"] = [
+            options.get_option_at_index(index).id for index in range(options.option_count)
+        ]
+        await pilot.press("escape")
+        await settle(app)
+        seen["after esc"] = (isinstance(app.screen, AddMenu), app.content.current)
+        await pilot.click("#add-project")
+        await settle(app)
+        await pilot.press("enter")
+        await settle(app)
+        seen["chosen"] = app.content.current
+        return seen
 
-    assert drive(go) == ("welcome", "onboard")
+    seen = drive(go)
+    assert seen["before"] == "welcome"
+    assert seen["entries"] == [ADD_A_PROJECT, ADOPT_A_CONVERSATION]
+    assert seen["after esc"] == (False, "welcome"), "Esc: the menu closed, nothing opened"
+    assert seen["chosen"] == "onboard"
+
+
+def test_the_plus_menus_adopt_opens_the_adopt_picker_and_adopts_the_one_picked(
+    tmp_path: Path, script: Script, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """M6: *Adopt a conversation…* in the ``+`` menu is the Accounts page's button's picker, read
+    off the UI thread, and the conversation picked is adopted, said in a toast."""
+    from aisquare.cli.ui.adopt_picker import ADOPT_A_CONVERSATION, AddMenu, AdoptPicker
+    from aisquare.models import AdoptableConversation
+    from aisquare.services import adopt as adopt_service
+
+    seed(tmp_path, ("prj_a", "alpha", None))
+    conversation = AdoptableConversation(
+        session_id="0a1b2c3d-4e5f-6789-abcd-ef0123456789",
+        transcript_path=str(tmp_path / "t.jsonl"),
+        slot=1,
+        account="me@example.com",
+        cwd=str(tmp_path / "alpha"),
+        project_id="prj_a",
+        last_activity=datetime.now(tz=UTC),
+        first_prompt="fix the login",
+    )
+    adopted: list[str] = []
+    monkeypatch.setattr(adopt_service, "recent", lambda *a, **k: [conversation])
+
+    def adopt(ref: str, **kwargs: object) -> fleet_service.SpawnReceipt:
+        adopted.append(ref)
+        agent = status("prj_a", "coder-1", "coder", "working").agent
+        agent = agent.model_copy(update={"session_id": ref})
+        return fleet_service.SpawnReceipt(agent=agent, asked_label=None, tmux_session="asq-alpha")
+
+    monkeypatch.setattr(adopt_service, "adopt", adopt)
+
+    async def go(pilot: Pilot[None]) -> tuple[str, list[str], int]:
+        app = fleet_app(pilot)
+        told = toast_log.record(app)
+        refreshes: list[int] = []
+        read = app.refresh_data
+
+        def counted(**kwargs: Any) -> None:
+            refreshes.append(1)
+            read(**kwargs)
+
+        app.refresh_data = counted  # type: ignore[method-assign]
+        await pilot.click("#add-project")
+        await settle(app)
+        menu = app.screen
+        assert isinstance(menu, AddMenu)
+        options = menu.query_one(OptionList)
+        options.highlighted = options.get_option_index(ADOPT_A_CONVERSATION)
+        await pilot.press("enter")
+        await settle_until(app, lambda: isinstance(app.screen, AdoptPicker))
+        picker = type(app.screen).__name__
+        app.screen.query_one(OptionList).highlighted = 0  # the one conversation listed
+        before = len(refreshes)  # the adoption may end within the press itself
+        await pilot.press("enter")
+        await settle_until(app, lambda: any(t.startswith("✓ adopted") for t in told))
+        await settle_until(app, lambda: len(refreshes) > before)
+        return picker, told, len(refreshes) - before
+
+    picker, told, read_after = drive(go)
+    assert picker == "AdoptPicker"
+    assert adopted == [conversation.session_id]
+    # What the + menu adds over the Accounts page's flow: the frame read again, so the adopted
+    # agent's row shows on its project's card (review of #563, seq 463).
+    assert read_after >= 1, "no frame was read after the adoption"
+    assert any(
+        t.startswith("✓ adopted 0a1b2c3d as coder-1: it runs in the fleet now") for t in told
+    ), told
 
 
 def test_the_hubs_doctor_link_opens_the_doctor_page_and_runs_the_checks(
@@ -1422,7 +1552,7 @@ def test_the_hubs_doctor_link_opens_the_doctor_page_and_runs_the_checks(
         ]
 
     async def go(pilot: Pilot[None]) -> tuple[int, str | None, str, str | None, str | None, int]:
-        app = fleet_app(pilot)
+        app = await from_welcome(pilot)
         await settle(app)
         await pilot.pause()
         calls_after_mount = len(calls)
@@ -1431,7 +1561,13 @@ def test_the_hubs_doctor_link_opens_the_doctor_page_and_runs_the_checks(
         await pilot.pause()
         await settle(app)
         await pilot.pause()
-        report = shown(app.query_one("#doctor", DoctorView).query_one("#doctor-report", Static))
+        doctor_page = app.query_one("#doctor", DoctorView)
+        # The problems, then the passing rows behind their fold (Q5): the whole report.
+        report = (
+            shown(doctor_page.query_one("#doctor-report", Static))
+            + "\n"
+            + shown(doctor_page.query_one("#doctor-passed-list", Static))
+        )
         return (
             calls_after_mount,
             before,
@@ -1502,11 +1638,13 @@ def test_the_doctor_page_arms_project_fixes_for_the_project_it_ran_for(
     """§0 item 4: a project fix is one click. Without a cwd every one renders disabled.
 
     ``DoctorView`` disables ``scope == "project"`` fixes when ``cwd is None``, so
-    the shell hands it the root its report was run in. Selecting a project runs
-    nothing and arms nothing — the report on the page is still the machine's —
-    and opening the page runs the checks for that project, armed in its root.
+    the shell hands it the root its report was run in. The one run at start is about home's
+    project (L1: start opens home), armed in its root. Selecting another project runs nothing
+    and arms nothing (the report on the page is still home's), and opening the page runs the
+    checks for the project selected, armed in its root.
     """
-    projects = seed(tmp_path, ("prj_a", "alpha", None))
+    projects = seed(tmp_path, ("prj_a", "alpha", None), ("prj_b", "beta", None))
+    ui_app._remember_ui_state(ui_app.LAST_PROJECT_KEY, "prj_a")
     Buttons = list[tuple[str, bool]]
 
     async def go(
@@ -1516,8 +1654,8 @@ def test_the_doctor_page_arms_project_fixes_for_the_project_it_ran_for(
         await settle(app)
         await pilot.pause()
         shell_doctor = app.query_one("#doctor", DoctorView)
-        globally = (_fix_buttons(shell_doctor), shell_doctor.cwd)  # control: nothing selected yet
-        await pilot.click(card_for(app, "prj_a").query_one(ProjectTitle))
+        at_start = (_fix_buttons(shell_doctor), shell_doctor.cwd)  # control: home's report
+        await pilot.click(card_for(app, "prj_b").query_one(ProjectTitle))
         await pilot.pause()
         await settle(app)
         await pilot.pause()
@@ -1527,7 +1665,7 @@ def test_the_doctor_page_arms_project_fixes_for_the_project_it_ran_for(
         await settle(app)
         await pilot.pause()
         return (
-            *globally,
+            *at_start,
             *selected,
             _fix_buttons(shell_doctor),
             shell_doctor.cwd,
@@ -1535,22 +1673,19 @@ def test_the_doctor_page_arms_project_fixes_for_the_project_it_ran_for(
         )
 
     checks = [FACTS_WARN, CONNECT_WARN]
-    global_buttons, global_cwd, selected_buttons, selected_cwd, page_buttons, page_cwd, views = (
-        drive(go, doctor=lambda: list(checks))
+    start_buttons, start_cwd, selected_buttons, selected_cwd, page_buttons, page_cwd, views = drive(
+        go, doctor=lambda: list(checks)
     )
-    refused = [
-        ("Refresh this project", True),  # no project: correctly refused
+    armed = [
+        ("Refresh this project", False),  # run for a project: armed
         ("Connect Claude Code", False),
     ]
-    assert global_cwd is None and global_buttons == refused
-    assert selected_cwd is None and selected_buttons == refused, (
-        "selecting a project leaves the machine's report — and its refusals — as they were"
+    assert start_cwd == projects[0].root and start_buttons == armed
+    assert selected_cwd == projects[0].root and selected_buttons == armed, (
+        "selecting a project leaves the report on the page, home's, as it was"
     )
-    assert page_cwd == projects[0].root
-    assert page_buttons == [
-        ("Refresh this project", False),  # run for the project: armed
-        ("Connect Claude Code", False),
-    ]
+    assert page_cwd == projects[1].root
+    assert page_buttons == armed
     assert views == 1, "the project page has no Doctor tab of its own"
 
 
@@ -1558,7 +1693,7 @@ def test_a_doctor_refreshed_message_updates_the_shells_report(
     tmp_path: Path, script: Script
 ) -> None:
     """A one-click fix re-runs the doctor inside the view; the shell must follow it."""
-    seed(tmp_path, ("prj_a", "alpha", None))
+    (home,) = seed(tmp_path, ("prj_a", "alpha", None))
     calls: list[int] = []
 
     def doctor() -> list[DoctorCheck]:
@@ -1576,11 +1711,12 @@ def test_a_doctor_refreshed_message_updates_the_shells_report(
         await settle(app)
         await pilot.pause()
         before = (counts(app), len(calls))
-        # The report the view was handed is about the scope on screen: adopt it.
+        # The report the view was handed is about the scope on screen, home's project (start
+        # opens home since L1): adopt it.
         app.post_message(
             DoctorRefreshed(
                 [DoctorCheck(name="facts", status=CheckStatus.ok, detail="seeded 2 minutes ago")],
-                None,
+                home.root,
             )
         )
         await pilot.pause()
@@ -1651,12 +1787,13 @@ def test_the_doctor_runs_at_start_and_then_only_when_asked(tmp_path: Path, scrip
 
 
 @pytest.mark.parametrize("remembered", ["project:prj_a", "doctor:prj_a"])
-def test_the_one_run_at_start_is_about_the_project_asq_reopens(
+def test_the_one_run_at_start_is_about_the_home_project(
     tmp_path: Path, script: Script, remembered: str
 ) -> None:
     """At start the doctor ran for the machine, then again for the project the restored view
-    selected: two runs, the first thrown away. Now one, about that project — and a reopened
-    Doctor page's own run is that one."""
+    selected: two runs, the first thrown away. Now one, about home's project. Start opens home
+    since L1, whatever was open last: a Doctor page last open is not reopened, and its one run
+    at start is still about the project."""
     projects = seed(tmp_path, ("prj_a", "alpha", None))
     ui_app._remember_ui_state(ui_app.SELECTED_KEY, remembered)
     calls: list[int] = []
@@ -1673,7 +1810,7 @@ def test_the_one_run_at_start_is_about_the_project_asq_reopens(
         return app.content.current, len(calls), app.query_one("#doctor", DoctorView).cwd
 
     current, count, cwd = drive(go, doctor=doctor)
-    assert current == ("project-prj_a" if remembered.startswith("project") else "doctor")
+    assert current == "project-prj_a", "home: the only project's view (its Manager tab)"
     assert count == 1
     assert cwd == projects[0].root
 
@@ -2533,6 +2670,120 @@ def test_help_opens_from_the_sidebar_and_closes(tmp_path: Path, script: Script) 
     assert "usage could not be read" in keys and "accounts that need a login" in keys
 
 
+def _footer(app: FleetApp) -> list[tuple[str, str]]:
+    """The footer's keys as drawn, left to right: (key as shown, its word). Each one whole: on
+    the screen, and a cell or more apart from the next entry the footer draws, whatever it is:
+    a key, a group of keys (``↓↑``), or a group's label (``move``), which the compact footer
+    drew touching the key after it (``move⏎ open``, the tester of #553). The palette's key is
+    docked on the right, an entry like the rest."""
+    from textual.widgets import Footer
+    from textual.widgets._footer import FooterKey
+
+    footer = app.screen.query_one(Footer)
+    entries = sorted(
+        (entry for entry in footer.children if entry.display and entry.region.area),
+        key=lambda entry: entry.region.x,
+    )
+    assert all(entry.region.right <= footer.region.right for entry in entries), entries
+    # Each entry's ink, from its first drawn glyph to its last: a key's padding is inside its
+    # region, so the gap is the blank cells between one entry's ink and the next's.
+    inked = []
+    for entry in entries:
+        text = composited_text(app, entry)
+        if text.strip():
+            first = entry.region.x + len(text) - len(text.lstrip())
+            inked.append((text.strip(), first, entry.region.x + len(text.rstrip())))
+    touching = [(a[0], b[0]) for a, b in itertools.pairwise(inked) if b[1] - a[2] < 1]
+    assert not touching, f"footer entries with no cell between them: {touching} in {inked}"
+    keys = sorted(
+        (key for key in footer.query(FooterKey) if key.region.area), key=lambda k: k.region.x
+    )
+    return [(key.key_display, key.description) for key in keys]
+
+
+def composited_text(app: FleetApp, widget: Widget) -> str:
+    """The cells ``widget`` covers on the screen's composited frame, as drawn."""
+    region = widget.region
+    (strip,) = app.screen._compositor.render_full_update(simplify=True).strips[region.y]
+    return strip.text[region.x : region.right]
+
+
+@pytest.mark.parametrize("size", [(80, 24), (99, 24), (100, 24), (101, 24), SIZE])
+def test_the_footer_starts_with_help_and_shows_welcome_and_add_project(
+    tmp_path: Path, script: Script, size: tuple[int, int]
+) -> None:
+    """Q9 (the UX audit): ``?`` first, where a newcomer looks, then ``w`` welcome and ``+``
+    add project, which were hidden. At 80x24 too: every key the footer lists is on screen, each
+    entry a cell apart from the next (:func:`_footer`), at the narrow footer's widest too (99)."""
+    seed(tmp_path, ("prj_a", "alpha", None))
+
+    async def go(pilot: Pilot[None]) -> tuple[list[tuple[str, str]], str]:
+        app = fleet_app(pilot)
+        strips = app.screen._compositor.render_full_update(simplify=True).strips
+        (bottom,) = strips[size[1] - 1]
+        return _footer(app), bottom.text
+
+    footer, bottom = drive(go, size=size)
+    assert footer[0] == ("?", "help"), footer
+    assert bottom.lstrip().startswith("? help"), f"the screen's bottom row: {bottom!r}"
+    assert re.search(r"move +⏎", bottom), f"the screen's bottom row: {bottom!r}"
+    assert ("w", "welcome") in footer and ("+", "add project") in footer, footer
+    # Nothing the footer listed before is pushed off it to make room.
+    for shown_before in (("q", "quit"), ("t", "theme"), ("R", "remote"), ("r", "refresh")):
+        assert shown_before in footer, (shown_before, footer)
+
+
+def test_the_footer_keeps_its_gaps_after_a_resize_back_to_80_columns(
+    tmp_path: Path, script: Script
+) -> None:
+    """The narrow footer is chosen at each resize (``ShellFooter.on_resize``): wide, then 80
+    columns again, it is drawn as at 80 from the start, every entry a cell apart."""
+    seed(tmp_path, ("prj_a", "alpha", None))
+
+    async def go(pilot: Pilot[None]) -> list[tuple[list[tuple[str, str]], str]]:
+        app = fleet_app(pilot)
+        seen = []
+        for width in (140, 80):
+            await pilot.resize_terminal(width, 24)
+            await settle(app)
+            strips = app.screen._compositor.render_full_update(simplify=True).strips
+            (bottom,) = strips[23]
+            seen.append((_footer(app), bottom.text))
+        return seen
+
+    (wide, wide_row), (narrow, narrow_row) = drive(go, size=(80, 24))
+    assert wide[0] == narrow[0] == ("?", "help"), (wide, narrow)
+    assert "f1 palette" in wide_row and "f1 palette" not in narrow_row, (wide_row, narrow_row)
+    assert "move ⏎" in narrow_row and "move⏎" not in narrow_row, narrow_row
+    assert ("r", "refresh") in narrow, narrow
+
+
+def test_help_explains_every_agent_mark_and_the_agent_menu(tmp_path: Path, script: Script) -> None:
+    """Q10 (the UX audit): the help says what each mark on an agent means, a line per mark the
+    sidebar draws (its own table, read, so a mark changed there is the one explained); and the
+    agent's ⋯ menu has its line (0.10.1's exploratory test)."""
+    from aisquare.cli.ui.app import AGENT_STATE_WORDS
+    from aisquare.cli.ui.sidebar import STATE_CHIP
+
+    seed(tmp_path, ("prj_a", "alpha", None))
+
+    async def go(pilot: Pilot[None]) -> str:
+        app = fleet_app(pilot)
+        await pilot.press("question_mark")
+        await settle(app)
+        return shown(app.screen.query_one("#helpbox Static", Static))
+
+    lines = drive(go).splitlines()
+    for state, (mark, _style) in STATE_CHIP.items():
+        words = AGENT_STATE_WORDS.get(state, state)
+        assert [line for line in lines if line.split() == [mark, *words.split()]], (state, mark)
+    assert set(AGENT_STATE_WORDS) == set(STATE_CHIP), "a mark with no words, or words for none"
+    menu = [line for line in lines if "on an agent's row, its menu" in line]
+    assert len(menu) == 1, menu
+    for part in (". ⋯ r-click", "Pause", "Resume", "Stop", "Restart", "Rename"):
+        assert part in menu[0], part
+
+
 def test_help_opens_from_the_board_and_explains_every_task_icon(
     tmp_path: Path, script: Script
 ) -> None:
@@ -2632,10 +2883,10 @@ def test_the_arrows_walk_the_one_highlight_and_open_each_row_they_land_on(
         await pilot.pause()
         before = highlighted(app)
         walk: list[tuple[str, ...]] = []
-        # Up at the top already stays on the first row; then down past Spawn agent to the
-        # card, its agent row, back up to the title and down again (the captain's walk:
-        # test_sidebar_actions).
-        for key in ("up", "down", "down", "down", "up", "down"):
+        # From home's row (start opens home since L1): up past Spawn agent to the +, up at
+        # the top stays there; then down past Spawn agent to the card, its agent row, back up
+        # to the title and down again (the captain's walk: test_sidebar_actions).
+        for key in ("up", "up", "up", "down", "down", "down", "up", "down"):
             await pilot.press(key)
             await settle(app)
             (row,) = (row for row in app.sidebar.query(Activatable) if row.has_class("selected"))
@@ -2645,10 +2896,12 @@ def test_the_arrows_walk_the_one_highlight_and_open_each_row_they_land_on(
         return before, walk, str(app.content.current), type(app.focused).__name__
 
     before, walk, current, focused = drive(go)
-    assert before == []  # nothing highlighted until a row is chosen
+    assert before == ["project:prj_a"]  # home's row, its view open
     assert walk == [
-        ("AddButton", "welcome", "Sidebar"),  # highlighted, and the Onboard view not opened
-        ("SpawnButton", "welcome", "Sidebar"),  # highlighted, and no Spawn dialog
+        ("SpawnButton", "project-prj_a", "Sidebar"),  # highlighted, and no Spawn dialog
+        ("AddButton", "project-prj_a", "Sidebar"),  # highlighted, and the + menu not opened
+        ("AddButton", "project-prj_a", "Sidebar"),  # the top: up stays
+        ("SpawnButton", "project-prj_a", "Sidebar"),
         ("ProjectTitle", "project-prj_a", "Sidebar"),
         ("AgentRow", "agent-agt_a_manager", "Sidebar"),  # its pane did not take the keys
         ("ProjectTitle", "project-prj_a", "Sidebar"),
@@ -2725,9 +2978,9 @@ def test_collapsing_the_highlighted_rows_card_leaves_one_highlight_and_moves_bes
         app = fleet_app(pilot)
         app.sidebar.focus()
         await pilot.pause()
-        for _ in range(4):  # add → spawn-agent → project:prj_a → agent:agt_a_manager
-            await pilot.press("down")
-            await settle(app)
+        # From home's row, project:prj_a (start opens home since L1), down to its agent's.
+        await pilot.press("down")
+        await settle(app)
         walked = highlighted(app)
         await pilot.click(card_for(app, "prj_a").query_one(Disclosure))  # hides the lit row
         await pilot.pause()
@@ -2754,9 +3007,10 @@ def test_the_arrows_skip_the_rows_of_a_collapsed_card(
 
     def walk(*, collapse: bool) -> list[str]:
         # The rows the arrows open are remembered, as a click's are: each walk starts at
-        # launch with nothing to reopen, or it would start where the last one ended.
+        # launch with nothing remembered, or its home would be where the last one ended.
         with store_session() as store:
             store.set_ui_state("fleet.selected", None)
+            store.set_ui_state(ui_app.LAST_PROJECT_KEY, None)
 
         async def go(pilot: Pilot[None]) -> list[str]:
             app = fleet_app(pilot)
@@ -2767,8 +3021,14 @@ def test_the_arrows_skip_the_rows_of_a_collapsed_card(
             assert card.query_one("#agents").display is not collapse
             app.sidebar.focus()
             await pilot.pause()
-            keys: list[str] = []
-            for _ in range(5):
+            # Start opens home since L1, so the walk begins on its row: up to the top first
+            # (up at the top stays there), then down from the +.
+            for _ in range(6):
+                await pilot.press("up")
+                await settle(app)
+            (key,) = highlighted(app)
+            keys: list[str] = [key]
+            for _ in range(4):
                 await pilot.press("down")
                 await settle(app)
                 (key,) = highlighted(app)
@@ -2884,7 +3144,7 @@ def test_rebuilds_update_in_place_and_keep_the_selection(tmp_path: Path, script:
     assert same_card and same_row  # updated in place — the widgets were not re-created
     assert still_selected
     # …yet the new state is painted, the highlighted row's ⋯ after it (R17)
-    assert coder_text.rstrip().removesuffix(MENU_GLYPH.strip()).rstrip().endswith("⏸")
+    assert coder_text.rstrip().removesuffix(MENU_GLYPH.strip()).rstrip().endswith("◦")
     assert labels == ["coder-auth", "tester-1"]  # the newcomer mounted, in order
     assert manager_gone
 
@@ -3083,7 +3343,7 @@ def test_ticks_while_a_fleet_read_is_in_flight_start_no_second_read_and_cost_one
     in_flight, while_held, after = drive(go)
     assert in_flight == 1, f"{in_flight} fleet reads in flight"
     assert peak[0] == 1, f"{peak[0]} reads at once"
-    assert while_held.rstrip().endswith("⏸")  # the frame shown is kept while the read waits
+    assert while_held.rstrip().endswith("◦")  # the frame shown is kept while the read waits
     assert reads == ["working", "attention"], reads  # the held read, then ONE owed read
     assert "🔔" in after  # …whose frame is the one painted last
 
@@ -3392,7 +3652,7 @@ def test_r_refreshes_from_the_sidebar_but_is_forwarded_from_a_pane(
         return first, from_sidebar, shown(row), list(pane.keys)
 
     first, from_sidebar, from_pane, keys = drive(go)
-    assert first.rstrip().endswith("⏸")
+    assert first.rstrip().endswith("◦")
     assert from_sidebar.rstrip().endswith("▶")  # r re-read the fleet
     assert from_pane.rstrip().endswith("▶") and "🔔" not in from_pane  # …and did not, here
     assert keys == ["r"]
@@ -3982,7 +4242,9 @@ def test_stop_on_an_exited_row_removes_its_dead_window_through_the_same_dialog(
         return question, force_offered, x_opens, not isinstance(app.screen, StopAgentScreen)
 
     question, force_offered, x_opens, closed = drive(go)
-    assert "dead window" in question and "/exit" not in question  # nothing to /exit
+    # The Stop box's plain words (#12): it removes the exited agent's row, nothing to /exit.
+    assert "Remove coder-auth from the list?" in question and "has exited" in question
+    assert "/exit" not in question
     assert force_offered is False
     assert x_opens, "x asks the same rule as the button: an exited row is offered"
     assert closed and recorder.calls == [("prj_a", "coder-auth", False, "agt_a_coder-auth")]
@@ -5257,13 +5519,11 @@ def test_a_min_width_of_zero_is_a_floor_of_zero(tmp_path: Path, script: Script) 
     )
     assert collapsed == 0
 
-    async def ceiling(pilot: Pilot[None]) -> int | None:
-        app = fleet_app(pilot)
-        app.sidebar.styles.min_width = 0
-        await _resized(pilot, 1 + Panes.MIN_CONTENT, SIZE[1])  # room for the content alone
-        return cells(app.sidebar.styles.max_width)
-
-    assert drive(ceiling) == 0, "the container's ceiling honours a floor of 0 too"
+    # Room for the content alone. The app is one side at a time there (L2), with no ceiling,
+    # so the rule is read where the container keeps it.
+    assert Panes.sidebar_ceiling(1 + Panes.MIN_CONTENT, 0) == 0, (
+        "the container's ceiling honours a floor of 0 too"
+    )
 
 
 def test_a_gesture_at_the_ceiling_with_a_huge_width_on_file_does_not_reach_the_style_setter(
@@ -5448,6 +5708,82 @@ def test_run_ui_says_what_the_quit_could_not_save(
     assert "⚠ the theme was not saved: state.json.lock is held by another process" in err
 
 
+def test_a_restart_from_an_agents_menu_owns_its_pane_going(tmp_path: Path, script: Script) -> None:
+    """The agent's menu restarts on the app when no view of the agent is open, and a project's
+    Manager tab may still show its pane: that pane says nothing of going while the restart of
+    that agent runs (``TerminalPane._replaced_by_restart``), and only for that agent's pane on
+    its own server."""
+    from aisquare.cli.ui.views.agent import PAUSE_WORKER, RESTART_WORKER
+
+    seed(tmp_path, ("prj_a", "alpha", None))
+    manager = status("prj_a", "manager", "manager", "working").agent
+
+    class _Worker:
+        def __init__(self, name: str, *, finished: bool = False) -> None:
+            self.name, self.is_finished = name, finished
+
+    async def go(pilot: Pilot[None]) -> list[bool]:
+        app = fleet_app(pilot)
+        here, elsewhere = TmuxServer(PRIVATE_SOCKET), TmuxServer("someone-elses")
+        asked = []
+        for worker in (
+            _Worker(RESTART_WORKER),
+            _Worker(RESTART_WORKER, finished=True),
+            _Worker(PAUSE_WORKER),
+        ):
+            app._menu_actions = {worker: manager}  # type: ignore[dict-item]
+            asked.append(app.restarting_pane(here, manager.pane_id))
+        app._menu_actions = {_Worker(RESTART_WORKER): manager}  # type: ignore[dict-item]
+        asked += [app.restarting_pane(here, "%7"), app.restarting_pane(elsewhere, "%1")]
+        asked.append(app.restarting_pane(None, manager.pane_id))
+        app._menu_actions = {}
+        return asked
+
+    assert drive(go) == [True, False, False, False, False, False]
+
+
+def test_a_quit_says_how_many_agents_keep_running(
+    tmp_path: Path,
+    script: Script,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Q12 (the UX audit): ``q`` stops no agent, and the terminal is told so once the screen is
+    gone — "2 agents keep running", counted off the frame (an exited row is not one)."""
+    seed(tmp_path, ("prj_a", "alpha", None))
+    script["prj_a"] = [
+        status("prj_a", "manager", "manager", "working"),
+        status("prj_a", "coder-1", "coder", "waiting", minute=1),
+        status("prj_a", "coder-2", "coder", "exited", minute=2, exit_status=0),
+    ]
+    apps: list[FleetApp] = []
+
+    async def go(pilot: Pilot[None]) -> None:
+        app = fleet_app(pilot)
+        apps.append(app)
+        app.sidebar.focus()
+        await pilot.press("q")
+
+    drive(go)
+    (app,) = apps
+    assert app.quit_line == "rlx quit: 2 agents keep running"
+
+    class _Quit:
+        def __init__(self, **options: object) -> None:
+            self.unsaved: list[str] = []
+            self.remote = RemoteController()  # off: nothing for run_ui to wait for
+            self.quit_line = app.quit_line
+
+        def run(self) -> None:
+            return None
+
+    monkeypatch.setattr(app_mod, "FleetApp", _Quit)
+    app_mod.run_ui()
+    assert "rlx quit: 2 agents keep running" in capsys.readouterr().err
+    assert app_mod.quit_line(1) == "rlx quit: 1 agent keeps running"
+    assert app_mod.quit_line(0) is None
+
+
 def test_a_quit_in_the_middle_of_a_drag_keeps_the_width_the_drag_reached(
     tmp_path: Path, script: Script, isolated_home: Path
 ) -> None:
@@ -5613,7 +5949,7 @@ def test_restart_from_the_agent_view_selects_the_new_row_in_the_shell(
         toasts
     )
     assert len(rows) == 1  # the old 💤 exited row is gone; the new one highlighted, its ⋯ last
-    assert rows[0].rstrip().removesuffix(MENU_GLYPH.strip()).rstrip().endswith("⏸")
+    assert rows[0].rstrip().removesuffix(MENU_GLYPH.strip()).rstrip().endswith("◦")
 
 
 def _replacement(old: FleetAgentStatus, agent_id: str) -> FleetAgentStatus:
@@ -6069,12 +6405,11 @@ def test_with_capture_off_no_captured_directory_is_listed_whatever_was_saved(
         assert [p.id for p in store.captured_projects()] == ["prj_scratch"], "nothing deleted"
 
 
-def test_the_shell_reopens_what_was_open_when_its_row_is_still_there(
-    tmp_path: Path, script: Script
-) -> None:
-    """#144: the UI restored exactly one thing at mount, the theme. What was open —
-    a project, an agent, a page — is remembered in the store's ui_state and comes
-    back; an agent whose row is gone falls back to its project."""
+def test_a_relaunch_opens_home_whatever_view_was_open(tmp_path: Path, script: Script) -> None:
+    """#144 remembered what was open (a project, an agent, a page) in the store's ui_state and
+    reopened it at start. Since L1 start opens home instead: the last-used project's Manager tab,
+    the agent's project when an agent's view was open last. The memory is still kept and
+    written; a stale one opens home all the same, and is replaced by home's."""
     seed(tmp_path, ("prj_a", "alpha", None))
     script["prj_a"] = [status("prj_a", "coder-auth", "coder", "working")]
 
@@ -6088,6 +6423,7 @@ def test_the_shell_reopens_what_was_open_when_its_row_is_still_there(
     assert drive(open_agent) == "agent-agt_a_coder-auth"
     with store_session() as store:
         assert store.ui_state("fleet.selected") == "agent:prj_a/agt_a_coder-auth"
+        assert store.ui_state(ui_app.LAST_PROJECT_KEY) == "prj_a"
 
     async def relaunch(pilot: Pilot[None]) -> tuple[str | None, str | None]:
         app = fleet_app(pilot)
@@ -6096,23 +6432,25 @@ def test_the_shell_reopens_what_was_open_when_its_row_is_still_there(
         view = app.current_view()
         return (view.id if view else None), app.sidebar.selected_key
 
-    assert drive(relaunch) == ("agent-agt_a_coder-auth", "agent:agt_a_coder-auth")
+    assert drive(relaunch) == ("project-prj_a", "project:prj_a"), "home, not the agent's view"
 
-    script["prj_a"] = []  # the agent's row is gone: its project is the fallback
+    script["prj_a"] = []  # the agent's row is gone: home is its project all the same
     assert drive(relaunch) == ("project-prj_a", "project:prj_a")
 
     with store_session() as store:
-        store.set_ui_state("fleet.selected", "project:prj_gone")  # nothing to reopen
-    assert drive(relaunch) == ("welcome", None)
+        store.set_ui_state("fleet.selected", "project:prj_gone")  # nothing of it is listed
+        store.set_ui_state(ui_app.LAST_PROJECT_KEY, "prj_gone")
+    assert drive(relaunch) == ("project-prj_a", "project:prj_a"), "the first listed project"
     with store_session() as store:
-        assert store.ui_state("fleet.selected") is None, "a stale memory is dropped, not retried"
+        assert store.ui_state("fleet.selected") == "project:prj_a", "the stale memory replaced"
 
 
-def test_the_shell_remembers_the_captured_toggle_and_reopens_a_page(
+def test_the_shell_remembers_the_captured_toggle_and_starts_home_whatever_page_was_open(
     tmp_path: Path, script: Script, project_capture: None
 ) -> None:
-    """Review of #169: what the shell remembers beyond a row came back untested —
-    the captured directories shown with `a`, and every page under ⚙ Settings."""
+    """Review of #169: what the shell remembers beyond a row came back untested: the captured
+    directories shown with `a`, and every page under ⚙ Settings. Since L1 a page last open
+    is not reopened at start: start opens home."""
     seed(tmp_path, ("prj_a", "alpha", None))
     with store_session() as store:
         store.ensure_project(ProjectInfo(id="prj_scratch", root=tmp_path / "scratch"))  # a hook
@@ -6139,17 +6477,12 @@ def test_the_shell_remembers_the_captured_toggle_and_reopens_a_page(
         assert store.ui_state("fleet.show_captured") is None, "hiding them again is remembered"
     assert drive(relaunch)[0] == ["prj_a"]
 
-    # Every page under ⚙ Settings reopens with Settings the highlighted row — the two
-    # remembered before the hub existed (`accounts`, `doctor:`) as much as the new ones.
-    for remembered, page in (
-        ("settings", "settings-hub"),
-        ("app-settings", "app-settings"),
-        ("accounts", "accounts"),
-        ("doctor:", "doctor"),
-    ):
+    # A page under ⚙ Settings last open is no longer reopened at start (L1: start opens home,
+    # the last-used project's Manager tab); it stays remembered for the session it is in.
+    for remembered in ("settings", "app-settings", "accounts", "doctor:"):
         with store_session() as store:
             store.set_ui_state("fleet.selected", remembered)
-        assert drive(relaunch)[1:] == (page, "settings"), remembered
+        assert drive(relaunch)[1:] == ("project-prj_a", "project:prj_a"), remembered
 
 
 # --- groups, pins and manual order (#140) ---------------------------------------------------
@@ -6511,7 +6844,7 @@ def test_m_marks_the_card_under_the_cursor_so_a_selection_needs_no_shift_click(
     script["prj_c"] = [status("prj_c", "coder-1", "coder", "working")]
 
     async def go(pilot: Pilot[None]) -> tuple[list[str], list[str], str | None, list[str]]:
-        app = fleet_app(pilot)
+        app = await from_welcome(pilot)
         app.sidebar.focus()
         for key in ("project:prj_a", "project:prj_b", "agent:agt_c_coder-1", "project:prj_b"):
             app.sidebar.select(key)  # the highlight the keys act on
@@ -6659,7 +6992,7 @@ def test_a_click_on_a_group_header_folds_it_and_a_drag_back_onto_itself_opens_no
         groups_service.create_group(store, "tools", ["prj_b"])
 
     async def go(pilot: Pilot[None]) -> tuple[list[str], list[str], str | None, bool]:
-        app = fleet_app(pilot)
+        app = await from_welcome(pilot)
         await _click(pilot, app.sidebar.query_one(GroupHeader))
         folded = _cards(app)
         await _click(pilot, app.sidebar.query_one(GroupHeader))
@@ -6862,7 +7195,7 @@ def test_another_button_let_go_mid_drag_does_not_end_it(
         groups_service.create_group(store, "tools", ["prj_b"])
 
     async def go(pilot: Pilot[None]) -> tuple[list[str], list[str], str | None, list[str]]:
-        app = fleet_app(pilot)
+        app = await from_welcome(pilot)
         before = _cards(app)
         header = app.sidebar.query_one(GroupHeader)
         await _as_the_terminal_sends(
@@ -7096,8 +7429,10 @@ def test_the_settings_tab_follows_a_rename_made_on_the_card_or_in_a_shell(
         app.refresh_data()
         await settle(app)
         out["typing"] = seen()
+        field.focus()
+        await settle(app)
         field.value = ""
-        tab.query_one("#save-nickname", Button).press()
+        field.blur()  # leaving the field keeps it: there is no Save (M5)
         await settle(app)
         out["cleared"] = (seen(), stored())
         return out
@@ -7110,7 +7445,7 @@ def test_the_settings_tab_follows_a_rename_made_on_the_card_or_in_a_shell(
         "what the operator is typing stays; the title says the stored name"
     )
     assert out["cleared"] == (("", "project settings — alpha"), None), (
-        "a blank Save clears a nickname set elsewhere"
+        "a blank field, left, clears a nickname set elsewhere"
     )
 
 
@@ -7152,6 +7487,42 @@ def test_a_paste_the_sidebar_got_reaches_the_one_live_pane_and_focuses_it(
     assert was_sidebar, "the premise: the sidebar had the keyboard"
     assert forwarded == [("paste", "/tmp/shot.png")]
     assert focused, "the pane took the keyboard with it"
+
+
+class PressCountingButton(Button):
+    """A button that counts its presses: Enter on a focused button is one."""
+
+    presses = 0
+
+    def press(self) -> Self:
+        self.presses += 1
+        return super().press()
+
+
+def test_a_paste_holding_a_raw_escape_presses_no_focused_button_and_reaches_the_pane_whole(
+    tmp_path: Path, script: Script
+) -> None:
+    """From the terminal's bytes, through the parser as the driver runs it. Textual's own parse
+    sends what follows an Escape in a paste as keys, its Enter pressing the focused button;
+    the guard keeps it one paste (``cli.ui.paste_guard``). This test reads the button's
+    presses and what the one live pane forwarded."""
+    seed(tmp_path, ("prj_a", "alpha", None))
+
+    async def go(pilot: Pilot[None]) -> tuple[list[tuple[str, str | bytes]], int]:
+        app = fleet_app(pilot)
+        pane = PasteRecordingPane()
+        await app.content.add_content(pane, set_current=True)
+        button = PressCountingButton("press", id="paste-button")
+        await app.screen.mount(button)
+        button.focus()
+        await pilot.pause()
+        post_terminal_input(app, bracketed_paste("one\x1b\rtwo"))
+        await settle(app)
+        return pane.forwarded, button.presses
+
+    forwarded, presses = drive(go)
+    assert presses == 0
+    assert forwarded == [("paste", "one\x1b\rtwo")]
 
 
 def test_a_paste_with_no_live_pane_on_screen_is_one_toast_and_no_tmux_call(
@@ -7291,6 +7662,43 @@ def test_a_paste_into_a_dialogs_input_never_reaches_a_pane_and_nothing_passes_a_
     assert forwarded == []
 
 
+def test_a_paste_holding_a_raw_escape_into_a_dialogs_input_submits_nothing(
+    tmp_path: Path, script: Script
+) -> None:
+    """From the terminal's bytes, through the parser as the driver runs it. Textual's own parse
+    sends an Enter that follows an Escape in a paste to the field, submitting it; the guard
+    keeps it one paste (``cli.ui.paste_guard``). This test reads the messages the Spawn
+    dialog's label posts, and its value: the paste's first line, as ``Input`` takes any
+    paste."""
+    from aisquare.cli.ui.spawn import SpawnDialog
+
+    [project] = seed(tmp_path, ("prj_a", "alpha", None))
+
+    async def go(pilot: Pilot[None]) -> tuple[list[str], str]:
+        app = fleet_app(pilot)
+        app.push_screen(SpawnDialog(project, accounts=None))
+        await settle(app)
+        label = app.screen.query_one("#spawn-label", Input)
+        label.value = ""
+        label.focus()
+        await pilot.pause()
+        posted: list[str] = []
+        post = label.post_message
+
+        def recorded(message: Any) -> bool:
+            posted.append(type(message).__name__)
+            return post(message)
+
+        label.post_message = recorded  # type: ignore[method-assign]
+        post_terminal_input(app, bracketed_paste("one\x1b\rtwo"))
+        await settle(app)
+        return posted, label.value
+
+    posted, value = drive(go)
+    assert "Submitted" not in posted, posted
+    assert value == "one\x1b"
+
+
 def test_a_paste_a_text_area_took_is_not_sent_to_the_pane_as_well(
     tmp_path: Path, script: Script
 ) -> None:
@@ -7314,6 +7722,39 @@ def test_a_paste_a_text_area_took_is_not_sent_to_the_pane_as_well(
 
     text, forwarded = drive(go)
     assert text == "a note"
+    assert forwarded == []
+
+
+def test_a_paste_holding_a_raw_escape_into_a_text_area_is_inserted_as_the_whole_paste_is(
+    tmp_path: Path, script: Script
+) -> None:
+    """From the terminal's bytes, through the parser as the driver runs it. Textual's own parse
+    types what follows an Escape in a paste into the text area as keys, ahead of a cut-short
+    paste; the guard keeps it one paste (``cli.ui.paste_guard``). This test reads two text
+    areas, one given the bytes and one given the same paste posted whole, and what the pane
+    behind them forwarded."""
+    from textual.widgets import TextArea
+
+    seed(tmp_path, ("prj_a", "alpha", None))
+
+    async def go(pilot: Pilot[None]) -> tuple[str, str, list[tuple[str, str | bytes]]]:
+        app = fleet_app(pilot)
+        pane = PasteRecordingPane()
+        await app.content.add_content(pane, set_current=True)
+        typed, posted = TextArea(id="typed-area"), TextArea(id="posted-area")
+        await app.screen.mount(typed, posted)
+        typed.focus()
+        await pilot.pause()
+        post_terminal_input(app, bracketed_paste("one\x1b\rtwo"))
+        await settle(app)
+        posted.focus()
+        await pilot.pause()
+        app.post_message(events.Paste("one\x1b\rtwo"))
+        await settle(app)
+        return typed.text, posted.text, pane.forwarded
+
+    typed, posted, forwarded = drive(go)
+    assert typed == posted != "", (typed, posted)
     assert forwarded == []
 
 

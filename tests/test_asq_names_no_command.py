@@ -6,6 +6,10 @@ to type; the Doctor's buttons say what they do, never their command line; a row 
 button is handed to the manager (ruled Q2), which knows the command line, or says plainly
 that a manager can fix it. The shell keeps every command: ``doctor``'s text, ``--help``,
 errors printed in a terminal.
+
+The guard knows every top-level command from the CLI itself (:data:`GUARD`), not from the
+Doctor's hand list (``COMMAND``), which missed ``status``, ``service``, ``tidy`` and more
+(reviewer #4085).
 """
 
 from __future__ import annotations
@@ -13,14 +17,23 @@ from __future__ import annotations
 import ast
 import asyncio
 import re
-from collections.abc import Iterator
+import string
+import subprocess
+import sys
+import tomllib
+from collections.abc import Callable, Iterable, Iterator
 from pathlib import Path
 from typing import Any
 
 import pytest
+import typer
+import typer.main
 from textual.app import App, ComposeResult
 from textual.widgets import Button, Static
+from typer.core import TyperGroup
 
+from aisquare.cli.app import app as cli_app
+from aisquare.cli.ui.views import doctor as doctor_view
 from aisquare.cli.ui.views.doctor import (
     COMMAND,
     NO_MANAGER_WAY,
@@ -33,7 +46,42 @@ from aisquare.core import selfcli
 from aisquare.models import CheckStatus, DoctorCheck
 from aisquare.services.onboarding import FixCommand, FixResult
 
-UI = Path(__file__).resolve().parents[1] / "src" / "aisquare" / "cli" / "ui"
+ROOT = Path(__file__).resolve().parents[1]
+UI = ROOT / "src" / "aisquare" / "cli" / "ui"
+
+
+def _programs() -> list[str]:
+    """The names a person types rlx by: every console script that runs the CLI's ``main``."""
+    project = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))["project"]
+    return sorted(name for name, at in project["scripts"].items() if at == "aisquare.cli.app:main")
+
+
+def _commands(app: typer.Typer) -> set[str]:
+    """Every top-level command and group ``app`` registers, hidden ones too, as the shell types
+    it: read off the command group Typer builds from it, so one added is known at once."""
+    group = typer.main.get_command(app)
+    assert isinstance(group, TyperGroup), group
+    return set(group.commands)
+
+
+def _naming(programs: Iterable[str], commands: Iterable[str]) -> re.Pattern[str]:
+    """``<program> <command>``, for each program and command; the longest of each first."""
+
+    def either(words: Iterable[str]) -> str:
+        return "|".join(sorted(map(re.escape, words), key=lambda word: (-len(word), word)))
+
+    return re.compile(rf"\b(?:{either(programs)}) (?:{either(commands)})\b")
+
+
+def _guard(app: typer.Typer) -> re.Pattern[str]:
+    """The Doctor's ``COMMAND``, every rule of it (a package manager's, tmux's, a backticked
+    flag), with each of ``app``'s commands after each of the CLI's names besides."""
+    every = _naming(_programs(), _commands(app))
+    return re.compile(f"{every.pattern}|{COMMAND.pattern}")
+
+
+GUARD = _guard(cli_app)
+"""What a command to type looks like in asq's text, as this guard reads it."""
 
 PRINTED_IN_A_TERMINAL = {"instance_gate.py"}
 """asq's files whose text is printed in the terminal, before asq draws or after it quits:
@@ -87,9 +135,9 @@ def _literals() -> Iterator[tuple[str, int, str]]:
 def test_no_asq_string_names_a_command_to_type() -> None:
     """Every string asq shows — f-strings' literal parts included — is free of a command."""
     found = [
-        f"{name}:{line}: {COMMAND.search(text).group(0)!r} in {text[:70]!r}"  # type: ignore[union-attr]
+        f"{name}:{line}: {GUARD.search(text).group(0)!r} in {text[:70]!r}"  # type: ignore[union-attr]
         for name, line, text in _literals()
-        if COMMAND.search(text)
+        if GUARD.search(text)
     ]
     assert found == []
 
@@ -102,10 +150,137 @@ def test_the_guard_catches_what_it_is_for() -> None:
         "tmux -L asq attach -t =asq-x",
         "install it: npm install -g @openai/codex",
         "curl -fsSL https://claude.ai/install.sh | bash",
+        "see rlx status",
+        "asq service install starts it at login",
+        "relax tidy --dry-run",
     ):
-        assert COMMAND.search(said), said
-    for prose in ("rlx — keys", "Restart on its sidebar row", "rlx's doctor: its tmux check"):
-        assert not COMMAND.search(prose), prose
+        assert GUARD.search(said), said
+    for prose in (
+        "rlx — keys",
+        "Restart on its sidebar row",
+        "rlx's doctor: its tmux check",
+        "rlx statuses",
+        "rlx's service",
+    ):
+        assert not GUARD.search(prose), prose
+
+
+def test_the_guard_knows_every_command_the_cli_has() -> None:
+    """Reviewer #4085: the hand list missed ``status``, ``service`` and more, so asq's text
+    could name them unseen. Each command the shell lists, after each of its names, is one."""
+    root = typer.main.get_command(cli_app)
+    assert isinstance(root, TyperGroup), root
+    listed = sorted(root.commands)
+    visible = [name for name in listed if not root.commands[name].hidden]
+
+    assert {"status", "service", "tidy", "fleet", "doctor"} <= set(visible), visible
+    assert {"rlx", "asq", "aisquare"} <= set(_programs())
+    missed = [
+        f"{program} {name}"
+        for program in _programs()
+        for name in listed
+        if not GUARD.search(f"say {program} {name} here")
+    ]
+    assert missed == []
+
+
+@pytest.fixture
+def stand_ins(monkeypatch: pytest.MonkeyPatch) -> list[str]:
+    """A command, a hidden one and a group, registered on the real CLI: on copies of its lists,
+    which the monkeypatch puts back after."""
+    monkeypatch.setattr(cli_app, "registered_commands", list(cli_app.registered_commands))
+    monkeypatch.setattr(cli_app, "registered_groups", list(cli_app.registered_groups))
+    group = typer.Typer()
+    group.command("go")(lambda: None)
+    cli_app.command("zz-stand-in")(lambda: None)
+    cli_app.command("zz-quiet", hidden=True)(lambda: None)
+    cli_app.add_typer(group, name="zz-group")
+    return ["zz-group", "zz-quiet", "zz-stand-in"]
+
+
+def test_a_command_the_cli_gains_is_known_with_no_hand_list(stand_ins: list[str]) -> None:
+    """A command or group registered on the real CLI is known from then on, hidden or not."""
+    before, after = GUARD, _guard(cli_app)
+
+    for said in ("rlx zz-stand-in", "asq zz-quiet --now", "aisquare zz-group go"):
+        assert after.search(said) and not before.search(said), said
+    assert set(stand_ins) <= _commands(cli_app)
+
+
+# --- the Doctor's own list (#69) ---------------------------------------------------------------
+
+
+def _drift(app: typer.Typer) -> tuple[list[str], list[str]]:
+    """(``app``'s commands the Doctor's list lacks, the names on it that ``app`` has not)."""
+    commands, listed = _commands(app), set(doctor_view.RLX_COMMANDS)
+    return sorted(commands - listed), sorted(listed - commands)
+
+
+def test_the_doctor_s_command_list_is_the_cli_s() -> None:
+    """The Doctor's ``COMMAND`` decides what asq says of a fix, in asq, which cannot read the
+    CLI's commands without loading all of it (#45): its hand list is held to the CLI's here,
+    hidden commands too, and its programs to the console scripts (#69)."""
+    assert _drift(cli_app) == ([], [])
+    assert len(set(doctor_view.RLX_COMMANDS)) == len(doctor_view.RLX_COMMANDS), "each once"
+    assert sorted(doctor_view.PROGRAMS) == _programs()
+
+
+def test_a_command_the_cli_gains_without_the_doctor_s_list_is_drift(stand_ins: list[str]) -> None:
+    assert _drift(cli_app) == (stand_ins, [])
+
+
+def test_asq_loads_no_cli_for_the_doctor_s_list() -> None:
+    """Why the list is by hand: asq's module, read in a fresh interpreter, loads no CLI app."""
+    code = "import sys, aisquare.cli.ui.app; print('aisquare.cli.app' in sys.modules)"
+    result = subprocess.run(
+        [sys.executable, "-c", code], capture_output=True, text=True, timeout=120, cwd=ROOT
+    )
+    assert result.returncode == 0, result.stderr[-3000:]
+    assert result.stdout.split() == ["False"], result.stdout
+
+
+def _fixes_naming_each_command() -> list[str]:
+    """A fix naming each command of the CLI's, after each of its names: read off the CLI."""
+    return [
+        f"Free it: {program} {name} --now"
+        for program in _programs()
+        for name in sorted(_commands(cli_app))
+    ]
+
+
+def test_asq_s_doctor_says_its_own_way_for_a_fix_naming_any_command() -> None:
+    """``ui_way``: a fix naming a command is never said as it is: the button it makes, the Ask
+    beside it, or plain words (#69: one naming ``rlx tidy`` was said as it is)."""
+    said = {
+        fix: (
+            ui_way(row, {}),
+            ui_way(row, {}, manager="api's manager"),
+            ui_way(row, {"disk": "Free space"}),
+        )
+        for fix in _fixes_naming_each_command()
+        for row in [DoctorCheck(name="disk", status=CheckStatus.warn, detail="full", fix=fix)]
+    }
+    ways = (NO_MANAGER_WAY, "Ask api's manager below to fix it", "Free space below fixes it")
+    assert [f"{fix}: {way}" for fix, way in said.items() if way != ways] == []
+    plain = DoctorCheck(name="disk", status=CheckStatus.warn, detail="full", fix="Wait a day")
+    assert ui_way(plain, {}) == "Wait a day", "words with no command are said as they are"
+
+
+def test_asq_s_explainability_page_shows_no_probe_fix_naming_any_command(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The probe's remediation, under the probe, only when it names no command (#69)."""
+    from aisquare.cli.ui.views import explainability as view
+    from aisquare.services import explainability_ops as ops
+
+    def probe(remediation: str) -> str:
+        state = ops.ProxyState(summary="down", severity=CheckStatus.warn, remediation=remediation)
+        monkeypatch.setattr(ops, "proxy_state", lambda target, on: state)
+        return dict(view.status_report().rows)["probe"]
+
+    assert "Start the SDK's proxy" in probe("Start the SDK's proxy"), "plain words are shown"
+    shown = [fix for fix in _fixes_naming_each_command() if fix in probe(fix)]
+    assert shown == []
 
 
 def test_asq_calls_no_function_that_spells_a_command() -> None:
@@ -133,7 +308,7 @@ def test_a_fix_button_says_what_it_does_and_which_home_never_its_command() -> No
     connect = FixCommand("claude-code", ("agents", "connect", "claude-code"), "machine", "")
     # As a fix spells it on this platform, and with "/" after the home, as one written by
     # hand on Windows has it: both shown from "~", in this platform's separators (#517).
-    native = str(Path.home() / ".aisquare" / "codex-accounts" / "4")
+    native = str(Path.home() / ".rlx" / "accounts" / "codex" / "4")
     slot = FixCommand(
         "claude-code",
         ("agents", "connect", "codex", "--config-dir", f"{home}/.aisquare/codex-accounts/3"),
@@ -152,7 +327,7 @@ def test_a_fix_button_says_what_it_does_and_which_home_never_its_command() -> No
 
     assert connect.title == "Connect Claude Code"
     assert slot.title == f"Connect Codex ({Path('~', '.aisquare', 'codex-accounts', '3')})"
-    assert slot_4.title == f"Connect Codex ({Path('~', '.aisquare', 'codex-accounts', '4')})"
+    assert slot_4.title == f"Connect Codex ({Path('~', '.rlx', 'accounts', 'codex', '4')})"
     assert elsewhere.title == "Connect Claude Code (/srv/x)"
     assert refresh.title == "Refresh this project"
     assert fix_all.title == "Fix what the checks can"
@@ -219,13 +394,13 @@ class Host(App[None]):
 
 
 def _doctor(
-    manager: str | None, tmp_path: Path
+    manager: str | None, tmp_path: Path, rows: list[DoctorCheck] | None = None
 ) -> tuple[list[str], list[tuple[str, Path | None]], str]:
     async def drive() -> tuple[list[str], list[tuple[str, Path | None]], str]:
         view = DoctorView(cwd=tmp_path, run=selfcli.run, manager=lambda cwd: manager)
         host = Host(view)
         async with host.run_test(size=(140, 40)) as pilot:
-            view.show([OK, CONNECT, WARN, OWN_WAY])
+            view.show([OK, CONNECT, WARN, OWN_WAY] if rows is None else rows)
             await pilot.pause()
             await pilot.pause()
             labels = [str(b.label) for b in view.query("#doctor-fixes Button").results(Button)]
@@ -253,6 +428,23 @@ def test_with_no_manager_there_is_no_ask_and_the_row_says_so(tmp_path: Path) -> 
 
     assert labels == ["Connect Claude Code"] and asked == []
     assert f"→ {NO_MANAGER_WAY}" in report
+
+
+def test_a_fix_naming_a_command_the_old_list_missed_is_asked_of_the_manager(
+    tmp_path: Path,
+) -> None:
+    """The Ask button is offered for a fix that names a command (#69: ``tidy`` and ``service``
+    were not known, and their rows were said as they are, with no Ask)."""
+    rows = [
+        DoctorCheck(name="disk", status=CheckStatus.warn, detail="full", fix="rlx tidy frees it"),
+        DoctorCheck(name="svc", status=CheckStatus.warn, detail="off", fix="asq service install"),
+    ]
+    labels, asked, report = _doctor("api's manager", tmp_path, rows)
+
+    assert labels == ["Ask the manager: disk", "Ask the manager: svc"]
+    assert asked == [("disk", tmp_path)]
+    assert report.count("→ Ask api's manager below to fix it") == 2, report
+    assert "tidy" not in report and "service" not in report, report
 
 
 def test_a_fix_with_no_command_is_said_as_it_is_and_is_not_asked() -> None:
@@ -342,7 +534,7 @@ def test_the_install_rows_name_no_command_in_asq_on_any_platform(
     for row, page in zip(rows, pages, strict=True):
         assert row.fix is not None and COMMAND.search(row.fix), (row.name, row.fix)
         way = ui_way(row, {})
-        assert way is not None and not COMMAND.search(way), (row.name, way)
+        assert way is not None and not GUARD.search(way), (row.name, way)
         assert page in way, f"{row.name}: asq links its install page: {way}"
 
 
@@ -366,12 +558,600 @@ def test_the_gh_rows_sign_in_note_names_its_command_at_a_shell_and_none_in_asq(
     monkeypatch.setenv(prog.IN_APP_ENV, "1")
     app = diagnostics._check_gh()
     assert app.detail.endswith("(not signed in to GitHub CLI)"), app.detail
-    assert not COMMAND.search(app.detail), app.detail
+    assert not GUARD.search(app.detail), app.detail
 
 
 def test_no_doctor_row_s_asq_wording_names_a_command() -> None:
+    """Its ``ui_fix``, and what asq's Doctor says under it (:func:`ui_way`): a ``fix`` naming a
+    command the Doctor's own pattern does not know would be said as it is."""
     from aisquare.services import diagnostics
 
     rows = diagnostics.doctor()
     assert rows, "the doctor ran"
-    assert [row.name for row in rows if row.ui_fix and COMMAND.search(row.ui_fix)] == []
+    assert [row.name for row in rows if row.ui_fix and GUARD.search(row.ui_fix)] == []
+    said = {row.name: ui_way(row, {}) for row in rows}
+    assert [f"{name}: {way}" for name, way in said.items() if way and GUARD.search(way)] == []
+
+
+# --- every ui_fix the source can build (#69, tester #4105) --------------------------------------
+
+SRC = ROOT / "src" / "aisquare"
+
+SPELLERS = frozenset(
+    {
+        "word",
+        "words",
+        "line",
+        "command",
+        "command_line",
+        "fleet_command",
+        "onboard_command",
+        "forget_command",
+        "config_dir_command",
+        "trust_command",
+        "claude_plugin_command",
+    }
+)
+"""The calls that spell a command (``core.program``'s and the services' builders)."""
+
+PLACEHOLDER = "rlx"
+"""What a placeholder the sweep cannot trace is read as saying: a program's name, so a command
+after it (``f"{PRODUCT} tidy"``) is still one (reviewer #4214)."""
+
+MOST_WAYS = 256
+"""The most texts one ``ui_fix`` is read as saying; past them it cannot be read."""
+
+TEXT_METHODS: dict[str, Callable[[str], str]] = {
+    "upper": str.upper,
+    "lower": str.lower,
+    "capitalize": str.capitalize,
+    "title": str.title,
+    "strip": str.strip,
+    "lstrip": str.lstrip,
+    "rstrip": str.rstrip,
+}
+"""A string's own methods a ``ui_fix`` may call on its text: each read as it acts."""
+
+_PERCENT = re.compile(r"%(?:\((\w+)\))?[#0 +-]*(?:\*|\d+)?(?:\.(?:\*|\d+))?([a-zA-Z%])")
+
+Scope = ast.FunctionDef | ast.AsyncFunctionDef | None
+"""The function a value is read in, or ``None`` for the module's top level."""
+
+
+class _Unreadable(Exception):
+    """A part of a ``ui_fix`` the sweep cannot trace to text: it fails closed (reviewer #4214)."""
+
+    def __init__(self, node: ast.AST, what: str) -> None:
+        super().__init__(f"cannot read {what}")
+        self.line: int = getattr(node, "lineno", 0)
+
+
+def _ui_fix_sites(tree: ast.Module) -> Iterator[tuple[ast.expr, Scope]]:
+    """(what a ``ui_fix`` is set to, the function around it) for every place ``tree`` sets one:
+    a ``ui_fix=`` argument, a ``{"ui_fix": …}`` update, an ``….ui_fix = …`` assignment, a
+    ``setattr(…, "ui_fix", …)``."""
+
+    def visit(node: ast.AST, around: Scope) -> Iterator[tuple[ast.expr, Scope]]:
+        if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef):
+            around = node
+        if isinstance(node, ast.keyword) and node.arg == "ui_fix":
+            yield node.value, around
+        if isinstance(node, ast.Dict):
+            for key, value in zip(node.keys, node.values, strict=True):
+                if isinstance(key, ast.Constant) and key.value == "ui_fix":
+                    yield value, around
+        if isinstance(node, ast.Assign | ast.AnnAssign) and node.value is not None:
+            targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+            if any(isinstance(t, ast.Attribute) and t.attr == "ui_fix" for t in targets):
+                yield node.value, around
+        if (
+            isinstance(node, ast.Call)
+            and _callee(node) == "setattr"
+            and len(node.args) == 3
+            and isinstance(node.args[1], ast.Constant)
+            and node.args[1].value == "ui_fix"
+        ):
+            yield node.args[2], around
+        for child in ast.iter_child_nodes(node):
+            yield from visit(child, around)
+
+    yield from visit(tree, None)
+
+
+def _assigned(scope: ast.AST, name: str, *, added: bool = True) -> list[ast.expr]:
+    """What ``name`` is set to in ``scope``, anywhere in a function or at a module's top
+    level; ``added``: what ``+=`` adds to it too."""
+    found: list[ast.expr] = []
+    for node in scope.body if isinstance(scope, ast.Module) else ast.walk(scope):
+        if isinstance(node, ast.Assign):
+            targets = node.targets
+        elif isinstance(node, ast.AnnAssign) or (isinstance(node, ast.AugAssign) and added):
+            targets = [node.target]
+        else:
+            continue
+        if node.value is not None and any(
+            isinstance(t, ast.Name) and t.id == name for t in targets
+        ):
+            found.append(node.value)
+    return found
+
+
+def _built_up(scope: ast.AST, name: str) -> bool:
+    """Whether ``name`` is added to with ``+=`` in ``scope`` (a module: at its top level)."""
+    return any(
+        isinstance(node, ast.AugAssign)
+        and isinstance(node.target, ast.Name)
+        and node.target.id == name
+        for node in (scope.body if isinstance(scope, ast.Module) else ast.walk(scope))
+    )
+
+
+def _callee(call: ast.Call) -> str | None:
+    if isinstance(call.func, ast.Attribute):
+        return call.func.attr
+    return call.func.id if isinstance(call.func, ast.Name) else None
+
+
+def _product(parts: list[set[str]], node: ast.AST, glue: str = "") -> set[str]:
+    """Each text ``parts`` make, one of each in order, joined by ``glue``."""
+    out = {""}
+    for index, part in enumerate(parts):
+        out = {f"{before}{glue if index else ''}{text}" for before in out for text in part}
+        if len(out) > MOST_WAYS:
+            raise _Unreadable(node, f"a text that can be more than {MOST_WAYS} ways")
+    return out
+
+
+class _Reader:
+    """Every text a ``ui_fix`` in one module can say, read from its source (:meth:`texts`):
+    literals, f-strings, ``+``, ``.format``, ``%``, a separator's ``join``, a string's own
+    methods, the module's constants, the function's variables and comprehensions, and what the
+    module's own helpers return. Anything else cannot be read and fails; a placeholder that
+    cannot be traced is read as a program's name (:data:`PLACEHOLDER`)."""
+
+    def __init__(self, tree: ast.Module) -> None:
+        self.tree = tree
+        self.functions = {
+            node.name: node
+            for node in ast.walk(tree)
+            if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef)
+        }
+        self.spelt: list[tuple[int, str]] = []
+        self.reading: set[str] = set()
+        self.naming: set[tuple[int, str]] = set()
+
+    def texts(self, expr: ast.expr, scope: Scope, bound: dict[str, set[str]]) -> set[str]:
+        if isinstance(expr, ast.Constant):
+            if isinstance(expr.value, str):
+                return {expr.value}
+            if expr.value is None:
+                return set()
+            raise _Unreadable(expr, f"the constant {expr.value!r}")
+        if isinstance(expr, ast.JoinedStr):
+            parts: list[set[str]] = []
+            for part in expr.values:
+                if isinstance(part, ast.FormattedValue):
+                    parts.append(self.hole(part.value, scope, bound))
+                else:
+                    parts.append(self.texts(part, scope, bound))
+            return _product(parts, expr)
+        if isinstance(expr, ast.BinOp) and isinstance(expr.op, ast.Add):
+            return _product(
+                [self.texts(side, scope, bound) for side in (expr.left, expr.right)], expr
+            )
+        if isinstance(expr, ast.BinOp) and isinstance(expr.op, ast.Mod):
+            return self._percent(expr, scope, bound)
+        if isinstance(expr, ast.IfExp):
+            return self.texts(expr.body, scope, bound) | self.texts(expr.orelse, scope, bound)
+        if isinstance(expr, ast.BoolOp):
+            return set().union(*(self.texts(value, scope, bound) for value in expr.values))
+        if isinstance(expr, ast.Name):
+            key = (id(scope), expr.id)
+            if key in self.naming:
+                raise _Unreadable(expr, f"{expr.id}, which is made from itself")
+            self.naming.add(key)
+            try:
+                values = self._values(expr, scope, bound, text=True)
+                return set().union(*(self.texts(v, s, b) for v, s, b in values))
+            finally:
+                self.naming.discard(key)
+        if isinstance(expr, ast.Subscript):
+            return self._subscript(expr, scope, bound)
+        if isinstance(expr, ast.Call):
+            return self._call(expr, scope, bound)
+        raise _Unreadable(expr, ast.unparse(expr)[:60])
+
+    def hole(self, expr: ast.expr, scope: Scope, bound: dict[str, set[str]]) -> set[str]:
+        """What a placeholder says: its texts, or a program's name where they cannot be read."""
+        try:
+            return self.texts(expr, scope, bound) or {PLACEHOLDER}
+        except _Unreadable:
+            return {PLACEHOLDER}
+
+    def _values(
+        self, name: ast.Name, scope: Scope, bound: dict[str, set[str]], *, text: bool
+    ) -> list[tuple[ast.expr, Scope, dict[str, set[str]]]]:
+        """What ``name`` is set to, each with the scope to read it in: a comprehension's
+        binding, the function's own variables, else the module's constants. A ``text`` built
+        up with ``+=`` cannot be read; a list's ``+=`` adds its items."""
+        if name.id in bound:
+            return [(ast.Constant(text), scope, {}) for text in sorted(bound[name.id])]
+        for where, around in ((scope, scope), (self.tree, None)):
+            if where is None or not (values := _assigned(where, name.id, added=not text)):
+                if around is not None and name.id in {
+                    arg.arg
+                    for arg in (
+                        *around.args.posonlyargs,
+                        *around.args.args,
+                        *around.args.kwonlyargs,
+                    )
+                }:
+                    raise _Unreadable(name, f"{name.id}, a parameter of {around.name}")
+                continue
+            if text and _built_up(where, name.id):
+                raise _Unreadable(name, f"{name.id}, built up with +=")
+            return [(value, around, bound if around is not None else {}) for value in values]
+        raise _Unreadable(name, f"{name.id}, which this module does not set")
+
+    def _subscript(self, expr: ast.Subscript, scope: Scope, bound: dict[str, set[str]]) -> set[str]:
+        """A text's character or slice, at whole numbers written in place."""
+
+        def number(end: ast.expr | None) -> int | None:
+            if end is None:
+                return None
+            if isinstance(end, ast.Constant) and isinstance(end.value, int):
+                return end.value
+            raise _Unreadable(expr, ast.unparse(expr)[:60])
+
+        texts = self.texts(expr.value, scope, bound)
+        index = expr.slice
+        if isinstance(index, ast.Slice):
+            cut = slice(number(index.lower), number(index.upper), number(index.step))
+            return {text[cut] for text in texts}
+        at = number(index)
+        if at is None:
+            raise _Unreadable(expr, ast.unparse(expr)[:60])
+        return {text[at] for text in texts if -len(text) <= at < len(text)}
+
+    def _call(self, expr: ast.Call, scope: Scope, bound: dict[str, set[str]]) -> set[str]:
+        func, callee = expr.func, _callee(expr)
+        if callee in SPELLERS:
+            self.spelt.append((expr.lineno, f"calls {callee}()"))
+            return {PLACEHOLDER}
+        if isinstance(func, ast.Attribute) and callee == "format":
+            if any(kw.arg is None for kw in expr.keywords) or any(
+                isinstance(arg, ast.Starred) for arg in expr.args
+            ):
+                raise _Unreadable(expr, "a .format given * or ** arguments")
+            holes = [self.hole(arg, scope, bound) for arg in expr.args]
+            named = {kw.arg: self.hole(kw.value, scope, bound) for kw in expr.keywords if kw.arg}
+            return set().union(
+                *(
+                    self._format(text, holes, named, expr)
+                    for text in self.texts(func.value, scope, bound)
+                )
+            )
+        if isinstance(func, ast.Attribute) and callee == "join" and len(expr.args) == 1:
+            items = self._items(expr.args[0], scope, bound)
+            return set().union(
+                *(_product(items, expr, glue) for glue in self.texts(func.value, scope, bound))
+            )
+        if isinstance(func, ast.Attribute) and callee in TEXT_METHODS and not expr.args:
+            act = TEXT_METHODS[callee]
+            return {act(text) for text in self.texts(func.value, scope, bound)}
+        if isinstance(func, ast.Name) and callee in self.functions:
+            if callee in self.reading:
+                raise _Unreadable(expr, f"{callee}, which calls itself")
+            helper = self.functions[callee]
+            self.reading.add(callee)
+            try:
+                returns = [
+                    node.value
+                    for node in ast.walk(helper)
+                    if isinstance(node, ast.Return) and node.value is not None
+                ]
+                return set().union(*(self.texts(value, helper, {}) for value in returns))
+            finally:
+                self.reading.discard(callee)
+        raise _Unreadable(expr, f"a call to {ast.unparse(func)[:50]}")
+
+    def _items(self, expr: ast.expr, scope: Scope, bound: dict[str, set[str]]) -> list[set[str]]:
+        """The texts of each item ``expr`` holds, for a ``join``: a literal list, tuple or set
+        (a starred part spliced in, both of a conditional's), a comprehension (its names bound
+        to what it walks), ``sorted``/``list``/``tuple`` of one, and a variable's every
+        assignment, ``append``, ``extend`` and ``insert``."""
+        if isinstance(expr, ast.List | ast.Tuple | ast.Set):
+            items: list[set[str]] = []
+            for element in expr.elts:
+                if isinstance(element, ast.Starred):
+                    items += self._items(element.value, scope, bound)
+                else:
+                    items.append(self.texts(element, scope, bound))
+            return items
+        if isinstance(expr, ast.IfExp):
+            return self._items(expr.body, scope, bound) + self._items(expr.orelse, scope, bound)
+        if isinstance(expr, ast.ListComp | ast.GeneratorExp | ast.SetComp):
+            binding = dict(bound)
+            for walk in expr.generators:
+                if not isinstance(walk.target, ast.Name):
+                    raise _Unreadable(walk.target, "a comprehension that unpacks")
+                binding[walk.target.id] = set().union(*self._items(walk.iter, scope, binding))
+            return [self.texts(expr.elt, scope, binding)]
+        if (
+            isinstance(expr, ast.Call)
+            and isinstance(expr.func, ast.Name)
+            and expr.func.id in ("sorted", "list", "tuple")
+            and len(expr.args) == 1
+        ):
+            return self._items(expr.args[0], scope, bound)
+        if isinstance(expr, ast.Name):
+            items = []
+            for value, where, binding in self._values(expr, scope, bound, text=False):
+                items += self._items(value, where, binding)
+            for node in ast.walk(scope if scope is not None else self.tree):
+                if (
+                    isinstance(node, ast.Call)
+                    and isinstance(node.func, ast.Attribute)
+                    and isinstance(node.func.value, ast.Name)
+                    and node.func.value.id == expr.id
+                    and node.func.attr in ("append", "extend", "insert")
+                    and node.args
+                ):
+                    added = node.args[-1]
+                    if node.func.attr == "extend":
+                        items += self._items(added, scope, bound)
+                    else:
+                        items.append(self.texts(added, scope, bound))
+            return items
+        raise _Unreadable(expr, f"the items of {ast.unparse(expr)[:50]}")
+
+    def _percent(self, expr: ast.BinOp, scope: Scope, bound: dict[str, set[str]]) -> set[str]:
+        """``template % args``: each conversion is the argument it takes, as a placeholder."""
+        args = expr.right
+        named: dict[str, set[str]] = {}
+        holes: list[set[str]] = []
+        if isinstance(args, ast.Dict):
+            for key, value in zip(args.keys, args.values, strict=True):
+                if not (isinstance(key, ast.Constant) and isinstance(key.value, str)):
+                    raise _Unreadable(args, "a % mapping whose keys are not plain words")
+                named[key.value] = self.hole(value, scope, bound)
+        else:
+            elements = args.elts if isinstance(args, ast.Tuple) else [args]
+            holes = [self.hole(element, scope, bound) for element in elements]
+        out: set[str] = set()
+        for template in self.texts(expr.left, scope, bound):
+            parts: list[set[str]] = []
+            at, taken = 0, 0
+            for spec in _PERCENT.finditer(template):
+                parts.append({template[at : spec.start()]})
+                if spec.group(2) == "%":
+                    parts.append({"%"})
+                elif spec.group(1) is not None:
+                    parts.append(named.get(spec.group(1), {PLACEHOLDER}))
+                else:
+                    parts.append(holes[taken] if taken < len(holes) else {PLACEHOLDER})
+                    taken += 1
+                at = spec.end()
+            parts.append({template[at:]})
+            out |= _product(parts, expr)
+        return out
+
+    def _format(
+        self, template: str, holes: list[set[str]], named: dict[str, set[str]], node: ast.AST
+    ) -> set[str]:
+        """``template.format(…)``: each field is the argument it names, as a placeholder."""
+        parts: list[set[str]] = []
+        taken = 0
+        try:
+            fields = list(string.Formatter().parse(template))
+        except ValueError as exc:
+            raise _Unreadable(node, f"the .format template {template[:40]!r} ({exc})") from exc
+        for literal, field, _spec, _conversion in fields:
+            parts.append({literal})
+            if field is None:
+                continue
+            key = re.split(r"[.\[]", field, maxsplit=1)[0]
+            whole = key == field  # not one of its attributes or items
+            if key == "":
+                key, taken = str(taken), taken + 1
+            if key.isdigit():
+                hole = holes[int(key)] if int(key) < len(holes) else {PLACEHOLDER}
+            else:
+                hole = named.get(key, {PLACEHOLDER})
+            parts.append(hole if whole else {PLACEHOLDER})
+        return _product(parts, node)
+
+
+def _ui_fix_findings(tree: ast.Module) -> list[tuple[int, str]]:
+    """(line, why) for each ``ui_fix`` in ``tree`` that names a command or cannot be read
+    (:class:`_Reader`). A function's keyword-only ``ui_fix`` handed on as a ``ui_fix`` (the
+    doctor's ``_warn`` and ``_fail``) is read where each caller sets it, by name."""
+    reader = _Reader(tree)
+    found: set[tuple[int, str]] = set()
+    for value, scope in _ui_fix_sites(tree):
+        if (
+            isinstance(value, ast.Name)
+            and value.id == "ui_fix"
+            and scope is not None
+            and "ui_fix" in {arg.arg for arg in scope.args.kwonlyargs}
+            and not _assigned(scope, "ui_fix")
+        ):
+            continue
+        try:
+            texts = reader.texts(value, scope, {})
+        except _Unreadable as exc:
+            found.add((exc.line, str(exc)))
+            continue
+        for text in texts:
+            if match := GUARD.search(text):
+                found.add((value.lineno, f"{match.group(0)!r} in {text[:70]!r}"))
+    return sorted(found | set(reader.spelt))
+
+
+def test_no_ui_fix_the_source_can_build_names_a_command() -> None:
+    """Tester #4105: the doctor rows a sandbox makes set no ``ui_fix``, so none was read. What
+    asq says under a row (``ui_way``) is its ``ui_fix`` as it is: each is read from the source,
+    in every module that sets one, and one it cannot read fails (reviewer #4214)."""
+    found = []
+    for path in sorted(SRC.rglob("*.py")):
+        text = path.read_text(encoding="utf-8")
+        if "ui_fix" in text:
+            rel = path.relative_to(SRC).as_posix()
+            found += [f"{rel}:{line}: {why}" for line, why in _ui_fix_findings(ast.parse(text))]
+    assert found == []
+
+
+_ROW = 'row = _warn("x", "d", "f", ui_fix={})\n'
+
+UI_FIX_SHAPES: dict[str, tuple[str, str]] = {
+    "a literal": (_ROW.format('"Run rlx tidy"'), "'rlx tidy'"),
+    "an f-string": (_ROW.format('f"Run {what}, or rlx tidy"'), "'rlx tidy'"),
+    "a constant": ('WAY = "rlx tidy"\n' + _ROW.format("WAY"), "'rlx tidy'"),
+    "a variable": (
+        "def check():\n    way = 'Run rlx tidy'\n    return "
+        + _ROW.format("way").split("= ", 1)[1],
+        "'rlx tidy'",
+    ),
+    "a helper": (
+        "def _way(n):\n    if n:\n        return 'Run rlx tidy'\n    return 'Wait'\n"
+        + _ROW.format('"; ".join([_way(1)])'),
+        "'rlx tidy'",
+    ),
+    "an update": ('row = old.model_copy(update={"ui_fix": "rlx tidy"})\n', "'rlx tidy'"),
+    "an assignment": ('row.ui_fix = "rlx tidy"\n', "'rlx tidy'"),
+    "a speller": (_ROW.format('f"{prog.word()} tidy"'), "calls word()"),
+    # Reviewer #4214's ten ways past the first sweep, each read or failed now:
+    "a constant's placeholder": (
+        'PRODUCT = "rlx"\n' + _ROW.format('f"{PRODUCT} tidy frees it"'),
+        "'rlx tidy'",
+    ),
+    "an imported placeholder": (
+        "from aisquare.core.program import PRODUCT\n" + _ROW.format('f"{PRODUCT} tidy"'),
+        "'rlx tidy'",
+    ),
+    "an attribute's placeholder": (_ROW.format('f"{prog.NAME} tidy"'), "'rlx tidy'"),
+    "a '+'": (_ROW.format('"Run rlx " + "tidy"'), "'rlx tidy'"),
+    "a .format": (_ROW.format('"Run {} {how}".format(PRODUCT, how="tidy")'), "'rlx tidy'"),
+    "a %": (_ROW.format('"Run %s tidy" % (PRODUCT,)'), "'rlx tidy'"),
+    "an imported constant": (
+        "from aisquare.services.ways import TIDY\n" + _ROW.format("TIDY"),
+        "cannot read TIDY",
+    ),
+    "an attribute": (_ROW.format("ways.TIDY"), "cannot read ways.TIDY"),
+    "another module's helper": (_ROW.format("ways.tidy_way()"), "cannot read a call to"),
+    "a helper's parameter": (
+        "def _row(way):\n    return " + _ROW.format("way").split("= ", 1)[1],
+        "cannot read way, a parameter of _row",
+    ),
+    "a setattr": ('setattr(row, "ui_fix", "Run rlx tidy")\n', "'rlx tidy'"),
+    "a list built up": (
+        "def check():\n    parts = []\n    parts.append('rlx tidy')\n    return "
+        + _ROW.format('"; ".join(parts)').split("= ", 1)[1],
+        "'rlx tidy'",
+    ),
+    "a text built up": (
+        "def check():\n    way = 'rlx '\n    way += 'tidy'\n    return "
+        + _ROW.format("way").split("= ", 1)[1],
+        "cannot read way, built up with +=",
+    ),
+    "another parameter handed on": (
+        "def _row(name, *, ui_fix=None, way=None):\n"
+        "    return DoctorCheck(name=name, ui_fix=way)\n",
+        "cannot read way, a parameter of _row",
+    ),
+    "a positional pass-through": (
+        "def _warn(name, ui_fix=None):\n    return DoctorCheck(name=name, ui_fix=ui_fix)\n",
+        "cannot read ui_fix, a parameter of _warn",
+    ),
+}
+"""shape → (a module that sets a ``ui_fix`` so, what the sweep says of it)."""
+
+
+@pytest.mark.parametrize("shape", sorted(UI_FIX_SHAPES))
+def test_the_ui_fix_sweep_fails_each_way_a_command_could_hide(shape: str) -> None:
+    source, said = UI_FIX_SHAPES[shape]
+    found = _ui_fix_findings(ast.parse(source))
+    assert any(said in why for _, why in found), found
+
+
+UI_FIX_PLAIN: dict[str, str] = {
+    "words": _ROW.format('"Restart it on its row"'),
+    "an f-string of a page": (
+        'PAGE = "https://example.com/tmux"\n'
+        + _ROW.format('f"Install tmux as {PAGE} says, as {label} does"')
+    ),
+    "an attribute's placeholder": _ROW.format('f"Install it as {adapter.install_page} says"'),
+    "a '+', a .format and a %": _ROW.format(
+        '"Restart " + "it" + " {} {how}".format(1, how="now") + " %s%%" % (name,)'
+    ),
+    "a join of a comprehension and a helper": (
+        "def _way(every):\n"
+        "    if every == 60:\n"
+        "        within = 'within the hour'\n"
+        "    else:\n"
+        "        within = f'within {every:g} minutes'\n"
+        "    return f'rlx frees it by itself {within}'\n"
+        "def check(named, to_free):\n"
+        "    unread = [f'make {named} readable'] if named else []\n"
+        "    return "
+        + _ROW.format(
+            '"; ".join([*(f"{w[0].upper()}{w[1:]}" for w in unread), '
+            "*([_way(60)] if to_free else [])])"
+        ).split("= ", 1)[1]
+    ),
+    "a keyword-only pass-through": (
+        "def _warn(name, *, ui_fix=None):\n    return DoctorCheck(name=name, ui_fix=ui_fix)\n"
+    ),
+    "none": _ROW.format("None"),
+}
+"""shape → a module whose ``ui_fix`` names no command, built each way the sweep can read."""
+
+
+@pytest.mark.parametrize("shape", sorted(UI_FIX_PLAIN))
+def test_the_ui_fix_sweep_passes_plain_words_however_built(shape: str) -> None:
+    assert _ui_fix_findings(ast.parse(UI_FIX_PLAIN[shape])) == []
+
+
+@pytest.mark.parametrize(
+    ("watching", "every", "deletes"),
+    [(True, 60, True), (True, 15, True), (False, 60, True), (True, 0, True), (True, 60, False)],
+)
+def test_the_disk_row_s_asq_wording_names_no_command(
+    monkeypatch: pytest.MonkeyPatch, watching: bool, every: float, deletes: bool
+) -> None:
+    """#60, manager #3817: the ``disk`` row's in-app way, with GBs to free and a folder it
+    cannot read, in every state: the watcher frees it, isn't running, the job is off, native
+    Windows only reports. Never a shell or a command; the shell's fix keeps ``tidy``, which the
+    sweep's pattern knows."""
+    from aisquare.core.config import load_config, save_config
+    from aisquare.services import diagnostics, tidy
+    from aisquare.services import watch as watch_service
+
+    use = tidy.DiskUse(
+        worktrees=20 * 10**9,
+        build_caches=6 * 10**9,
+        session_temp=8 * 10**9,
+        use_whole=False,
+        would_free=3 * 10**9,
+        free_whole=False,
+        unreadable=(Path("/nowhere/.aisquare-worktrees"),),
+    )
+    monkeypatch.setattr(tidy, "disk_use", lambda **kwargs: use)
+    monkeypatch.setattr(tidy, "DELETES", deletes)
+    monkeypatch.setattr(
+        watch_service, "watch_status", lambda: watch_service.Status(1 if watching else None, None)
+    )
+    config = load_config()
+    config.tidy.every_minutes = every
+    save_config(config)
+
+    rows = [row for row in diagnostics.doctor() if row.name == "disk"]
+
+    assert [row.status for row in rows] == [CheckStatus.warn]
+    [row] = rows
+    assert row.ui_fix and not GUARD.search(row.ui_fix), row.ui_fix
+    assert not GUARD.search(row.detail), row.detail
+    said = ui_way(row, {})
+    assert said == row.ui_fix and not GUARD.search(said), said
+    assert row.fix and GUARD.search(row.fix), "the shell's fix names its command"
+    assert COMMAND.search(row.fix), "the Doctor's own pattern knows it, so asq never says it"

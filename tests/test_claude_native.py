@@ -623,11 +623,21 @@ def native_options() -> dict[str, Any]:
 
 @pytest.fixture
 def native(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, native_options: dict[str, Any]
+    keychain_fake_for_children: Any,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    native_options: dict[str, Any],
 ) -> Iterator[Native]:
     """A project with the team on, under a home and a Claude Code config dir of their own,
     both removed after, Claude Code on the loopback stub, and a tmux server killed after
-    however far the test got (review r4 of #113, finding 15)."""
+    however far the test got (review r4 of #113, finding 15).
+
+    rlx's own children (the fleet's ``aisquare launch`` in a pane, ``accounts run``) read
+    the Keychain through the suite's fake ``security`` (``keychain_fake_for_children``, set
+    before the tmux server starts, so its panes inherit it), never the real one: on CI's
+    macOS runner the uninstall test's child read ``Claude Code-credentials-<slot>`` and the
+    suite's guard refused it (#52). The real Claude Code this drives is not Python and is
+    untouched: it runs on the loopback stub through each slot's ``settings.json``."""
     binary = installed_claude()
     path = os.environ.get("PATH", "")
     # Ahead of the stand-in, so the fleet's window starts the real one.

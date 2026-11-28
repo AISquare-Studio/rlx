@@ -70,6 +70,22 @@ app = typer.Typer(
 )
 
 
+@app.callback()
+def remote_switch_holds() -> None:
+    """Remote is experimental (#46): while it is off, every subcommand exits 2 with one line
+    saying how to turn it on (``core.experimental.remote_off``), as the captain's do, so no
+    server starts behind the switch. Help still prints."""
+    from aisquare.core import experimental
+
+    if not experimental.remote_enabled():
+        fail(
+            experimental.remote_off(),
+            error="remote_off",
+            hint=experimental.remote_off(),
+            exit_code=2,
+        )
+
+
 def _fail_if_missing() -> None:
     from aisquare.services import remote_server
 
@@ -303,7 +319,7 @@ def install_page(
         typer.Argument(help="Built aisquare-remote dist/ directory (must contain index.html)."),
     ],
 ) -> None:
-    """Copy a built ``aisquare-remote`` page into ``~/.aisquare/remote-dist`` (atomic replace).
+    """Copy a built ``aisquare-remote`` page into ``~/.rlx/remote/dist`` (atomic replace).
 
     A page installed here overrides the one bundled with aisquare-cli, for the
     Remote modal (``R``) and ``rlx remote serve`` alike.
@@ -333,7 +349,7 @@ def install_page(
 @app.command("status")
 def status_command(port: LinkPort = DEFAULT_PORT) -> None:
     """Whether Remote is on, the link, the password, the devices and failed unlocks, from
-    ~/.aisquare/remote.json."""
+    ~/.rlx/remote/remote.json."""
     from aisquare.services import remote_server
 
     state = _remote_runtime()

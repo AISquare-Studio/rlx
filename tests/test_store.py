@@ -5491,3 +5491,21 @@ def test_fleet_manager_board_is_the_newest_manager_rows_a_live_one_first() -> No
         assert store.fleet_manager_board(PROJECT.id) == "prj_hub", "the newest, stopped"
         store.upsert_fleet_agent(row(0, "manager", "prj_m"))
         assert store.fleet_manager_board(PROJECT.id) == "prj_m", "a live one first"
+
+
+def test_a_cursor_page_keeps_only_the_kinds_asked_for_before_its_limit(
+    store: ContextStore,
+) -> None:
+    """``events_since(include_kinds=…)`` (#41): asked IN the query, so a page of other kinds
+    hides nothing behind it; a scheduled manager's question behind its results is found."""
+    now = datetime.now(tz=UTC)
+    _board(
+        store,
+        PROJECT.id,
+        *(("result", "ses_1", now) for _ in range(5)),
+        ("question", "ses_1", now),
+        ("limited", "ses_2", now),
+    )
+    page = store.events_since(PROJECT.id, 0, include_kinds=("question", "limited"), limit=2)
+    assert [event.kind for event in page] == ["question", "limited"]
+    assert [e.kind for e in store.events_since(PROJECT.id, 0, limit=2)] == ["result", "result"]

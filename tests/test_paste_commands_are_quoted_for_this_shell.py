@@ -36,6 +36,7 @@ SRC = Path(__file__).resolve().parents[1] / "src" / "aisquare"
 SHLEX_KEPT: dict[tuple[str, str], tuple[int, str]] = {
     ("core/shell_line.py", "command_line"): (1, "it is the quoting: shlex.join off Windows"),
     ("core/agents.py", "_quote"): (1, "its POSIX branch; Windows has its own"),
+    ("services/tray.py", "command_script"): (2, "a /bin/sh file macOS opens: never Windows's"),
     ("services/remote_server.py", "_remote_shell_word"): (1, "its POSIX branch; Windows its own"),
     ("services/remote_server.py", "_page_open_refusal"): (2, "chmod, which only POSIX has"),
     ("services/remote_server.py", "_page_open_to_others"): (1, "chmod, which only POSIX has"),

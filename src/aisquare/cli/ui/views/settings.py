@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import contextlib
 from collections.abc import Sequence
+from typing import ClassVar
 
 from rich.text import Text
 from textual import on
@@ -38,6 +39,13 @@ from textual.widgets import Button, Input, Label, Static
 from textual.worker import Worker, WorkerState
 
 from aisquare.cli.ui.fresh import StartFresh
+from aisquare.cli.ui.save_model import (
+    UNDO_BINDING,
+    UNDO_SAID,
+    Change,
+    CommitInput,
+    SavesAsYouGo,
+)
 from aisquare.cli.ui.sidebar import ProjectRenamed
 from aisquare.cli.ui.views.fleet_bulk import BulkAsked, applicable
 from aisquare.models import FleetAgentStatus, ProjectInfo
@@ -64,9 +72,12 @@ def fleet_id_line(project: ProjectInfo) -> Text:
     )
 
 
-class SettingsView(VerticalScroll):
+class SettingsView(SavesAsYouGo, VerticalScroll):
     """One project's own settings: its nickname and its codename shown. How to attach to its
-    tmux session from a terminal is the shell's (``fleet attach``): asq names no command (R13)."""
+    tmux session from a terminal is the shell's (``fleet attach``): asq names no command (R13).
+
+    The nickname is kept as settings are (``cli.ui.save_model``, M5): on Enter or on leaving
+    the field, refused in a line under it, and taken back by ctrl+z."""
 
     DEFAULT_CSS = """
     SettingsView { padding: 1 2; }
@@ -83,10 +94,15 @@ class SettingsView(VerticalScroll):
     }
     SettingsView #settings-note { color: $text-muted; margin-top: 1; height: auto; }
     """
+    BINDINGS: ClassVar = [UNDO_BINDING]
 
     def __init__(self, project: ProjectInfo, *, id: str | None = None) -> None:
         super().__init__(id=id)
         self.project = project
+        self._undoing = False
+        """The rename running is Undo's: it takes a change back rather than keeping a new one."""
+        self._nickname_worker: Worker[object] | None = None
+        """The latest rename asked: only its report is heard (:meth:`_nickname_saved`)."""
         self.agents: list[FleetAgentStatus] | None = None
         """The project's agent rows as the shell's last frame listed them; ``None`` before
         the first."""
@@ -121,7 +137,15 @@ class SettingsView(VerticalScroll):
             line = self.query_one("#fleet-id", Static)
         except NoMatches:  # not composed yet: compose reads self.project
             return
-        if field.value.strip() == before:
+        if isinstance(field, CommitInput):
+            # The stored name, kept whatever the field shows: what is being typed is the
+            # operator's, and leaving the field keeps it. Typing is a field showing other than
+            # what it last kept: the tab's project may already hold Undo's target (#56).
+            if field.value.strip() != field.kept.strip():
+                field.kept = project.nickname or ""
+            else:
+                field.keep(project.nickname or "")
+        elif field.value.strip() == before:
             field.value = project.nickname or ""
         field.placeholder = project.root.name or project.id
         title.update(self._title())
@@ -136,13 +160,12 @@ class SettingsView(VerticalScroll):
         yield Static(self._title(), id="settings-title")
         with Horizontal(classes="row"):
             yield Label("nickname")
-            yield Input(
+            yield CommitInput(
                 value=self.project.nickname or "",
                 placeholder=self.project.root.name or self.project.id,
                 max_length=project_service.NICKNAME_MAX,
                 id="nickname",
             )
-            yield Button("Save", id="save-nickname", variant="primary")
         yield Static(fleet_id_line(self.project), id="fleet-id")
         can = applicable(self.agents, fleet_paused=self.fleet_paused)
         with Horizontal(classes="row", id="pause-row"):
@@ -200,28 +223,53 @@ class SettingsView(VerticalScroll):
 
     # --- the nickname --------------------------------------------------------------------
 
-    @on(Input.Submitted, "#nickname")
-    @on(Button.Pressed, "#save-nickname")
-    def _save_nickname(self) -> None:
-        """Write the field as the nickname, off the UI thread; blank clears it.
+    @on(CommitInput.Committed, "#nickname")
+    def _nickname_committed(self, event: CommitInput.Committed) -> None:
+        """Enter, or leaving the field with a new value: keep it (M5)."""
+        event.stop()
+        self._save_nickname(event.value.strip())
+
+    def on_mount(self) -> None:
+        # The nickname's writer as the page goes (M5): set here, not in compose (see
+        # AppSettingsView.on_mount).
+        self.query_one("#nickname", CommitInput).leaving = self._settings_keep_left_nickname
+
+    def _settings_keep_left_nickname(self, field: CommitInput) -> None:
+        """rlx quitting with a nickname typed and not left: written now, on this thread, showing
+        nothing (``CommitInput.leaving``). A name the store refuses is not written."""
+        # Anything: a traceback as rlx exits says nothing to anyone (reviewer of #24; the
+        # service raises KeyError for a project gone, as the token's writer suppresses all).
+        with contextlib.suppress(Exception):
+            fleet_service.rename_project(
+                self.project, field.value.strip() or None, notes=[], follow_unchanged=False
+            )
+
+    def _save_nickname(self, wanted: str, *, undoing: bool = False) -> None:
+        """Write ``wanted`` as the nickname, off the UI thread; blank clears it; ``undoing``:
+        Undo's, which keeps no new change.
 
         Always written, never compared with the tab's copy of the project first: a
         rename made elsewhere may not have reached it, and writing the same name
         again changes nothing.
-        """
-        wanted = self.query_one("#nickname", Input).value.strip()
-        project = self.project
 
-        def rename() -> tuple[ProjectInfo, list[str], bool]:
+        The project as the tab has it NOW, as the save is asked, goes back with the result:
+        what its Undo puts back and the codename it replaces. Read when the worker reports, a
+        frame landing between the store's write and the report (``show_project``) already
+        held the new name, and the one Undo wrote that again (reviewer of #53, #3320).
+        """
+        project = self.project
+        self._undoing = undoing  # this save's, the latest: an earlier one is not heard
+
+        def rename() -> tuple[ProjectInfo, list[str], bool, ProjectInfo]:
             notes: list[str] = []
             before = project.codename
             renamed = fleet_service.rename_project(
                 project, wanted or None, notes=notes, follow_unchanged=False
             )
             works = bool(before) and fleet_service.old_codename_works(renamed.id, before or "")
-            return renamed, notes, works
+            return renamed, notes, works, project
 
-        self.run_worker(
+        self._nickname_worker = self.run_worker(
             rename,
             name=NICKNAME_WORKER,
             group=NICKNAME_WORKER,
@@ -230,12 +278,37 @@ class SettingsView(VerticalScroll):
             exit_on_error=False,
         )
 
+    def _undo_rename(self, folder: str, previous: str) -> Change:
+        """How ctrl+z takes this rename back: the name it replaced, written again."""
+
+        def undo() -> None:
+            # The tab's project takes the name Undo is writing, as it asks: a name asked before
+            # Undo's report is heard snapshots it (``_save_nickname``), and its own Undo goes
+            # back to it, not to the name just taken back (tester of #53, m3; #56). A frame
+            # from the store puts the project right if Undo's save fails.
+            self.project = self.project.model_copy(update={"nickname": previous or None})
+            self._save_nickname(previous, undoing=True)
+
+        return Change(f"{folder}'s nickname", undo)
+
     @on(Worker.StateChanged)
     def _nickname_saved(self, event: Worker.StateChanged) -> None:
         if event.worker.name != NICKNAME_WORKER:
             return
+        if event.worker is not self._nickname_worker:
+            # A save another one asked after it: heard, it recorded a second Undo back to the
+            # same name and kept its value over the one typed since (reviewer of #53, #3354).
+            # Its newer one answers the field and records the one change. As exclusive=True
+            # cancels one still running, this is one that finished first, its report queued.
+            return
         if event.state is WorkerState.ERROR:
             error = event.worker.error
+            undoing, self._undoing = self._undoing, False
+            if isinstance(error, ValueError) and not undoing:
+                # Refused beside the field, which keeps what was typed to correct (M5).
+                self.refuse(self.query_one("#nickname"), f"not saved: {error}")
+                return
+            self.query_one("#nickname", CommitInput).release()  # to try again (#53)
             if isinstance(error, KeyError):
                 reason = "the project is no longer registered"
             elif isinstance(error, ValueError):
@@ -251,12 +324,15 @@ class SettingsView(VerticalScroll):
         result = event.worker.result
         if not isinstance(result, tuple):
             return
-        updated, notes, _old_works = result
-        if not isinstance(updated, ProjectInfo):
+        updated, notes, _old_works, asked_of = result
+        if not isinstance(updated, ProjectInfo) or not isinstance(asked_of, ProjectInfo):
             return
-        before = self.project.codename
+        before = asked_of.codename  # as the save was asked: see _save_nickname
+        previous = asked_of.nickname or ""
         self.project = updated
-        self.query_one("#nickname", Input).value = updated.nickname or ""
+        field = self.query_one("#nickname", CommitInput)
+        field.keep(updated.nickname or "", over_typing=self._undoing)  # Undo wins (#3597)
+        self.accept(field)
         self.query_one("#settings-title", Static).update(self._title())
         self.query_one("#fleet-id", Static).update(fleet_id_line(updated))
         folder = updated.root.name or updated.id
@@ -268,7 +344,12 @@ class SettingsView(VerticalScroll):
             said += f" · fleet codename {updated.codename}"
             if before and before != updated.codename:
                 said += f" (was {before})"  # the `--project` spellings are the shell's (R13)
-        self.notify(said, timeout=6, markup=False)
+        if self._undoing:
+            self._undoing = False
+            self.notify(said, timeout=6, markup=False)
+        else:
+            self.changes.append(self._undo_rename(folder, previous))
+            self.notify(f"{said} · Undo: {UNDO_SAID}", timeout=6, markup=False)
         for note in notes:
             self.notify(note, severity="warning", timeout=10, markup=False)
         self.post_message(ProjectRenamed(updated))

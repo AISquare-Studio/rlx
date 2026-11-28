@@ -812,12 +812,13 @@ class TestEnvFiles:
             )  # bytes: text mode would read a CR in the value as a newline
             # The line runs `aisquare launch` (#113), whose banner names what it starts, and
             # which says the role's tool policy is withheld for a binary no agent's name runs
-            # (P1 WS-1): any other line on stderr (a `cat:`) is one this test refuses.
+            # (P1 WS-1) and, with this test's long home, that it keeps the inherited TMPDIR
+            # (#57): any other line on stderr (a `cat:`) is one this test refuses.
             said = done.stderr.decode().splitlines(keepends=True)
             err = "".join(
                 line
                 for line in said
-                if not line.startswith("Launching ") and " withheld: " not in line
+                if not line.startswith(("Launching ", "agent temp: ")) and " withheld: " not in line
             )
             return done.returncode, done.stdout.decode(), err
 

@@ -638,14 +638,20 @@ def test_an_aisquare_whose_version_fails_is_broken_not_absent(tmp_path: Path, bo
         path=f"{cli}:{base_path(tmp_path)}",
     )
     assert "ACTION=repair" in result.stdout, result.stdout + result.stderr
-    assert "aisquare — broken: `aisquare --version` fails" in result.stdout, result.stdout
+    # The product is rlx (0.10.1's rebrand); the command that failed is named as it ran.
+    assert "rlx — broken: `aisquare --version` fails" in result.stdout, result.stdout
+    assert "aisquare — broken" not in result.stdout, result.stdout
+
+
+#: The PyPI package as this OS installs it: with the tray's extra on macOS and Linux (#34).
+_PKG = "aisquare-cli[tray]" if sys.platform in ("darwin", "linux") else "aisquare-cli"
 
 
 @pytest.mark.parametrize(
     ("pin", "package", "spec"),
     [
-        ("", None, "aisquare-cli@latest"),
-        ("0.10.0", None, "aisquare-cli@0.10.0"),
+        ("", None, f"{_PKG}@latest"),
+        ("0.10.0", None, f"{_PKG}@0.10.0"),
         ("", "/w/aisquare.whl", "/w/aisquare.whl"),
     ],
     ids=["latest", "pinned", "local-build"],
@@ -664,8 +670,28 @@ def test_a_broken_install_is_reinstalled_with_force_as_an_upgrade_is(
     assert f"would run: uv tool install --force --python 3.13 --with tiktoken {spec}\n" in out, out
 
 
-_FRESH = "uv tool install --python 3.13 --with tiktoken aisquare-cli"
-_UP = "uv tool install --force --python 3.13 --with tiktoken aisquare-cli@0.10.0"
+_FRESH = f"uv tool install --python 3.13 --with tiktoken {_PKG}"
+_UP = f"uv tool install --force --python 3.13 --with tiktoken {_PKG}@0.10.0"
+
+
+@pytest.mark.parametrize(
+    ("os_name", "wsl", "package"),
+    [
+        ("macos", "0", "aisquare-cli[tray]"),
+        ("linux", "0", "aisquare-cli[tray]"),
+        ("linux", "1", "aisquare-cli"),
+        ("windows", "0", "aisquare-cli"),
+        ("bsd", "0", "aisquare-cli"),
+    ],
+    ids=["macos", "linux", "wsl", "windows", "bsd"],
+)
+def test_the_tray_extra_is_installed_where_there_is_a_tray(
+    os_name: str, wsl: str, package: str
+) -> None:
+    """#34: the rlx service's tray icon needs the `tray` extra, which the script installs on
+    macOS and on Linux outside WSL, and nowhere else (no tray there in 0.10.2)."""
+    result = sh(f'OS={os_name}; IS_WSL={wsl}; printf "%s" "$(cli_package)"')
+    assert result.stdout == package, result.stdout + result.stderr
 
 
 @pytest.mark.parametrize(
@@ -872,15 +898,16 @@ def test_dry_run_still_reports_what_it_would_do(tmp_path: Path) -> None:
     """A dry run that printed nothing useful would be worse than none."""
     cli = stub_dir(tmp_path, "cli", "aisquare", body='printf "aisquare 0.1.0\\n"')
     curl = stub_dir(tmp_path, "bin", "curl")
+    (tmp_path / "user").mkdir()
     result = sh(
         "main --dry-run --yes --no-project --offline --no-agent --no-system-deps",
         # The suite's own home is in AISQUARE_HOME, and the banner names the home this
         # run resolves; the default is the one asserted here.
-        env={"AISQUARE_HOME": ""},
+        env={"AISQUARE_HOME": "", "HOME": str(tmp_path / "user")},
         path=f"{cli}:{curl}:{base_path(tmp_path)}",
     )
     assert "rlx installer" in result.stdout
-    assert "~/.aisquare/" in result.stdout, "the banner must list what gets written (§3.7)"
+    assert "~/.rlx/" in result.stdout, "the banner must list what gets written (§3.7)"
     assert "nothing above was actually run" in result.stdout
 
 
@@ -1805,6 +1832,30 @@ def test_a_row_name_with_spaces_is_one_row(tmp_path: Path) -> None:
     assert "  manager board context\n  python\n" in result.stdout, result.stdout
     assert "  manager\n" not in result.stdout and "  board\n" not in result.stdout
     assert result.returncode == 2
+
+
+@pytest.mark.parametrize(
+    ("foreign", "word"), [(False, "rlx"), (True, "aisquare")], ids=["ours", "another-programs"]
+)
+def test_the_doctor_step_names_rlx_as_the_rest_of_the_output_does(
+    tmp_path: Path, foreign: bool, word: str
+) -> None:
+    """The production end-to-end test (board task #177): a new user's first screen named the
+    doctor step by the old word, aisquare, while the rest said rlx ("rlx doctor here says",
+    "Open rlx with: rlx"). The step names the word every other line does (``program_word``):
+    rlx, or aisquare where another program's rlx comes first on PATH."""
+    cli = stub_dir(
+        tmp_path,
+        "cli",
+        "aisquare",
+        body=f"case \"$1\" in --json) printf '%s' '{_SPACED_ROWS}' ;; esac\nexit 0",
+    )
+    dirs = [stub_dir(tmp_path, "other-bin", "rlx")] if foreign else []
+    path = ":".join([*map(str, dirs), str(cli), base_path(tmp_path)])
+    ran = sh("DRY_RUN=0; run_doctor", path=path)
+    assert f"Verifying with {word} doctor" in ran.stdout, ran.stdout + ran.stderr
+    if not foreign:
+        assert "aisquare doctor" not in ran.stdout, ran.stdout
 
 
 def test_exit_2_is_documented_for_an_extra_that_did_not_install(tmp_path: Path) -> None:
@@ -3677,15 +3728,18 @@ def test_the_banner_lists_only_what_the_run_writes(
             "CLAUDE_ACTION=update; CLAUDE_VERSION=2.1.294"
         ),
     }[machine]
+    (tmp_path / "user").mkdir()
     result = sh(
         f"WANT_AGENT={want_agent}; WANT_PROJECT=1; PROJECT_DIR=/p; {decided}; banner",
-        env={"AISQUARE_HOME": ""},  # the default home, not the suite's (see below)
+        # The default home, not the suite's (see below), in a user home of the test's own: the
+        # developer's may hold a ~/.aisquare, which the banner would name.
+        env={"AISQUARE_HOME": "", "HOME": str(tmp_path / "user")},
         path=base_path(tmp_path),
     )
 
     written = result.stdout.split("Written to:\n", 1)[1]
     assert "register /p as a project" in result.stdout, result.stdout + result.stderr
-    assert "  ~/.aisquare/  " in written, written
+    assert "  ~/.rlx/  " in written, written
     if bin_line is None:
         assert "~/.local/bin/" not in written, written
     else:
@@ -3911,7 +3965,12 @@ def test_the_refresh_runs_after_init_only_with_an_agent(
     result = sh(f"parse_args {flags}; DRY_RUN=0; init_home", path=f"{cli}:{base_path(tmp_path)}")
 
     assert result.returncode == 0, result.stdout + result.stderr
-    ran = calls.read_text(encoding="utf-8").splitlines()
+    # Less the rlx service's login item (S2, #33): its probe and its step.
+    ran = [
+        line
+        for line in calls.read_text(encoding="utf-8").splitlines()
+        if not line.startswith("service install")
+    ]
     assert ran[0].startswith("init --local --yes"), ran
     assert (ran[1:] == ["agents refresh-hooks --recorded"]) is refreshed, ran
     assert any("refresh-hooks" in line for line in ran) is refreshed, ran
@@ -4158,7 +4217,7 @@ def test_a_path_in_the_plan_prints_as_written(tmp_path: Path) -> None:
 @pytest.mark.parametrize(
     ("environment", "home_shown", "settings_shown"),
     [
-        ({}, "~/.aisquare/", "~/.claude/settings.json"),
+        ({}, "~/.rlx/", "~/.claude/settings.json"),
         (
             {"AISQUARE_HOME": "{home}/aq-home/", "CLAUDE_CONFIG_DIR": "{home}/.claude-work"},
             "~/aq-home/",
@@ -4192,7 +4251,7 @@ def test_the_banner_and_the_steps_name_the_paths_this_run_resolves(
     )
 
     written = result.stdout.split("Written to:\n", 1)[1]
-    assert f"  {home_shown:<33} config.toml, context.db, projects/\n" in written, written
+    assert f"  {home_shown:<33} config.toml, rlx.db, projects/\n" in written, written
     assert f"  {settings_shown:<33} MERGED" in written, written
     assert f"  set up   {home_shown.rstrip('/')} (no project registered)\n" in result.stdout
     assert f"==> Setting up {home_shown.rstrip('/')}\n" in result.stdout, result.stdout
@@ -4710,10 +4769,154 @@ def test_the_word_a_line_tells_a_person_to_type_is_rlx_while_rlx_is_ours(
 ) -> None:
     """install.sh names a command by core/program.py's rule (#135): `rlx` while the rlx a shell
     finds first is uv's own (refuse_taken_commands keeps another program's out of uv's
-    directory), or while none is on PATH yet; `aisquare` while another program's comes first."""
+    directory), or while none is on PATH yet; `aisquare` while another program's comes first.
+
+    install.ps1's last line names the same word, where it said `wsl -d <distro> -- rlx`
+    whatever the install found: it asks WSL the two facts the rule reads (the rlx a login
+    shell finds first, and uv's tool directory) and compares them. Its two questions are run
+    here as WSL runs them, with a `uv` that answers as uv does, and must reach install.sh's
+    word."""
     uv_bin = stub_dir(tmp_path, "uv-bin", "aisquare", "rlx")
     other = stub_dir(tmp_path, "other-bin", "rlx")
+    uv = stub_dir(tmp_path, "uv", "uv", body='printf "%s\\n" "$UV_TOOL_BIN_DIR"')
     dirs = {"none": [], "ours": [uv_bin], "foreign-first": [other, uv_bin]}[on_path]
-    path = ":".join([*map(str, dirs), base_path(tmp_path)])
+    path = ":".join([*map(str, dirs), str(uv), base_path(tmp_path)])
     said = sh("program_word", env={"UV_TOOL_BIN_DIR": str(uv_bin)}, path=path)
     assert said.stdout == word, (said.stdout, said.stderr)
+
+    ps1 = (REPO / "install.ps1").read_text(encoding="ascii")
+    assert 'Write-Note "Open it with:  wsl -d $target -- $word"' in ps1
+    asked = re.findall(r"bash -lc '([^']*)'", ps1)
+    assert asked == ["command -v rlx 2>/dev/null", "uv tool dir --bin 2>/dev/null"], asked
+    environment = {**os.environ, "PATH": path, "UV_TOOL_BIN_DIR": str(uv_bin)}
+    found, bin_dir = (
+        subprocess.run(
+            [SH, "-c", command], capture_output=True, text=True, env=environment, timeout=60
+        ).stdout.strip()
+        for command in asked
+    )
+    ps1_word = "rlx" if not found or found == f"{bin_dir}/rlx" else "aisquare"  # its `if`
+    assert ps1_word == word, (found, bin_dir)
+
+
+# ---------------------------------------------------------------------------
+# The rlx service at login (S2, #33): init adds it by default; --no-service
+# ---------------------------------------------------------------------------
+
+
+def _an_init(tmp_path: Path, *, has_no_service: bool) -> tuple[Path, Path]:
+    """An ``aisquare`` that logs what it is asked, and that has the rlx service's login item
+    (0.10.2's: ``service install --help`` exits 0) or not (a release before it, exit 2)."""
+    calls = tmp_path / "calls.log"
+    body = (
+        f'printf "%s\\n" "$*" >> "{calls}"\n'
+        f'[ "$*" = "service install --help" ] && exit {0 if has_no_service else 2}\n'
+        "exit 0"
+    )
+    return stub_dir(tmp_path, "cli", "aisquare", body=body), calls
+
+
+@pytest.mark.parametrize(
+    ("flags", "has_it", "passed", "asked"),
+    [
+        ("--yes --no-project --no-agent", True, False, True),
+        ("--yes --no-project --no-agent --no-service", True, True, False),
+        ("--yes --no-project --no-agent --no-service", False, False, False),
+        ("--yes --no-project --no-agent", False, False, False),
+    ],
+    ids=["by-default", "no-service", "no-service-to-a-release-without-it", "a-release-without-it"],
+)
+def test_the_installer_sets_the_service_at_login_unless_no_service_says_not_to(
+    tmp_path: Path, flags: str, has_it: bool, passed: bool, asked: bool
+) -> None:
+    """The installer registers the login item on an undecided default home: init does, and
+    `service install --if-undecided` after it, which does so under CI too (installing is the
+    person's act; init alone does not there). --no-service reaches an init that has it and asks
+    nothing more; a release before 0.10.2 is asked neither, for options it does not know."""
+    cli, calls = _an_init(tmp_path, has_no_service=has_it)
+    result = sh(f"parse_args {flags}; DRY_RUN=0; init_home", path=f"{cli}:{base_path(tmp_path)}")
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    ran = calls.read_text(encoding="utf-8").splitlines()
+    init = next(line for line in ran if line.startswith("init --local"))
+    assert init.startswith("init --local --yes"), init
+    assert ("--no-service" in init.split()) is passed, init
+    assert ("service install --if-undecided" in ran) is asked, ran
+    if asked:
+        assert ran.index("service install --if-undecided") > ran.index(init), ran
+
+
+_STARTS = "  start    the rlx service, now and at each login (unless turned off before)\n"
+_NAMED = (
+    "  skip     the rlx service at login (a home RLX_HOME or AISQUARE_HOME names: "
+    "`rlx service install` there sets it)\n"
+)
+
+
+@pytest.mark.parametrize(
+    ("flags", "named", "line"),
+    [
+        ("", "", _STARTS),
+        (" --no-service", "", "  skip     the rlx service at login (--no-service)\n"),
+        ("", "{home}/.rlx", _STARTS),
+        ("", "{home}/.rlx/", _STARTS),
+        ("", "{home}/scratch-home", _NAMED),
+    ],
+    ids=["by-default", "no-service", "the-default-home-by-name", "with-a-slash", "a-named-home"],
+)
+def test_the_plan_says_the_service_starts_at_login(
+    tmp_path: Path, flags: str, named: str, line: str
+) -> None:
+    """The plan promises the login item only where it is set up by itself: the default home,
+    named by its own path or not (review of #33: not a home a variable names elsewhere)."""
+    home = tmp_path / "home"
+    home.mkdir()
+    result = sh(
+        f"main --dry-run --yes --no-project --offline --no-agent --no-system-deps{flags}",
+        env={
+            "AISQUARE_INSTALL_VERSION": "",
+            "HOME": str(home),
+            "AISQUARE_HOME": named.format(home=home),
+            "RLX_HOME": "",
+        },
+        path=f"{_machine(tmp_path, _ABSENT)}:{base_path(tmp_path)}",
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert line in result.stdout, result.stdout
+    init = next(text for text in result.stdout.splitlines() if "would run: aisquare init" in text)
+    assert ("--no-service" in init.split()) is bool(flags), init
+    step = "would run: aisquare service install --if-undecided\n"
+    assert (step in result.stdout) is not bool(flags), result.stdout
+
+
+@pytest.mark.parametrize(
+    ("folders", "named", "elsewhere"),
+    [
+        ((".rlx",), "{home}/.rlx", False),
+        ((".aisquare",), "{home}/.aisquare", False),
+        ((".rlx", ".aisquare"), "{home}/.aisquare", True),
+        ((".rlx",), "{home}/via-a-link", False),
+        ((), "{home}/scratch-home", True),
+        ((), "", False),
+    ],
+    ids=["rlx", "aisquare", "aisquare-beside-rlx", "a-link-to-it", "scratch", "none-named"],
+)
+def test_named_home_elsewhere_decides_as_the_cli_does(
+    tmp_path: Path, folders: tuple[str, ...], named: str, elsewhere: bool
+) -> None:
+    """The plan line's rule is the CLI's (``service_login._named_home``): the default home is
+    ~/.rlx if it is there, else ~/.aisquare if it is, else ~/.rlx, compared by the folder a
+    link leads to (reviewer of #33, round 2, nit)."""
+    home = tmp_path / "home"
+    home.mkdir()
+    for folder in folders:
+        (home / folder).mkdir()
+    (home / "via-a-link").symlink_to(home / ".rlx")
+    result = sh(
+        "if named_home_elsewhere; then echo ELSEWHERE; else echo DEFAULT; fi",
+        env={"HOME": str(home), "AISQUARE_HOME": named.format(home=home), "RLX_HOME": ""},
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == ("ELSEWHERE" if elsewhere else "DEFAULT"), result.stdout
