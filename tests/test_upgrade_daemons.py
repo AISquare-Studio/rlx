@@ -1246,12 +1246,22 @@ def test_a_reader_never_sees_a_claim_without_its_helper_pid(
         began = time.monotonic()
         old, _ = _given_up_on(fake)
         took = time.monotonic() - began
+        # restart_when_gone waits for the claim only up to CLAIM_WAIT_SECONDS: a helper
+        # slower than that to start (a loaded runner) claims after it returns, so the claim
+        # is waited for here, whole, and seen by the watch (as #670's racing test is).
+        claim = upgrade_daemons.restarts_dir() / f"{old.id}.json"
+        deadline = time.monotonic() + 30
+        while upgrade_daemons._claim_helper_pid(claim) is None:
+            assert time.monotonic() < deadline, "the claim was never written whole"
+            time.sleep(0.05)
+        watch.settle()
         pending = upgrade_daemons.pending_restarts()
     assert watch.half_written == [], watch.half_written
     assert len(pending) == 1, pending
     assert isinstance(pending[0]["helper_pid"], int), pending
     assert pending[0]["id"] == old.id
-    assert took >= 1.0, "restart_when_gone waited for the claim, whole"
+    waited = min(1.0, upgrade_daemons.CLAIM_WAIT_SECONDS)
+    assert took >= waited, "restart_when_gone waited for the claim, whole, up to its limit"
     assert list(upgrade_daemons.restarts_dir().glob("*.tmp")) == []
     (fake.dir / "stuck-rlxd").unlink()  # rlxd finishes its stop: the helper ends
     fake.wait_live("rlxd", not_pid=old.pid)
