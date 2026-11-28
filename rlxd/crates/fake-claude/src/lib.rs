@@ -583,7 +583,7 @@ fn run_hook(command: &str, stdin: &str) -> (String, Option<i32>) {
 }
 
 /// Claude Code's config directory: `CLAUDE_CONFIG_DIR`, else `~/.claude`.
-fn config_dir() -> Option<PathBuf> {
+pub(crate) fn config_dir() -> Option<PathBuf> {
     if let Some(dir) = std::env::var_os("CLAUDE_CONFIG_DIR").filter(|v| !v.is_empty()) {
         return Some(PathBuf::from(dir));
     }

@@ -425,6 +425,10 @@ pub mod codes {
     /// `connectors.call`: the call's run ended otherwise (`detail.reason`, its
     /// `run.failed` reason; `detail.run_id`). The message says why.
     pub const CALL_FAILED: &str = "call_failed";
+    /// `connectors.call`: the call's working folder holds Claude Code settings rlxd did not
+    /// write (`.claude/settings.json` or `.claude/settings.local.json`, `detail.path`),
+    /// whose rules or hooks could let the call past the gate. No call is made.
+    pub const UNTRUSTED_SETTINGS: &str = "untrusted_settings";
     /// `connectors.list {refresh: true, allow_turn: true}`: Claude Code was not found.
     pub const CLAUDE_NOT_FOUND: &str = "claude_not_found";
     /// `connectors.list {refresh: true, allow_turn: true}`: the one-turn probe ended

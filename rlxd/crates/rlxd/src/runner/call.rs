@@ -24,6 +24,18 @@
 //!   watch job to the scheduler; the run ends `run.done {num_turns: 0}`, or `run.failed
 //!   {reason: "denied"}` on a deny.
 //!
+//! **No settings but rlxd's.** `check_permissions` decides the call as Claude Code decides
+//! a model's: by its settings' permission rules and hooks first, and only then by asking
+//! `can_use_tool`. A rule or hook that allowed the call would skip the ask, and with it
+//! every rule of rlxd's. So Claude Code loads no user or local settings
+//! (`--setting-sources project`), and its working folder is not the run's space but an
+//! empty folder of the run's own ([`store::RunDir::create_call_dir`]), private, which rlxd
+//! writes nothing into: no project settings either. Before Claude Code starts, and again
+//! before the call is sent, rlxd checks that folder holds no `.claude/settings.json` or
+//! `.claude/settings.local.json`; one there fails the run (`error`) and the call is
+//! `untrusted_settings`, with no call made. A call that comes back with no `can_use_tool`
+//! all the same still fails (above).
+//!
 //! Everything read is bounded: each line ([`MAX_LINE`]), each wait (for `initialize`'s
 //! reply, the connector, the `can_use_tool`, the result: [`Times`]), and the run as a
 //! whole (its `timeout_s`, their sum and the app's `deadline_ms`). Each write must be taken
@@ -50,8 +62,8 @@ use super::{
     End, JobTag, Run, RunNote, Runner, argv, blocking, check_start, ended_early, jcs, process,
     refusal, run_env, store, stream, tail, with_detail,
 };
+use crate::claude;
 use crate::log::{info, warning};
-use crate::{claude, spaces};
 
 /// The `initialize` capability without which a Claude Code runs `mcp_call` unchecked.
 pub const CHECK_PERMISSIONS: &str = "mcp_call_check_permissions_v1";
@@ -155,6 +167,8 @@ enum Outcome {
     },
     /// This Claude Code is no route to a call with no model turn: why.
     NoRoute(String),
+    /// The working folder held settings rlxd did not write: this one.
+    Untrusted(String),
 }
 
 /// What driving the control channel came to.
@@ -165,6 +179,8 @@ enum Driven {
     Denied,
     /// No route: why.
     NoRoute(String),
+    /// The working folder held settings rlxd did not write: this one.
+    Untrusted(std::path::PathBuf),
     /// The connector was not connected.
     Connectors(Vec<ConnectorStatus>),
     /// rlxd ended the run, for this reason.
@@ -276,10 +292,17 @@ impl Runner {
                 claude::BIN_ENV
             ));
         };
-        let space = match blocking(|| spaces::ensure(&self.home, &params.space)) {
-            Ok(space) => space,
+        // Its own empty folder, not the space: no project settings (the module's doc).
+        let cwd = match blocking(|| run.dir.create_call_dir()) {
+            Ok(dir) => dir,
             Err(e) => return failed(format!("the run could not be set up: {e}")),
         };
+        if let Some(path) = blocking(|| untrusted(&cwd)) {
+            let message = untrusted_message(&path);
+            call.set(Outcome::Untrusted(path.display().to_string()));
+            warning!("run {}: {message}", params.run_id);
+            return failed(message);
+        }
         let ending = run.inner().ending;
         if let Some(reason) = ending {
             return ended_early(run, reason);
@@ -301,7 +324,7 @@ impl Runner {
         let launch = process::Launch {
             program: program.clone(),
             args: argv::call_args(),
-            cwd: space.clone(),
+            cwd: cwd.clone(),
             env,
         };
         let (mut child, tree) = match self.spawner.spawn(launch).await {
@@ -343,10 +366,14 @@ impl Runner {
             line: Vec::new(),
             deadline,
         };
-        let driven = self.drive(run, call, &mut channel, &space, times).await;
+        let driven = self.drive(run, call, &mut channel, &cwd, times).await;
         drop(channel);
         match &driven {
-            Driven::Ran | Driven::Denied | Driven::NoRoute(_) | Driven::Connectors(_) => {
+            Driven::Ran
+            | Driven::Denied
+            | Driven::NoRoute(_)
+            | Driven::Untrusted(_)
+            | Driven::Connectors(_) => {
                 // Done with it: closing stdin ends it, and what is left of the tree is
                 // killed after the grace.
                 let _ = stdin.shutdown().await;
@@ -398,6 +425,12 @@ impl Runner {
                 call.set(Outcome::NoRoute(message.clone()));
                 failed(message)
             }
+            Driven::Untrusted(path) => {
+                let message = untrusted_message(&path);
+                warning!("run {}: {message}", params.run_id);
+                call.set(Outcome::Untrusted(path.display().to_string()));
+                failed(message)
+            }
             Driven::Connectors(connectors) => End::Failed(
                 RunFailedData::new(
                     FailReason::Connectors,
@@ -431,7 +464,7 @@ impl Runner {
         run: &Arc<Run>,
         call: &CallRun,
         channel: &mut Channel<'_, R>,
-        space: &std::path::Path,
+        cwd: &std::path::Path,
         times: Times,
     ) -> Driven {
         let Some(pinned) = run.params.pinned_call.clone() else {
@@ -525,8 +558,12 @@ impl Runner {
             tools.sort();
             inner.listed = listed;
             let data =
-                RunStartedData::new(space.display().to_string(), "", "").with_tools(tools, servers);
+                RunStartedData::new(cwd.display().to_string(), "", "").with_tools(tools, servers);
             self.emit(run, &mut inner, run_types::STARTED, &data);
+        }
+        // Nothing planted since Claude Code started: no rule or hook can skip the ask.
+        if let Some(path) = blocking(|| untrusted(cwd)) {
+            return Driven::Untrusted(path);
         }
         // The one call, always with check_permissions.
         let input = Value::Object(call.input.clone());
@@ -768,6 +805,13 @@ fn reply(
             refusal(codes::NO_ROUTE, message),
             json!({"run_id": run_id}),
         )),
+        (_, Some(Outcome::Untrusted(path))) => Err(with_detail(
+            refusal(
+                codes::UNTRUSTED_SETTINGS,
+                untrusted_message(std::path::Path::new(&path)),
+            ),
+            json!({"run_id": run_id, "path": path}),
+        )),
         _ => {
             let last = run.inner().last_state_event.clone().unwrap_or_default();
             let reason = last["data"]["reason"]
@@ -784,6 +828,27 @@ fn reply(
             ))
         }
     }
+}
+
+/// The settings files Claude Code would read in `cwd` (`--setting-sources project`, and
+/// `local`'s too): neither may be there, whatever it is (a file, a folder, a link).
+const PROJECT_SETTINGS: [&str; 2] = ["settings.json", "settings.local.json"];
+
+/// The first settings file in the call's working folder `cwd`, which rlxd writes none of:
+/// `None` when there is none.
+fn untrusted(cwd: &std::path::Path) -> Option<std::path::PathBuf> {
+    PROJECT_SETTINGS
+        .iter()
+        .map(|name| cwd.join(".claude").join(name))
+        .find(|path| std::fs::symlink_metadata(path).is_ok())
+}
+
+fn untrusted_message(path: &std::path::Path) -> String {
+    format!(
+        "untrusted_settings: the call's working folder holds Claude Code settings rlxd did not \
+         write ({}), whose rules or hooks could let the call past the gate: no call is made",
+        path.display()
+    )
 }
 
 /// The gate's listing of `mcp_status`'s `rows`: each tool as Claude Code names it
@@ -1069,6 +1134,34 @@ mod tests {
         );
         assert_eq!(listed.servers.len(), 2);
         assert_eq!(listed.servers[0].source.as_deref(), Some("claudeai"));
+    }
+
+    #[test]
+    fn any_settings_file_in_the_calls_folder_is_untrusted() {
+        let dir = std::env::temp_dir().join(format!(
+            "rlxd-call-settings-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        assert_eq!(untrusted(&dir), None);
+        // A .claude folder with anything else in it is not settings.
+        std::fs::create_dir_all(dir.join(".claude")).unwrap();
+        std::fs::write(dir.join(".claude").join("CLAUDE.md"), "x").unwrap();
+        assert_eq!(untrusted(&dir), None);
+        for name in PROJECT_SETTINGS {
+            let path = dir.join(".claude").join(name);
+            std::fs::write(&path, "{}").unwrap();
+            assert_eq!(untrusted(&dir), Some(path.clone()));
+            std::fs::remove_file(&path).unwrap();
+            // Not only a file: a folder there is refused too.
+            std::fs::create_dir(&path).unwrap();
+            assert_eq!(untrusted(&dir), Some(path.clone()));
+            std::fs::remove_dir(&path).unwrap();
+        }
+        assert_eq!(untrusted(&dir), None);
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

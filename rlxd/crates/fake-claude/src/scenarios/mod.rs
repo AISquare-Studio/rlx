@@ -76,6 +76,9 @@ pub const ALL: &[(&str, Scenario)] = &[
     ("mcp-direct-old", |fake| {
         mcp_direct::play(fake, Variant::Old)
     }),
+    ("mcp-direct-plant", |fake| {
+        mcp_direct::play(fake, Variant::Plant)
+    }),
     ("mcp-direct-respelled", |fake| {
         mcp_direct::play(fake, Variant::Respelled)
     }),

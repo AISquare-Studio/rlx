@@ -548,6 +548,98 @@ fn a_connector_that_needs_auth_fails_the_run_connectors() {
     assert!(requests(&the_start(&home), "mcp_call").is_empty());
 }
 
+// --- No settings but rlxd's ---------------------------------------------------------------
+
+/// Writes `settings` to `path`, making its folder.
+fn plant(path: &std::path::Path, settings: &Value) {
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(path, settings.to_string()).unwrap();
+}
+
+#[test]
+fn allow_rules_planted_in_the_space_and_the_users_settings_cant_skip_can_use_tool() {
+    // Claude Code runs a call its settings allow with no can_use_tool, and so past every
+    // rule of rlxd's: the call's Claude Code must load none of these.
+    let home = home("mcp-direct", &[]);
+    let rule = json!({"permissions": {"allow": [READ, "mcp__claude_ai_GitHub"]}});
+    let space = home.root().join("spaces").join("default").join(".claude");
+    plant(&space.join("settings.json"), &rule);
+    plant(&space.join("settings.local.json"), &rule);
+    plant(
+        &home.root().join("claude-config").join("settings.json"),
+        &rule,
+    );
+    plant(
+        &home
+            .root()
+            .join("user-home")
+            .join(".claude")
+            .join("settings.json"),
+        &rule,
+    );
+    let r = run_id();
+    // No app: only the gate's ask can tell the call no, and it must be asked.
+    let run = call(&home, &params(&r, READ, &json!({"ref": "main"})));
+    let (code, detail) = refusal(&run);
+    assert_eq!(code, "denied", "{run:?}");
+    assert_eq!(detail["by"], "unreachable", "{run:?}");
+    let start = the_start(&home);
+    assert_eq!(start["tool_runs"], 0, "{start:#}");
+    assert_eq!(start["allowed_by"], Value::Null, "{start:#}");
+    assert_eq!(start["control_answers"][0]["response"]["behavior"], "deny");
+    // Its working folder is the run's own, empty one: not the space.
+    let cwd = std::path::PathBuf::from(start["cwd"].as_str().unwrap());
+    assert!(
+        cwd.ends_with(std::path::Path::new("runs").join(&r).join("call")),
+        "{}",
+        cwd.display()
+    );
+    assert!(!cwd.join(".claude").exists(), "{}", cwd.display());
+}
+
+#[test]
+fn an_allow_rule_planted_after_claude_code_starts_is_refused_before_the_call() {
+    // mcp-direct-plant writes an allow rule into its own working folder once it has
+    // answered initialize: rlxd finds it before it sends the call, and makes none.
+    let home = home("mcp-direct-plant", &[]);
+    let _app = App::open(&home);
+    let since = seq(&home);
+    let r = run_id();
+    let run = call(&home, &params(&r, READ, &json!({"ref": "main"})));
+    let (code, detail) = refusal(&run);
+    assert_eq!(code, "untrusted_settings", "{run:?}");
+    assert_eq!(detail["run_id"], r.as_str());
+    let path = std::path::PathBuf::from(detail["path"].as_str().unwrap());
+    assert!(
+        path.ends_with(std::path::Path::new(".claude").join("settings.json")),
+        "{}",
+        path.display()
+    );
+    let events = wait_until(&home, since, "the run ends", |e| {
+        !of(e, &r, Some("run.failed")).is_empty()
+    });
+    let failed = one(&events, &r, "run.failed");
+    assert_eq!(failed["data"]["reason"], "error");
+    assert!(
+        failed["data"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("untrusted_settings"),
+        "{failed}"
+    );
+    assert!(
+        of(&events, &r, Some("run.tool_call")).is_empty(),
+        "{events:#?}"
+    );
+    let start = the_start(&home);
+    assert!(requests(&start, "mcp_call").is_empty(), "{start:#}");
+    assert_eq!(start["tool_runs"], 0);
+    // The rule was there: the call would have run unasked.
+    let cwd = std::path::PathBuf::from(start["cwd"].as_str().unwrap());
+    assert!(cwd.join(".claude").join("settings.json").is_file());
+    assert!(ledger(&home, &r).is_empty());
+}
+
 // --- Every read is bounded ----------------------------------------------------------------
 
 /// A call to `scenario` that must fail `call_failed`, its message saying `says`, within

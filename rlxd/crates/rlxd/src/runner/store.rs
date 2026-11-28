@@ -122,6 +122,14 @@ impl RunDir {
         private_dir(&self.dir)
     }
 
+    /// `call/`: a `connectors.call` run's working folder (5.3), private, which rlxd writes
+    /// nothing into: Claude Code finds no project settings there.
+    pub fn create_call_dir(&self) -> io::Result<PathBuf> {
+        let dir = self.dir.join("call");
+        private_dir(&dir)?;
+        Ok(dir)
+    }
+
     /// `<attempt>/settings.json`.
     pub fn settings(&self, attempt: u64) -> PathBuf {
         self.dir.join(attempt.to_string()).join("settings.json")

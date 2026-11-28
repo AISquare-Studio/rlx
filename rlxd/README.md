@@ -465,13 +465,21 @@ listing, 5.5 and 7.7): `crate::connectors`, and the gate in `crate::runner::conn
   `readOnly: true` hints are what the gate's rules decide by; then one `mcp_call`, always
   with `check_permissions: true`. Claude Code's `can_use_tool` takes the gate's own path
   (rlxd's rules, then the app, then the ledger), and an allow answers with the pinned
-  input as `updatedInput`, never the request's. The run emits `run.started`,
+  input as `updatedInput`, never the request's. **No settings but rlxd's:** Claude Code
+  decides a `check_permissions` call by its settings' rules and hooks before it asks
+  `can_use_tool`, and a rule that allowed the call would skip every rule of rlxd's. So it
+  loads no user or local settings (`--setting-sources project`) and runs not in the space
+  but in an empty, private folder of the run's own (`runs/<run_id>/call/`), which rlxd
+  writes nothing into; before Claude Code starts and again before the call is sent, rlxd
+  checks it holds no `.claude/settings.json` or `.claude/settings.local.json`, and one
+  there fails the run with no call made (`untrusted_settings`, `detail.path`). The run
+  emits `run.started`,
   `run.tool_call`, `run.tool_decided` and `run.tool_result`, and ends `run.done
   {num_turns: 0}`, or `run.failed {reason: "denied"}` on a deny. The reply is `{run_id,
   decision, content?, is_error?, model_turns: 0}`; a deny is `denied` (`detail.by`,
   `detail.reason`, `detail.call_id`); any other end is `call_failed` (`detail.reason`,
-  the run's). A call that comes back with no `can_use_tool` first fails, its content
-  dropped. Every read is bounded: a 4 MiB line, a wait for `initialize`'s reply (15 s),
+  the run's). A call that comes back with no `can_use_tool` first fails all the same, its
+  content dropped. Every read is bounded: a 4 MiB line, a wait for `initialize`'s reply (15 s),
   the connector (30 s), the `can_use_tool` (30 s) and the result (60 s), and the run's
   `timeout_s` (their sum, the app's `deadline_ms` and 5 s); any of them, or a model
   turn's line, kills the tree.

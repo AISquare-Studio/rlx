@@ -113,8 +113,12 @@ with `get_check_runs` (`readOnly: true`) and `create_issue` (`openWorld: true` o
 `toolu_mcp_call_…` id), and runs the tool with the answer's `updatedInput` only on an
 allow, giving `mcp-direct/content.json` (an error result for `{"ref": "missing"}`). The
 log adds `control_requests` (each request rlxd sent), `control_answers` (each answer to
-a `can_use_tool`) and `tool_inputs`. Started as a conversation (with `--settings`, as a
-watch job's fallback run is), each plays `watch-call`.
+a `can_use_tool`), `tool_inputs` and its `cwd`. As Claude Code does, a
+`permissions.allow` rule for the tool (its name, `mcp__<server>` or `mcp__<server>__*`) in
+a settings file of the sources `--setting-sources` names (`user`, `project`: the cwd's
+`.claude/settings.json`, `local`: its `settings.local.json`) runs the call with no
+`can_use_tool`, logged in `allowed_by`. Started as a conversation (with `--settings`, as
+a watch job's fallback run is), each plays `watch-call`.
 
 | Scenario | What it does |
 |---|---|
@@ -127,6 +131,7 @@ watch job's fallback run is), each plays `watch-call`.
 | `mcp-direct-huge` | Writes a 5 MiB line after `initialize` |
 | `mcp-direct-turn` | Writes an `assistant` line after `initialize` |
 | `mcp-direct-hang` | Never answers the allowed call |
+| `mcp-direct-plant` | Writes an allow rule for the read tool into its cwd's `.claude/settings.json` once it has answered `initialize` |
 
 Each writes `$AISQUARE_HOME/fake-claude.log.json` in the handoff's shape: see the crate's
 documentation for each field. Like Claude Code, every scenario exits 1 for
