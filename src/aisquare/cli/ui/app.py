@@ -58,7 +58,7 @@ from textual.timer import Timer
 from textual.widget import Widget
 from textual.widgets import Button, ContentSwitcher, Footer, Static, TextArea
 from textual.widgets._footer import FooterKey
-from textual.worker import Worker, WorkerState, WorkType
+from textual.worker import Worker, WorkerState, WorkType, get_current_worker
 from textual.worker_manager import WorkerManager
 
 from aisquare.cli.ui import remote_workers  # Remote's worker names alone: no Remote
@@ -394,6 +394,12 @@ _QUIT_POLL = 0.1
 """Seconds between the looks a hand-over takes at the reads it waits out (``_exit_when_read``)."""
 _HAND_OFF_PATIENCE = 10.0
 """Seconds a hand-over waits for the reads running before it names them and can be called off."""
+_RESTORE_PATIENCE = 30.0
+"""Seconds a Remote turned on again waits for the one still turning off before it gives up and
+says so (``FleetApp._restore_after``). Each of stopping's steps is bounded, and the wait was
+not: one that never ended parked its worker for good (review of #46, #3839)."""
+_RESTORE_SLICE = 0.2
+"""Seconds between that wait's looks at whether rlx is quitting or Remote was turned off again."""
 _hand_off_clock: Callable[[], float] = time.monotonic
 """What a hand-over's wait is timed by: the injection point a test's own clock takes, so the
 seconds its toast names are the test's, not a runner's (a slow one said 1 s for 0)."""
@@ -1937,16 +1943,41 @@ class FleetApp(SelectionHost, inherit_bindings=False):
 
     def _restore_after(self, remote: RemoteController, stopping: list[RemoteController]) -> None:
         """On a worker's thread: wait for ``stopping`` to be off, their writes landed, then
-        bring ``remote`` up on the UI thread, unless it was turned off again meanwhile."""
+        bring ``remote`` up on the UI thread, unless it was turned off again meanwhile.
+
+        The wait is bounded (review of #46, #3839). Every :data:`_RESTORE_SLICE` it looks
+        whether rlx is quitting (Textual cancels every worker as it exits) or ``remote`` was
+        turned off again, and ends at once if so: there is nothing to bring up, and a worker
+        left waiting held the process's end, whose executor joins its thread. Past
+        :data:`_RESTORE_PATIENCE` it gives up and says so (:meth:`_restore_overdue`)."""
+        worker = get_current_worker()
+        deadline = time.monotonic() + _RESTORE_PATIENCE
         for old in stopping:
-            old.wait_until_off()
-            old.writes_done()
+            while not (old.wait_until_off(_RESTORE_SLICE) and old.writes_done(_RESTORE_SLICE)):
+                if worker.is_cancelled or self._remote is not remote:
+                    return
+                if time.monotonic() >= deadline:
+                    self._from_its_thread(self._restore_overdue, remote)
+                    return
+        self._from_its_thread(self._restore_if_current, remote)
+
+    def _from_its_thread(
+        self, then: Callable[[RemoteController], None], remote: RemoteController
+    ) -> None:
         with contextlib.suppress(RuntimeError):  # rlx quit meanwhile: nothing to bring up
-            self.call_from_thread(self._restore_if_current, remote)
+            self.call_from_thread(then, remote)
 
     def _restore_if_current(self, remote: RemoteController) -> None:
         if self._remote is remote:
             remote.restore(wait=False)
+
+    def _restore_overdue(self, remote: RemoteController) -> None:
+        """The one turning off still is after :data:`_RESTORE_PATIENCE`: ``remote`` stays
+        down, and the toast says what Remote's own switch says to a start it refuses."""
+        if self._remote is remote:
+            from aisquare.cli.ui.remote_control import STILL_TURNING_OFF
+
+            self.notify(STILL_TURNING_OFF, severity="warning", timeout=10)
 
     async def _bring_remote_down(self) -> None:
         """Remote turned off from Settings: what shows of it gone, and it stopped on its own

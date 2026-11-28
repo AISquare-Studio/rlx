@@ -17,16 +17,20 @@ import subprocess
 import sys
 import textwrap
 import threading
+import time
 from collections.abc import Callable
 from pathlib import Path
+from typing import Any
 
 import pytest
+from textual.app import App
 from textual.pilot import Pilot
 from textual.widgets import Checkbox, TabbedContent
 from typer.testing import CliRunner
 
 from aisquare.cli.app import app as cli
-from aisquare.cli.ui import remote_control
+from aisquare.cli.ui import app as ui_app
+from aisquare.cli.ui import remote_control, remote_workers
 from aisquare.cli.ui.remote_control import RemoteController
 from aisquare.cli.ui.sidebar import SettingsRow
 from aisquare.cli.ui.views.app_settings import REMOTE_TAB
@@ -495,16 +499,9 @@ async def _until(pilot: Pilot[None], holds: Callable[[], object], what: str) -> 
     raise AssertionError(f"never: {what}")
 
 
-def test_remote_off_then_on_at_once_waits_for_the_one_still_stopping(
-    script: Script, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """Review of #46 (#3780): a quick off then on built a new controller and brought it up at
-    once, beside the one still stopping with a write in flight. The two share ``remote.json``
-    and the server's runtime, and their locks are each their own. The new one now comes up only
-    once the old one is off and its write has landed: one controller left, serving, and the
-    write switch as a restore leaves it. The old one's write landed first and the restore then
-    turned writes off (``_restored_read_only``). Without the wait, the held write landed after
-    the restore: writes on behind a Remote that said it came back read-only."""
+def _one_server(monkeypatch: pytest.MonkeyPatch) -> tuple[_HeldWrites, list[RemoteController]]:
+    """One server for every controller the app builds, each recorded as it is made, with
+    Remote's own switch on, so that each start serves."""
     server = _HeldWrites()
     made: list[RemoteController] = []
 
@@ -515,13 +512,62 @@ def test_remote_off_then_on_at_once_waits_for_the_one_still_stopping(
         return made[-1]
 
     monkeypatch.setattr(remote_control, "RemoteController", controller)
-    update_state("remote_enabled", True)  # Remote's own switch on: each start serves
+    update_state("remote_enabled", True)
+    return server, made
+
+
+async def _a_write_in_flight(pilot: Pilot[None], made: list[RemoteController]) -> RemoteController:
+    """The Remote the start brought up, serving, with a write of it held in flight."""
+    await _until(pilot, lambda: made and made[0].remote_serving, "the first Remote serving")
+    first = made[0]
+    first.set_allow_write(True, wait=False)
+    return first
+
+
+def _waiting(app: App[Any]) -> bool:
+    """Whether a Remote turned on again still waits for the one turning off."""
+    return any(
+        worker.name == remote_workers.RESTORE_WORKER and not worker.is_finished
+        for worker in app.workers
+    )
+
+
+def _starts_after_the_last_stop(server: _HeldWrites) -> int:
+    calls = list(server.calls)
+    last_stop = len(calls) - 1 - calls[::-1].index("stop_remote_server")
+    return calls[last_stop:].count("start_remote_server")
+
+
+def _still_turning_off(app: App[Any]) -> list[str]:
+    """Every toast saying Remote is still turning off from now on, with its severity, as it is
+    raised (a toast's own timeout can end before a slow runner reads the screen's)."""
+    said: list[str] = []
+    notify = app.notify
+
+    def spy(message: str, **kwargs: Any) -> None:
+        if message == remote_control.STILL_TURNING_OFF:
+            said.append(str(kwargs.get("severity", "information")))
+        notify(message, **kwargs)
+
+    app.notify = spy  # type: ignore[method-assign]
+    return said
+
+
+def test_remote_off_then_on_at_once_waits_for_the_one_still_stopping(
+    script: Script, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Review of #46 (#3780): a quick off then on built a new controller and brought it up at
+    once, beside the one still stopping with a write in flight. The two share ``remote.json``
+    and the server's runtime, and their locks are each their own. The new one now comes up only
+    once the old one is off and its write has landed: one controller left, serving, and the
+    write switch as a restore leaves it. The old one's write landed first and the restore then
+    turned writes off (``_restored_read_only``). Without the wait, the held write landed after
+    the restore: writes on behind a Remote that said it came back read-only."""
+    server, made = _one_server(monkeypatch)
 
     async def body(pilot: Pilot[None]) -> dict[str, object]:
         app = fleet_app(pilot)
-        await _until(pilot, lambda: made and made[0].remote_serving, "the first Remote serving")
-        old = made[0]
-        old.set_allow_write(True, wait=False)  # held: a write in flight
+        old = await _a_write_in_flight(pilot, made)
         app.post_message(RemoteSwitched(False))
         app.post_message(RemoteSwitched(True))
         await _until(pilot, lambda: len(made) == 2, "a second controller")
@@ -532,8 +578,6 @@ def test_remote_off_then_on_at_once_waits_for_the_one_still_stopping(
         server.held.set()
         await _until(pilot, lambda: new.remote_serving, "the new Remote serving")
         await settle_page(app)
-        calls = list(server.calls)
-        last_stop = len(calls) - 1 - calls[::-1].index("stop_remote_server")
         return {
             "new serving while the old one's write was in flight": held,
             "the app's controller is the new one": getattr(app, "remote", None) is new,
@@ -541,7 +585,7 @@ def test_remote_off_then_on_at_once_waits_for_the_one_still_stopping(
             "server running": server.running,
             "write switch": (server.allow_write, new.write_actions_allowed()),
             "its writes, in order": list(server.allow_write_calls),
-            "starts after the last stop": calls[last_stop:].count("start_remote_server"),
+            "starts after the last stop": _starts_after_the_last_stop(server),
         }
 
     assert drive(body) == {
@@ -553,6 +597,130 @@ def test_remote_off_then_on_at_once_waits_for_the_one_still_stopping(
         "its writes, in order": [True, False],
         "starts after the last stop": 1,
     }
+
+
+def test_remote_off_on_and_off_again_ends_the_wait_and_on_once_more_comes_up_once(
+    script: Script, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Review of #46 (#3839), a third toggle: Remote off, on and off again while the first
+    one's write is still in flight. The second is never brought up, and its wait ends at its
+    next look, not with the write: there is nothing left for it to bring up. Turned on a
+    fourth time, the third comes up once the first is off: one start after the last stop."""
+    server, made = _one_server(monkeypatch)
+
+    async def body(pilot: Pilot[None]) -> dict[str, object]:
+        app = fleet_app(pilot)
+        said = _still_turning_off(app)
+        first = await _a_write_in_flight(pilot, made)
+        for on in (False, True, False):
+            app.post_message(RemoteSwitched(on))
+        await _until(pilot, lambda: len(made) == 2 and app._remote is None, "off once more")
+        second = made[1]
+        await _until(pilot, lambda: not _waiting(app), "the second one's wait over")
+        ended_in_flight = not first.writes_done(0)
+        app.post_message(RemoteSwitched(True))
+        await _until(pilot, lambda: len(made) == 3, "a third controller")
+        third = made[2]
+        for _ in range(10):
+            await pilot.pause(0.02)
+        held = third.remote_serving
+        server.held.set()
+        await _until(pilot, lambda: third.remote_serving, "the third Remote serving")
+        await settle_page(app)
+        return {
+            "the second one's wait ended with the write in flight": ended_in_flight,
+            "the third serving while the write was in flight": held,
+            "the app's controller is the third": app._remote is third,
+            "the second, never up, among those stopping": (
+                not second.remote_serving and second in app.remotes_stopping
+            ),
+            "starts, in all": server.calls.count("start_remote_server"),
+            "starts after the last stop": _starts_after_the_last_stop(server),
+            "said still turning off": said,
+        }
+
+    assert drive(body) == {
+        "the second one's wait ended with the write in flight": True,
+        "the third serving while the write was in flight": False,
+        "the app's controller is the third": True,
+        "the second, never up, among those stopping": True,
+        "starts, in all": 2,
+        "starts after the last stop": 1,
+        "said still turning off": [],
+    }
+
+
+def test_a_wait_past_its_patience_gives_up_says_so_and_brings_nothing_up(
+    script: Script, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Review of #46 (#3839): the wait for the one still turning off was unbounded, so a stop
+    that never ended parked its worker for good. Past its patience it ends with the write
+    still in flight, Remote stays down, and a warning says what Remote's own switch says to a
+    start it refuses. The write landing later brings nothing up by itself."""
+    server, made = _one_server(monkeypatch)
+    monkeypatch.setattr(ui_app, "_RESTORE_PATIENCE", 0.5)
+
+    async def body(pilot: Pilot[None]) -> dict[str, object]:
+        app = fleet_app(pilot)
+        said = _still_turning_off(app)
+        first = await _a_write_in_flight(pilot, made)
+        app.post_message(RemoteSwitched(False))
+        app.post_message(RemoteSwitched(True))
+        await _until(pilot, lambda: len(made) == 2, "a second controller")
+        second = made[1]
+        await _until(pilot, lambda: said and not _waiting(app), "the wait given up")
+        gave_up_in_flight = not first.writes_done(0)
+        server.held.set()
+        await _until(pilot, lambda: first.writes_done(0) and first.wait_until_off(0), "off")
+        for _ in range(10):
+            await pilot.pause(0.02)
+        await settle_page(app)
+        return {
+            "gave up with the write in flight": gave_up_in_flight,
+            "said still turning off": said,
+            "the second serving": second.remote_serving,
+            "the app's controller is the second": app._remote is second,
+            "starts after the last stop": _starts_after_the_last_stop(server),
+        }
+
+    assert drive(body) == {
+        "gave up with the write in flight": True,
+        "said still turning off": ["warning"],
+        "the second serving": False,
+        "the app's controller is the second": True,
+        "starts after the last stop": 0,
+    }
+
+
+def test_a_quit_while_remote_waits_for_the_one_turning_off_is_not_held_by_the_wait(
+    script: Script, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Review of #46 (#3839): rlx quit while a Remote turned on again waits for the one still
+    turning off. Textual cancels the wait's worker as it exits, and the wait ends at its next
+    look, so the run's end, whose executor joins the worker's thread, is not held until the
+    write lands (held 30 s here). run_ui waits for the one turning off itself, as before."""
+    server, made = _one_server(monkeypatch)
+    left: list[float] = []
+
+    async def body(pilot: Pilot[None]) -> None:
+        app = fleet_app(pilot)
+        await _a_write_in_flight(pilot, made)
+        app.post_message(RemoteSwitched(False))
+        app.post_message(RemoteSwitched(True))
+        await _until(pilot, lambda: len(made) == 2 and _waiting(app), "the wait running")
+        left.append(time.monotonic())
+
+    try:
+        ui_suite.drive(body)
+        took = time.monotonic() - left[0]
+        in_flight = not made[0].writes_done(0)
+    finally:
+        server.held.set()
+    assert made[0].writes_done(10) and made[0].wait_until_off(10)
+    assert in_flight, "the write landed before the run ended: nothing was held"
+    assert took < 10, f"the run's end waited {took:.1f} s for the wait"
+    assert not made[1].remote_serving
+    assert server.calls.count("start_remote_server") == 1
 
 
 # --- the rlx service ---------------------------------------------------------------------------
