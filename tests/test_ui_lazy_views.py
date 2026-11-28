@@ -129,6 +129,14 @@ _OPENED = textwrap.dedent(
         async with app.run_test(headless=True, size=(140, 40)) as pilot:
             await until(pilot, lambda: app.content.current == f"project-{{PROJECT}}", "home")
             app.refresh_data()  # a tick, the doctor's paint: neither may load a view
+            # Remote switched off in Settings' Experimental (on in the suite): the switch's
+            # look for the Settings hub, never opened, may not load it either.
+            from aisquare.cli.ui.views.settings_captain import RemoteSwitched
+
+            was_on = app.remote_on
+            app.post_message(RemoteSwitched(not was_on))
+            await until(pilot, lambda: app.remote_on is not was_on, "the Remote switch")
+            report["remote was on"] = was_on
             doctor = app._doctor_worker
             await until(pilot, lambda: doctor is None or doctor.is_finished, "the doctor")
             await until(pilot, lambda: not any(
@@ -212,11 +220,12 @@ def _opened_one_by_one(project_id: str) -> dict[str, Any]:
 @pytest.mark.skipif(sys.platform == "win32", reason="the headless start is POSIX's here")
 def test_a_start_loads_no_deferred_view_and_each_loads_when_first_opened(a_project: str) -> None:
     """Acceptance 1: a start to the first screen (the project's page) loads none of them, a
-    tick and a doctor run included; each page and dialog then loads its own module as it
-    opens, and opens."""
+    tick, a doctor run and Remote switched off included; each page and dialog then loads its
+    own module as it opens, and opens."""
     report = _opened_one_by_one(a_project)
 
     assert report["sharing asked"] is True, report
+    assert report["remote was on"] is True, report
     assert report["start"] == [], report
     assert report["hub"] == [
         "aisquare.cli.ui.views.settings_hub",
