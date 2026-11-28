@@ -3292,10 +3292,8 @@ def _disk_detail(use: DiskUse) -> str:
         else "what tidy would free was not reached in time"
     )
     said = f"{sizes}; {free}"
-    if use.as_of_clock is not None:  # tidy's to say: no clock is spelt here (#152)
-        said += (
-            f" as of its last pass at {use.as_of_clock}, which freed {size_text(use.freed_then)}"
-        )
+    if use.as_of_said is not None:  # tidy's to say: no clock is spelt here (#152)
+        said += f" as of its last pass {use.as_of_said}, which freed {size_text(use.freed_then)}"
     return said
 
 

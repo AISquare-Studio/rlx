@@ -346,21 +346,49 @@ def india() -> Iterator[None]:
         time.tzset()
 
 
+SAT_EVENING = datetime(2026, 11, 28, 12, 49, tzinfo=UTC)
+"""Sat 28 Nov, 18:19 in Asia/Kolkata (``india``), 12:49 UTC."""
+SAT_SMALL_HOURS = datetime(2026, 11, 27, 18, 40, tzinfo=UTC)
+"""Sat 28 Nov, 00:10 in Asia/Kolkata: still Fri 27 Nov in UTC."""
+
+
 @posix_only
+@pytest.mark.parametrize(
+    ("now", "ago", "every", "said"),
+    [
+        (SAT_EVENING, timedelta(minutes=30), 60, "at 17:49"),
+        (SAT_SMALL_HOURS, timedelta(minutes=20), 60, "on Fri at 23:50"),
+        (SAT_EVENING, timedelta(hours=30), 1440, "on Fri at 12:19"),
+        (SAT_EVENING, timedelta(days=6), 10080, "on Sun at 18:19"),
+        (SAT_EVENING, timedelta(days=7), 10080, "on 21 Nov at 18:19"),
+    ],
+    ids=["today", "just before midnight", "a day old", "six days old", "a week old"],
+)
 def test_a_fresh_stamp_is_read_and_no_dry_run_runs(
-    plans: list[datetime | None], india: None
+    monkeypatch: pytest.MonkeyPatch,
+    plans: list[datetime | None],
+    india: None,
+    now: datetime,
+    ago: timedelta,
+    every: float,
+    said: str,
 ) -> None:
     """The last pass began within twice ``every_minutes`` and freed all it planned: tidy
-    would free nothing more as of then, said in local time."""
-    last = datetime.now(UTC).replace(microsecond=0) - timedelta(minutes=30)
+    would free nothing more as of then, said in local time. On another local day, the day
+    is said too (reviewer #4130): a bare 12:19 for Friday's pass read as today's on Saturday.
+    The local date decides, not UTC's (just before midnight). Past six days, the date."""
+    monkeypatch.setattr(tidy, "_now", lambda: now)
+    config = load_config()
+    config.tidy.every_minutes = every
+    save_config(config)
+    last = now - ago
     _stamp(last, freed_bytes=3 * GB, not_freed=0)
 
     row = diagnostics._check_disk()
 
-    when = last.astimezone().strftime("%H:%M")
-    assert when != last.strftime("%H:%M"), "control: local time is not UTC here"
+    assert last.strftime("%H:%M") not in said, "control: local time is not UTC here"
     assert row.detail.endswith(
-        f"tidy would free 0 B as of its last pass at {when}, which freed 3.0 GB"
+        f"tidy would free 0 B as of its last pass {said}, which freed 3.0 GB"
     ), row.detail
     assert row.status is CheckStatus.ok and plans == []
 

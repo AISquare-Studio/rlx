@@ -1524,18 +1524,32 @@ class DiskUse:
     trees_whole: bool = True
     """The worktrees (and their build caches) measured whole: past them the time ran out in
     the temp roots, if anywhere."""
+    as_of_said: str | None = None
+    """When :attr:`as_of` was, as the row says it (:func:`pass_time_said`), against the look's
+    own clock."""
 
     @property
     def total(self) -> int:
         return self.worktrees + self.session_temp
 
-    @property
-    def as_of_clock(self) -> str | None:
-        """:attr:`as_of` on this machine's clock, ``HH:MM``: when the last pass began. A time
-        past, said here, by tidy, whose pass it was. A reset time to come is
-        ``format_reset``'s alone, as a distance and a clock (#152); the Doctor's rows spell no
-        clock of their own (``test_reset_formatter``)."""
-        return None if self.as_of is None else self.as_of.astimezone().strftime("%H:%M")
+
+def pass_time_said(when: datetime, now: datetime) -> str:
+    """When a pass began, on this machine's clock, against ``now``: ``at 12:19`` on today's
+    local date, ``on Fri at 12:19`` within the six days before, ``on 21 Nov at 12:19`` before
+    that. Never a bare clock time for another day: that is what read as tonight before #152
+    (reviewer #4130), and a stamp stays fresh for twice ``every_minutes``, up to 14 days.
+
+    A time past, said by tidy, whose pass it was. A reset time to come is ``format_reset``'s
+    alone, as a distance and a clock; the Doctor's rows spell no clock of their own
+    (``test_reset_formatter``)."""
+    local = when.astimezone()
+    days = (now.astimezone().date() - local.date()).days
+    clock = f"at {local:%H:%M}"
+    if days <= 0:
+        return clock
+    if days <= 6:
+        return f"on {local:%a} {clock}"
+    return f"on {local.day} {local:%b} {clock}"
 
 
 @dataclass(frozen=True)
@@ -1599,6 +1613,7 @@ def disk_use(*, budget_s: float | None = None, now: datetime | None = None) -> D
         freed_then=fresh.freed_bytes if fresh else 0,
         unreadable=(*trees.unreadable, *temp.unreadable),
         trees_whole=trees.whole,
+        as_of_said=pass_time_said(fresh.at, at) if fresh else None,
     )
 
 
