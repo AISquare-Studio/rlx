@@ -35,9 +35,11 @@ from textual.geometry import Region
 from textual.notifications import SeverityLevel
 from textual.pilot import Pilot
 from textual.screen import Screen
+from textual.widget import Widget
 from textual.widgets import (
     Button,
     Checkbox,
+    Collapsible,
     DataTable,
     Input,
     OptionList,
@@ -306,9 +308,46 @@ _NO_WORKER = "no worker"
 """A group no worker is in: a settle passed it waits for the messages alone."""
 
 
+async def clickable(pilot: Pilot[Any], selector: str, seconds: float = 10.0) -> Widget:
+    """Until the widget ``selector`` names is mounted, displayed and laid out (a region of its
+    own, which ``Pilot.click`` aims at), and no container is scrolling it.
+
+    A button just revealed has no region until its section is laid out. On a slow runner
+    the click on Spawn ▸ Advanced ▸ Import… went in before that, landed on nothing, and
+    "ImportPersonaScreen never opened" (#3545, #65). Once laid out, the opened section
+    scrolls itself into view, and a scroll can outlast a settle. Aimed mid-scroll, the click
+    pressed down on the button and let go where it no longer was: aimed at row 21, the
+    button at row 18 by the click, so it was never pressed (the same test at -n 3, #65).
+    This is a bounded poll on the condition (``settle_until``).
+    """
+    app = pilot.app
+
+    def ready() -> bool:
+        widget = app.screen.query_one(selector)
+        if not (widget.display and widget.region.area):
+            return False
+        scrolls = [(node, at) for node in widget.ancestors_with_self for at in SCROLLS]
+        return not any(app.animator.is_being_animated(node, at) for node, at in scrolls)
+
+    await settle_until(app, ready, group=_NO_WORKER, timeout=seconds)
+    return app.screen.query_one(selector)
+
+
+SCROLLS = ("scroll_x", "scroll_y")
+"""The attributes a container's scroll animates."""
+
+
+async def click(pilot: Pilot[Any], selector: str) -> None:
+    """Click the widget ``selector`` names once it is :func:`clickable`; the click must land
+    on it, not on whatever was under its corner before it was laid out."""
+    aimed = (await clickable(pilot, selector)).region
+    landed = await pilot.click(selector)
+    assert landed, f"the click on {selector} missed it; it was at {aimed}"
+
+
 async def press(pilot: Pilot[Any], selector: str) -> None:
-    """Click, then wait past the button's 0.2 s active effect so the next click counts."""
-    await pilot.click(selector)
+    """:func:`click`, then wait past the button's 0.2 s active effect so the next click counts."""
+    await click(pilot, selector)
     await pilot.pause(0.3)
 
 
@@ -1019,7 +1058,7 @@ def test_the_editor_saves_only_text_that_parses_and_only_through_the_service(
             what=f"the debounced check ({PARSE_DEBOUNCE} s) to show the text's ✗ status",
         )
         seen: list[Any] = [button.disabled, shown(dialog.query_one("#edit-status", Static))]
-        await pilot.click("#edit-save")  # disabled: nothing may reach the service
+        await click(pilot, "#edit-save")  # disabled: nothing may reach the service
         await pilot.pause()
         seen.append(len(save.calls))
         area.clear()
@@ -2077,16 +2116,81 @@ async def _a_new_pair_programmer(pilot: Pilot[None]) -> None:
     await settle(pilot)
 
 
-def test_an_import_over_it_from_the_spawn_dialog_leaves_the_new_personas_undo_acting_on_nothing(
+#: How late the Advanced section is laid out in the slowed runs: later than a settle waits
+#: (it waits for messages, workers and layout, not timers), as on a slow Windows runner (#65).
+LATE_LAYOUT_S = 0.5
+
+#: How long it then takes to scroll itself into view: longer than a settle's bounded rounds.
+SLOW_SCROLL_S = 2.0
+
+
+def lay_out_late(monkeypatch: pytest.MonkeyPatch, collapsible_id: str) -> None:
+    """The collapsible ``collapsible_id`` opens (or folds) ``LATE_LAYOUT_S`` late, its
+    contents not laid out until then, and then scrolls itself into view over
+    ``SLOW_SCROLL_S``, moving them as it goes. In process; no load."""
+    on_time = Collapsible._watch_collapsed
+    scroll = Collapsible.scroll_visible
+
+    def late(self: Collapsible, collapsed: bool) -> None:
+        if self.id == collapsible_id and self.is_mounted:
+            self.set_timer(LATE_LAYOUT_S, lambda: on_time(self, collapsed))
+        else:
+            on_time(self, collapsed)
+
+    def slowly(self: Collapsible, *args: Any, **kwargs: Any) -> None:
+        if self.id == collapsible_id:
+            kwargs["duration"] = SLOW_SCROLL_S
+        scroll(self, *args, **kwargs)
+
+    monkeypatch.setattr(Collapsible, "_watch_collapsed", late)
+    monkeypatch.setattr(Collapsible, "scroll_visible", slowly)
+
+
+def test_a_button_in_a_section_laid_out_late_is_clickable_once_it_is_at_rest(
     project: ProjectInfo, repo: Path, skills: Recorder, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#65: :func:`clickable` waits past the late layout and the slow scroll into view.
+    When it returns, Import… is laid out and where it stays, so a click aimed at it lets
+    go on it too. A wait on a region alone returned mid-scroll."""
+    from aisquare.cli.ui.spawn import SpawnDialog
+
+    lay_out_late(monkeypatch, "spawn-advanced")
+
+    async def scenario(pilot: Pilot[None], host: Host) -> list[Region]:
+        host.push_screen(SpawnDialog(project, accounts=None, defaults=None))
+        await wait_for(pilot, SpawnDialog)
+        await press(pilot, "#spawn-advanced CollapsibleTitle")
+        button = await clickable(pilot, "#spawn-import")
+        ready = button.region
+        await pilot.wait_for_scheduled_animations()
+        await settle(pilot)
+        return [ready, button.region]
+
+    ready, at_rest = drive(scenario, project=project)
+    assert ready.area, "clickable returned before Import… was laid out"
+    assert ready == at_rest, f"clickable returned mid-scroll: at {ready}, at rest {at_rest}"
+
+
+@pytest.mark.parametrize("late", [False, True], ids=["laid out as it is", "laid out late"])
+def test_an_import_over_it_from_the_spawn_dialog_leaves_the_new_personas_undo_acting_on_nothing(
+    project: ProjectInfo,
+    repo: Path,
+    skills: Recorder,
+    monkeypatch: pytest.MonkeyPatch,
+    late: bool,
 ) -> None:
     """The reviewer of #24 (#1813): Spawn agent ▸ Advanced ▸ Import… is a second way into the
     same Import dialog, Force and all, whose answer never reaches this page. A New made here,
     then imported over from the Spawn dialog: ctrl+z on the page removed the import. Each undo
     checks the persona is as its change left it; changed since, it says so and acts on
-    nothing, and the next ctrl+z goes on to what is older."""
+    nothing, and the next ctrl+z goes on to what is older.
+
+    ``late``: the Advanced section laid out after a settle and scrolled into view slowly, as
+    on a slow runner, where the click on Import… went in before it and missed (#65)."""
     from aisquare.cli.ui.spawn import SpawnDialog
 
+    if late:
+        lay_out_late(monkeypatch, "spawn-advanced")
     imported = skill_text("Pairs, imported from the Spawn dialog.")
 
     def answer(source: str, **options: object) -> personas_service.ImportResult:
@@ -2102,9 +2206,8 @@ def test_an_import_over_it_from_the_spawn_dialog_leaves_the_new_personas_undo_ac
         host.push_screen(SpawnDialog(project, accounts=None, defaults=None))
         await wait_for(pilot, SpawnDialog)
         await settle(pilot)
-        await pilot.click("#spawn-advanced CollapsibleTitle")
-        await settle(pilot)
-        await pilot.click("#spawn-import")
+        await press(pilot, "#spawn-advanced CollapsibleTitle")
+        await press(pilot, "#spawn-import")
         importer = await wait_for(pilot, ImportPersonaScreen)
         importer.query_one("#import-source", Input).value = "./skills/pair-programmer"
         importer.query_one("#import-force", Switch).value = True
