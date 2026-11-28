@@ -97,7 +97,9 @@ def holds_repository(path: Path, *, below_only: bool = False) -> bool:
         except OSError:
             return True
         for entry in entries:
-            if entry.name == ".git" and not (top and below_only):
+            if entry.name == ".git":
+                if top and below_only:
+                    continue  # the checkout's own repository: never walked into, nor counted
                 return True
             if not entry.is_dir(follow_symlinks=False):
                 continue

@@ -481,6 +481,15 @@ def test_a_paused_row_in_a_forgotten_project_still_holds_its_session(
 # --- round 3 (review #3584, manager #3585): no repository is ever deleted --------------------
 
 
+def test_a_checkouts_own_repository_is_not_another(tmp_path: Path, repo: Path) -> None:
+    """A main checkout's ``.git`` is a directory shaped like a bare repository: below its root,
+    it is neither counted nor walked into. A repository inside it is."""
+    assert not cachedir.holds_repository(repo, below_only=True)
+    assert cachedir.holds_repository(repo)
+    _git("init", "-q", str(repo / "vendor" / "inner"), cwd=repo)
+    assert cachedir.holds_repository(repo, below_only=True)
+
+
 @pytest.mark.parametrize("nested", ["an ignored clone", "a submodule's .git file"])
 def test_reap_keeps_a_tree_that_holds_any_repository_but_its_own(
     tmp_path: Path, tmux: object, claude_on_path: Path, project: ProjectInfo, nested: str
