@@ -85,6 +85,10 @@ fn check_7_a_release_build_has_no_debug_methods() {
         "RLXD_TEST_CONNECTOR_MAP_MS",
         "RLXD_TEST_CONNECTORS_SETTLE_MS",
         "RLXD_TEST_HOOK_HOLD_MS",
+        // The runner's test-only holds on a run's record and needs-you (#42).
+        "RLXD_TEST_SLOW_PERSIST",
+        "RLXD_TEST_SLOW_RECORD",
+        "RLXD_TEST_SLOW_RAISE",
     ] {
         let found = bytes
             .windows(needle.len())
