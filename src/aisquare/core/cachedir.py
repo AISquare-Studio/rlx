@@ -107,16 +107,24 @@ def is_bundle(path: Path | str) -> bool:
     """Whether ``path`` is a git bundle (manager #3697: a repository in one file): a regular
     file, no link followed, whose first line is a bundle's (:data:`BUNDLE_SIGNATURES`). Read
     without blocking (never a FIFO's reader), its first line alone."""
+    return _bundle_or_unread(path) is True
+
+
+def _bundle_or_unread(path: Path | str) -> bool | None:
+    """``True`` for a bundle (:func:`is_bundle`), ``False`` for a file that is none or is gone,
+    ``None`` for one that could not be read: what it holds is not known."""
     try:
         fd = os.open(path, _READ_ONLY)
-    except OSError:
+    except FileNotFoundError:
         return False
+    except OSError:
+        return None
     try:
         if not stat.S_ISREG(os.fstat(fd).st_mode):
             return False
         head = os.read(fd, _BUNDLE_HEAD)
     except OSError:
-        return False
+        return None
     finally:
         os.close(fd)
     return head in BUNDLE_SIGNATURES
@@ -140,8 +148,8 @@ def holds_repository(path: Path, *, below_only: bool = False) -> bool:
     a bare repository or a bundle (:func:`is_bundle`), ignored by git or not, links not
     followed (review of #58, C-a).
     ``below_only``: ``path``'s own ``.git`` (a checkout's) is neither counted nor walked into, a
-    repository inside it counts. A folder that cannot be read, or on another filesystem (a
-    mount: no rule crosses one, M3), is taken to hold one: kept."""
+    repository inside it counts. A folder or a file that cannot be read (#3804), or a folder
+    on another filesystem (a mount: no rule crosses one, M3), is taken to hold one: kept."""
     device = _device(path)
     if device is None:
         return True
@@ -161,8 +169,13 @@ def holds_repository(path: Path, *, below_only: bool = False) -> bool:
                     continue  # the checkout's own repository: never walked into, nor counted
                 return True
             if not entry.is_dir(follow_symlinks=False):
-                if entry.is_file(follow_symlinks=False) and is_bundle(entry.path):
-                    return True  # a repository in one file (manager #3697)
+                if (
+                    entry.is_file(follow_symlinks=False)
+                    and _bundle_or_unread(entry.path) is not False
+                ):
+                    # A repository in one file (manager #3697), or a file that could not be
+                    # read, as an unreadable folder is: taken to hold one (#3804).
+                    return True
                 continue
             inner = Path(entry.path)
             if _device(inner) != device:
