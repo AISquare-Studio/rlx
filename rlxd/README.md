@@ -292,8 +292,9 @@ rlxd call env.get
   the values it already has doesn't restart it.
 - **Keychain.** rlx keeps `/usr/bin/security` as the only Keychain reader, and rlxd
   links no Keychain crate. `deny.toml` bans `security-framework` and `keyring` for
-  `rlxd.yml`'s `cargo deny`, and `tests/env.rs` runs 4.3's `cargo tree` line as written,
-  then with `--target all -e normal`.
+  `rlxd.yml`'s `cargo deny`. `tests/env.rs` runs 4.3's line as written (`cargo tree
+  --manifest-path rlxd/Cargo.toml --target all -e normal > tree.txt && …`) through `sh`
+  on macOS and Linux, and its `cargo tree` and `grep` on every OS.
 
 `crates/rlxd/tests/env.rs` runs 4.3's Accept lines that start no run, and
 `crates/rlxd/tests/env_runs.rs` those that do, with fake-claude's `print-env`, on three

@@ -1036,6 +1036,58 @@ fn an_allow_rule_planted_after_claude_code_starts_is_refused_before_the_call() {
     assert!(ledger(&home, &r).is_empty());
 }
 
+#[test]
+fn an_allow_rule_planted_while_a_call_waits_its_turn_is_refused_before_claude_code_starts() {
+    // The watch pool has one place. A call waiting on the app holds it, so the next one
+    // queues, its run's folder made. A rule planted in that call's working folder then is
+    // found before its Claude Code is started, and it never is.
+    let home = home("mcp-direct", &[]);
+    let _app = App::open(&home);
+    let since = seq(&home);
+    let (first, second) = (run_id(), run_id());
+    let first_reply = call_in_background(&home, &accept_params(&first));
+    let events = wait_until(&home, since, "the first call reaches the app", |e| {
+        !of(e, &first, Some("run.tool_call")).is_empty()
+    });
+    let call_id = one(&events, &first, "run.tool_call")["data"]["call_id"].clone();
+    let second_reply = call_in_background(&home, &accept_params(&second));
+    wait_until(&home, since, "the second call waits its turn", |e| {
+        !of(e, &second, Some("run.queued")).is_empty()
+    });
+    let rule = json!({"permissions": {"allow": [SLACK_READ, "mcp__claude_ai_Slack"]}});
+    let call_dir = home
+        .root()
+        .join("rlxd")
+        .join("runs")
+        .join(&second)
+        .join("call");
+    plant(&call_dir.join(".claude").join("settings.json"), &rule);
+    let denied = decide(&home, &first, &call_id, "deny");
+    assert_eq!(denied.code(), Some(0), "{denied:?}");
+    let run = finish(first_reply);
+    assert_eq!(refusal(&run).0, "denied", "{run:?}");
+
+    let run = finish(second_reply);
+    let (code, detail) = refusal(&run);
+    assert_eq!(code, "untrusted_settings", "{run:?}");
+    assert_eq!(detail["run_id"], second.as_str());
+    let path = std::path::PathBuf::from(detail["path"].as_str().unwrap());
+    assert!(
+        path.ends_with(
+            std::path::Path::new(&second)
+                .join("call")
+                .join(".claude")
+                .join("settings.json")
+        ),
+        "{}",
+        path.display()
+    );
+    // The one start is the first call's.
+    let log = fixture_log(&home);
+    assert_eq!(log["starts"].as_array().unwrap().len(), 1, "{log:#}");
+    assert!(ledger(&home, &second).is_empty());
+}
+
 // --- Every read is bounded ----------------------------------------------------------------
 
 /// A call to `scenario` that must fail `call_failed`, its message saying `says`, within
