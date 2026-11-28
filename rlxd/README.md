@@ -513,21 +513,23 @@ listing, 5.5 and 7.7): `crate::connectors`, and the gate in `crate::runner::conn
   new sign-in, to read at once. The file is rlxd's alone (0600); the homes and the mark
   are never on the wire, in an event, or in rlxd's log. When the runs'
   `CLAUDE_CONFIG_DIR` names one (the app's when it set one, as runs get it, 4.3; else
-  rlxd's own), rlxd asks the brain at its start, and again after an `env.set` that
-  leaves it unknown, so it knows which account its own runs use (with none named, they
-  use the plain account). Without a
+  rlxd's own), or a run's init waits, rlxd asks the brain, at its start and after an
+  `env.set` that leaves it unknown, so it knows which account each run used (with none
+  named, the plain account). The ask runs on its own: an `env.set` made meanwhile is
+  taken at once. Without a
   brain, there is the plain account alone; with the brain unavailable, the accounts stay
   as they were. A managed account is read only with both of its homes as rlx gave them:
   one whose `CLAUDE_CODE_TMPDIR` rlxd doesn't know (a restart with no brain to say it) is
   not read, `account_unknown`, rather than read with rlxd's own. An account gone from its
   list is dropped, with a `connector.removed {account, id}` for each of its connectors.
-- **The cache.** Each `system/init` rlxd takes as a run's truth updates the account the
-  runs use, as the brain gave it: the plain account when the runs' environment names no
-  `CLAUDE_CONFIG_DIR` (the app's when it set one, else rlxd's own), else the account
-  whose `CLAUDE_CONFIG_DIR` it is, matched by its resolved path. Each `env.set` that
-  changes the app's values settles that again. Until rlx has said which accounts there
-  are, rlxd holds the latest init and files it then; one that is no account rlx knows is
-  filed nowhere, never under a guess, as is one held when the runs' home changes. That is an ungated run's (not `no_tools`, which lists none), a gated run's once
+- **The cache.** Each `system/init` rlxd takes as a run's truth updates the account its
+  own attempt ran on, as the brain gave it: by the `CLAUDE_CONFIG_DIR` that attempt
+  started with (the app's then, when it set one, else rlxd's own), never the runs' home
+  now, which an `env.set` may have changed since. That is the account whose
+  `CLAUDE_CONFIG_DIR` it is, matched by its resolved path, or the plain account when it
+  names none. Until rlx has said which accounts there are, rlxd holds the latest init
+  with that home and files it by it then; one that is no account rlx knows is filed
+  nowhere, never under a guess. That is an ungated run's (not `no_tools`, which lists none), a gated run's once
   confirmed, the last try's of one that failed, and a one-turn probe's. So does a
   `connectors.call` that finds its connector `needs-auth` or `failed`. A read that lists
   no server at all empties nothing, since a Claude Code that loaded none (E9's stdin at

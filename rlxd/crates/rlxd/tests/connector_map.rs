@@ -82,7 +82,16 @@ fn map_home(no_turn: bool, envs: &[(&str, &str)]) -> (TestHome, Accounts) {
 
 /// [`map_home`], slot 2's connectors being `rows` from its start.
 fn map_home_with(no_turn: bool, envs: &[(&str, &str)], rows: &Value) -> (TestHome, Accounts) {
-    let root = TestHome::new();
+    map_home_in(TestHome::new(), no_turn, envs, rows)
+}
+
+/// [`map_home_with`] in `root`, a home not yet started (one with a brain of its own).
+fn map_home_in(
+    root: TestHome,
+    no_turn: bool,
+    envs: &[(&str, &str)],
+    rows: &Value,
+) -> (TestHome, Accounts) {
     let accounts = Accounts::of(root.root());
     accounts.set(1, &slack("connected"));
     accounts.set(2, rows);
@@ -1027,4 +1036,131 @@ fn a_runs_init_is_filed_under_the_account_whose_home_the_app_set() {
     let started = starts(&home);
     let named = started.last().unwrap()["env"]["CLAUDE_CONFIG_DIR"].clone();
     assert!(named.is_null() || named == "", "{started:#?}");
+}
+
+/// A connectors widget run, which reads Slack.
+fn widget() -> Value {
+    json!({"kind": "widget_refresh", "prompt": "digest",
+        "mount": {"kind": "connectors", "connectors": [SLACK]}, "space": "default"})
+}
+
+/// `env.set` from the app, which must succeed.
+fn app_sets(home: &TestHome, change: &Value) {
+    let run = home.rlxd(&["call", "--as-app", "env.set", &change.to_string()]);
+    assert_eq!(run.code(), Some(0), "{run:?}");
+}
+
+/// Slack's status in `slot`'s connectors now, or null.
+fn slack_status(home: &TestHome, slot: u32) -> Value {
+    row(&list(home, &json!({})), slot)["connectors"][0]["status"].clone()
+}
+
+#[test]
+fn a_runs_init_is_filed_by_the_home_its_attempt_ran_on_though_an_env_set_changed_it_since() {
+    // #4167 F1: the app's home is slot 2's when the run starts, and the plain one's by
+    // the time its init (10 s in) comes. It is slot 2's init.
+    let (home, accounts) = map_home(false, &[]);
+    app_sets(
+        &home,
+        &json!({"CLAUDE_CONFIG_DIR": accounts.managed.to_str().unwrap()}),
+    );
+    std::fs::write(home.root().join("scenario"), "connectors-slow-init").unwrap();
+    let since = seq(&home);
+    let id = run_id();
+    start(&home, &widget(), &id);
+    eventually("the run's Claude Code is started", || {
+        starts(&home).len() == 1
+    });
+    assert_eq!(
+        starts(&home)[0]["env"]["CLAUDE_CONFIG_DIR"],
+        accounts.managed.to_str().unwrap()
+    );
+    app_sets(&home, &json!({"CLAUDE_CONFIG_DIR": ""}));
+    // Its init comes 10 s in, past `ended`'s wait.
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    while slack_status(&home, 2) != "connected" {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "never: the init is slot 2's"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    ended(&home, &id);
+    let data = list(&home, &json!({}));
+    assert_eq!(row(&data, 2)["from"], "init", "{data:#}");
+    assert_eq!(row(&data, 1)["connectors"], json!([]), "{data:#}");
+    let events = connector_events(&home, since);
+    assert!(
+        events.iter().all(|e| e["data"]["account"] == 2),
+        "nothing of slot 1's: {events:#?}"
+    );
+}
+
+#[test]
+fn an_init_held_for_the_brain_is_filed_by_its_own_home_and_a_later_runs_by_theirs() {
+    // #4167 F2 and M9. rlxd learns slot 2 from RLXD_TEST_ACCOUNTS, with the app's home
+    // slot 2's, and a run files slot 2's Slack connected.
+    let brain = TestHome::new().with_rlx(common::fake_brain("print-env"));
+    let (mut home, accounts) = map_home_in(brain, false, &[], &slack("needs-auth"));
+    app_sets(
+        &home,
+        &json!({"CLAUDE_CONFIG_DIR": accounts.managed.to_str().unwrap()}),
+    );
+    std::fs::write(home.root().join("scenario"), "init-connectors").unwrap();
+    let id = run_id();
+    start(&home, &widget(), &id);
+    ended(&home, &id);
+    eventually("slot 2's Slack is connected", || {
+        slack_status(&home, 2) == "connected"
+    });
+
+    // Restarted with the real brain path: its `accounts` is accepted and then held, so
+    // rlx hasn't said which accounts there are. The app's home is still slot 2's.
+    home.stop();
+    home.remove_env("RLXD_TEST_ACCOUNTS");
+    let (hold, busy) = (
+        home.root().join("fake-brain-hold"),
+        home.root().join("fake-brain-busy"),
+    );
+    std::fs::write(&hold, "").unwrap();
+    let _ = std::fs::remove_file(&busy);
+    home.start_dev();
+    eventually("the brain holds the accounts ask", || busy.exists());
+
+    // A run on slot 2's home: its init (Slack signed out) waits for the brain.
+    std::fs::write(home.root().join("scenario"), "connectors-needs-auth").unwrap();
+    let held = run_id();
+    start(&home, &widget(), &held);
+    ended(&home, &held);
+    assert_eq!(slack_status(&home, 2), "connected", "held, not filed yet");
+
+    // The app's home changes while the ask is pending (M9), and a run on the plain home
+    // files under slot 1 at once (F2), never under slot 2 by a stale home.
+    app_sets(&home, &json!({"CLAUDE_CONFIG_DIR": ""}));
+    std::fs::write(home.root().join("scenario"), "init-connectors").unwrap();
+    let plain = run_id();
+    start(&home, &widget(), &plain);
+    ended(&home, &plain);
+    eventually("the plain run's init is slot 1's", || {
+        slack_status(&home, 1) == "connected"
+    });
+    assert_eq!(
+        slack_status(&home, 2),
+        "connected",
+        "{:#}",
+        list(&home, &json!({}))
+    );
+
+    // The brain answers with no accounts list: they stay as they were, and the held init
+    // is filed by the home it ran on, slot 2's, though the app's is the plain one now.
+    std::fs::remove_file(&hold).unwrap();
+    eventually("the held init is slot 2's", || {
+        slack_status(&home, 2) == "needs-auth"
+    });
+    assert_eq!(
+        slack_status(&home, 1),
+        "connected",
+        "{:#}",
+        list(&home, &json!({}))
+    );
 }

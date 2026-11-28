@@ -24,6 +24,7 @@
 //!   read in the background at most daily, unless it is new or signed in again.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
@@ -56,6 +57,9 @@ pub struct ConnectorMap {
     /// The reads under way, by slot: a refresh of an account being read joins that read,
     /// and takes its outcome.
     reading: Mutex<HashMap<u32, Reading>>,
+    /// Whether [`ConnectorMap::follow_env`]'s ask of the brain for the accounts is under
+    /// way: one at a time.
+    asking: AtomicBool,
 }
 
 /// One read under way: its outcome, once it has one.
@@ -84,6 +88,7 @@ impl ConnectorMap {
             connectors,
             brain,
             reading: Mutex::new(HashMap::new()),
+            asking: AtomicBool::new(false),
         })
     }
 
@@ -244,16 +249,21 @@ impl ConnectorMap {
         }
     }
 
-    /// Settles which account rlxd's runs use again on each change to the app's values,
+    /// Works out again which account rlxd's runs use on each change to the app's values,
     /// as runs take the app's `CLAUDE_CONFIG_DIR` (4.3), and asks the brain for the
-    /// accounts when that leaves it unknown. Once at its start too, for a change made
-    /// before it listened.
+    /// accounts when rlx has yet to say them and it matters. Once at its start too, for a
+    /// change made before it listened. The ask runs on its own, so a change made while it
+    /// waits on the brain is taken at once.
     async fn follow_env(self: Arc<Self>) {
         let mut changes = self.connectors.env_changes();
         loop {
             off_worker(|| self.connectors.env_changed());
-            if self.connectors.runs_account_unknown() {
-                self.learn_accounts().await;
+            if self.connectors.runs_account_unknown() && !self.asking.swap(true, Ordering::SeqCst) {
+                let map = Arc::clone(&self);
+                tokio::spawn(async move {
+                    map.learn_accounts().await;
+                    map.asking.store(false, Ordering::SeqCst);
+                });
             }
             if changes.changed().await.is_err() {
                 return;

@@ -192,6 +192,12 @@ impl TestHome {
         self.envs.push((name.to_owned(), value.to_owned()));
     }
 
+    /// Stops setting `name` for the `rlxd`s run in this home from now on: they inherit
+    /// the test's own, for a restart with another environment.
+    pub fn remove_env(&mut self, name: &str) {
+        self.envs.retain(|(each, _)| each != name);
+    }
+
     /// This home, its rlxd given a `HOME`, `USERPROFILE` and `CLAUDE_CONFIG_DIR` of its own
     /// in the home (`user-home`, `claude-config`), so a `claude` it starts reads none of
     /// the user's: for a test whose rlxd looks for `claude` on a `PATH` (the stub).

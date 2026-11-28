@@ -1876,7 +1876,9 @@ impl Runner {
                         continue;
                     }
                     if let Some(init) = init.filter(|_| reads_connectors(params)) {
-                        blocking(|| self.connectors.observe(init.observed()));
+                        // Filed by the home this attempt ran on, never the runs' home now.
+                        let home = values.claude_config_dir.as_deref();
+                        blocking(|| self.connectors.observe(init.observed(), home));
                     }
                     End::Failed(
                         RunFailedData::new(
@@ -2092,6 +2094,7 @@ impl Runner {
                 gate,
                 deadline,
                 confirmed,
+                values.claude_config_dir.as_deref(),
             )
             .await;
         let end = match streamed {
@@ -2195,6 +2198,7 @@ impl Runner {
         gate: Option<&Gate>,
         deadline: Option<Instant>,
         delivered: &mut bool,
+        home: Option<&str>,
     ) -> Streamed {
         let params = &run.params;
         let try_started = Instant::now();
@@ -2446,7 +2450,9 @@ impl Runner {
                 // only after the gate has what the init listed: a hook that asks about the
                 // turn's first call never waits on the cache (5.1).
                 if let Some(init) = seen {
-                    blocking(|| self.connectors.observe(init.observed()));
+                    // Filed by the home this attempt ran on (4.3), never the runs' home now,
+                    // which an env.set may have changed since it started.
+                    blocking(|| self.connectors.observe(init.observed(), home));
                 }
             }
         }

@@ -186,13 +186,10 @@ fn canonical(dir: &std::path::Path) -> PathBuf {
     std::fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf())
 }
 
-/// The `CLAUDE_CONFIG_DIR` rlxd's runs use, resolved: the app's when `values` set one, as
-/// a run's Claude Code gets it (4.3), else rlxd's own (`rlxd`, resolved already).
-fn runs_home(values: &rlxd_proto::EnvValues, rlxd: Option<&std::path::Path>) -> Option<PathBuf> {
-    values
-        .claude_config_dir
-        .as_deref()
-        .filter(|dir| !dir.is_empty())
+/// The `CLAUDE_CONFIG_DIR` a run runs on, resolved: `app`'s, the app's value, when it is
+/// one, as the run's Claude Code gets it (4.3), else rlxd's own (`rlxd`, resolved already).
+fn runs_home(app: Option<&str>, rlxd: Option<&std::path::Path>) -> Option<PathBuf> {
+    app.filter(|dir| !dir.is_empty())
         .map(|dir| canonical(std::path::Path::new(dir)))
         .or_else(|| rlxd.map(std::path::Path::to_path_buf))
 }
@@ -251,6 +248,14 @@ fn runs_of(
         None if !listed => Runs::Slot(DEFAULT_ACCOUNT),
         None => Runs::Nowhere,
     }
+}
+
+/// Logs that a run's `system/init` is filed under no account.
+fn filed_nowhere() {
+    info!(
+        "connectors: a run's connectors are filed under no account: its CLAUDE_CONFIG_DIR is \
+         no account rlx knows"
+    );
 }
 
 /// What a run's `system/init` listed, kept until rlx says which account it belongs to.
@@ -401,19 +406,19 @@ pub struct Connectors {
     accounts: Mutex<BTreeMap<u32, Account>>,
     /// rlxd's own `CLAUDE_CONFIG_DIR`, resolved once, when its environment names one.
     rlxd_dir: Option<PathBuf>,
-    /// The `CLAUDE_CONFIG_DIR` rlxd's runs use, resolved: the app's when it set one (4.3),
-    /// as a run's Claude Code gets it, else rlxd's own. Settled again on each change to
-    /// the app's values ([`Connectors::env_changed`]).
-    own_dir: Mutex<Option<PathBuf>>,
     /// Whether rlx has said which accounts there are, or couldn't.
     told: AtomicBool,
-    /// Held while the runs' account is worked out and taken, so two of them never cross.
+    /// Held while an account is worked out for the runs or for a run's init and taken, so
+    /// that never crosses a change to the accounts.
     settling: Mutex<()>,
-    /// Which account rlxd's runs use ([`Connectors::runs_account`]).
+    /// Which account rlxd's runs use now: what a run, call or login started now runs on,
+    /// the plain one when their environment names no `CLAUDE_CONFIG_DIR` (the app's when
+    /// it set one, 4.3, else rlxd's own), else the one whose resolved `CLAUDE_CONFIG_DIR`
+    /// it is.
     runs: Mutex<Runs>,
-    /// The latest run's `system/init` that came before then: taken as that account's once
-    /// rlx has said which it is.
-    held: Mutex<Option<Seen>>,
+    /// The latest run's `system/init` that came before rlx said which accounts there are,
+    /// with the resolved home its attempt ran on: filed by that home once rlx has said.
+    held: Mutex<Option<(Seen, Option<PathBuf>)>>,
     /// Whether this Claude Code reports connector states before the first message (5.5,
     /// route 1): the capability `connectors.gate_before_turn`.
     route_1: bool,
@@ -487,15 +492,17 @@ impl Connectors {
             );
         }
         let rlxd_dir = own_dir.map(canonical);
-        let own_dir = runs_home(&env.values(), rlxd_dir.as_deref());
-        let runs = runs_of(own_dir.as_deref(), &accounts, false, saved.listed);
+        let runs_dir = runs_home(
+            env.values().claude_config_dir.as_deref(),
+            rlxd_dir.as_deref(),
+        );
+        let runs = runs_of(runs_dir.as_deref(), &accounts, false, saved.listed);
         Arc::new(Self {
             home,
             bus,
             cache: Mutex::new(saved),
             accounts: Mutex::new(accounts),
             rlxd_dir,
-            own_dir: Mutex::new(own_dir),
             told: AtomicBool::new(false),
             settling: Mutex::new(()),
             runs: Mutex::new(runs),
@@ -594,20 +601,15 @@ impl Connectors {
         self.known().get(&slot).cloned()
     }
 
-    /// The account rlxd's runs, calls and logins use, as rlx knows it (its mark
-    /// included): the plain one when their environment names no `CLAUDE_CONFIG_DIR` (the
-    /// app's when it set one, 4.3, else rlxd's own), else the one whose resolved
-    /// `CLAUDE_CONFIG_DIR` it is. `None` while rlx hasn't said which accounts there are,
-    /// and when it is none of theirs.
-    pub fn runs_account(&self) -> Option<Account> {
-        let slot = self.runs_slot()?;
-        self.account(slot)
-    }
-
-    /// Whether rlx has yet to say which account rlxd's runs use: only while their
-    /// environment names a `CLAUDE_CONFIG_DIR`.
+    /// Whether rlx has yet to say which accounts there are while it matters: the runs'
+    /// environment names a `CLAUDE_CONFIG_DIR`, or a run's init waits for it.
     pub fn runs_account_unknown(&self) -> bool {
         self.runs_now() == Runs::Waiting
+            || self
+                .held
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .is_some()
     }
 
     fn runs_now(&self) -> Runs {
@@ -625,50 +627,31 @@ impl Connectors {
         self.told.store(true, Ordering::SeqCst);
         let known = self.known().clone();
         let listed = self.cache().listed;
-        let own = self.own_dir();
-        self.settle_runs(runs_of(own.as_deref(), &known, true, listed));
+        let home = self.runs_home_now();
+        self.settle_runs(runs_of(home.as_deref(), &known, true, listed));
     }
 
-    /// The `CLAUDE_CONFIG_DIR` rlxd's runs use now, resolved.
-    fn own_dir(&self) -> Option<PathBuf> {
-        self.own_dir
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .clone()
+    /// The `CLAUDE_CONFIG_DIR` a run started now runs on, resolved: the app's when it set
+    /// one (4.3), else rlxd's own.
+    fn runs_home_now(&self) -> Option<PathBuf> {
+        runs_home(
+            self.env.values().claude_config_dir.as_deref(),
+            self.rlxd_dir.as_deref(),
+        )
     }
 
-    /// Settles again which account rlxd's runs use, after a change to the app's values:
-    /// runs take the app's `CLAUDE_CONFIG_DIR` when it set one, else rlxd's own (4.3), and
-    /// a run's `system/init` is filed under the account whose home that is, by the rules
-    /// [`runs_of`] gives. An init held for the accounts, which came from runs on the home
-    /// before, is filed under no account, never under another home's. Resolves the home:
-    /// never under the cache's lock.
+    /// Works out again which account rlxd's runs use now, after a change to the app's
+    /// values: what a run, call or login started from now on runs on. A run's
+    /// `system/init` is filed by the home its own attempt ran on ([`Connectors::observe`]),
+    /// never by this. Resolves the home: never under the cache's lock.
     pub fn env_changed(&self) {
         let _settling = self.settling.lock().unwrap_or_else(|p| p.into_inner());
-        let own = runs_home(&self.env.values(), self.rlxd_dir.as_deref());
-        let before = std::mem::replace(
-            &mut *self.own_dir.lock().unwrap_or_else(|p| p.into_inner()),
-            own.clone(),
-        );
-        if before == own {
-            return;
-        }
-        if self
-            .held
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .take()
-            .is_some()
-        {
-            info!(
-                "connectors: a run's connectors held for the accounts are filed under no \
-                 account: the runs' CLAUDE_CONFIG_DIR changed"
-            );
-        }
+        let home = self.runs_home_now();
         let known = self.known().clone();
         let listed = self.cache().listed;
         let told = self.told.load(Ordering::SeqCst);
-        self.settle_runs(runs_of(own.as_deref(), &known, told, listed));
+        *self.runs.lock().unwrap_or_else(|p| p.into_inner()) =
+            runs_of(home.as_deref(), &known, told, listed);
     }
 
     /// Each change to the app's values from here on: what [`Connectors::env_changed`]
@@ -677,21 +660,26 @@ impl Connectors {
         self.env.subscribe()
     }
 
-    /// Takes `runs` as the runs' account, and files the `system/init` held until it was
-    /// known, or, when it is no account rlx knows, lets it go.
+    /// Takes `runs` as the runs' account now, and files the `system/init` held until rlx
+    /// said which accounts there are, by the home its own attempt ran on: under the
+    /// account whose home that is, or nowhere when it is no account rlx knows.
     fn settle_runs(&self, runs: Runs) {
         *self.runs.lock().unwrap_or_else(|p| p.into_inner()) = runs;
         if runs == Runs::Waiting {
             return;
         }
         let held = self.held.lock().unwrap_or_else(|p| p.into_inner()).take();
-        match (held, self.runs_account()) {
-            (Some(seen), Some(account)) => self.observe_on(&account, seen.observed(), Read::Init),
-            (Some(_), None) => info!(
-                "connectors: a run's connectors are filed under no account: the runs' \
-                 CLAUDE_CONFIG_DIR is no account rlx knows"
-            ),
-            (None, _) => {}
+        let Some((seen, home)) = held else {
+            return;
+        };
+        let known = self.known().clone();
+        let listed = self.cache().listed;
+        match runs_of(home.as_deref(), &known, true, listed) {
+            Runs::Slot(slot) => match known.get(&slot) {
+                Some(account) => self.observe_on(account, seen.observed(), Read::Init),
+                None => filed_nowhere(),
+            },
+            Runs::Waiting | Runs::Nowhere => filed_nowhere(),
         }
     }
 
@@ -722,8 +710,8 @@ impl Connectors {
             now.insert(account.slot, account);
         }
         // Each home resolved before the cache's lock is taken.
-        let own = self.own_dir();
-        let runs = runs_of(own.as_deref(), &now, true, true);
+        let home = self.runs_home_now();
+        let runs = runs_of(home.as_deref(), &now, true, true);
         let mut cache = self.cache();
         let mut changed = !cache.listed;
         cache.listed = true;
@@ -821,21 +809,39 @@ impl Connectors {
         .with_accounts(listed)
     }
 
-    /// Takes a run's `system/init` as the runs' account's connectors now
-    /// ([`Connectors::observe_on`]), as rlx knows that account. Until rlx has said which
-    /// account that is, the latest init is held, and taken then; when it is no account
-    /// rlx knows, it is filed nowhere.
-    pub fn observe(&self, init: Observed<'_>) {
-        match (self.runs_now(), self.runs_account()) {
-            (Runs::Slot(_), Some(account)) => self.observe_on(&account, init, Read::Init),
-            (Runs::Waiting, _) => {
-                info!("connectors: a run's connectors wait for rlx to say which account it is");
-                *self.held.lock().unwrap_or_else(|p| p.into_inner()) = Some(Seen::of(init));
+    /// Takes a run's `system/init` as the connectors now of the account its attempt ran on
+    /// ([`Connectors::observe_on`]), as rlx knows that account: the one whose resolved
+    /// `CLAUDE_CONFIG_DIR` is `home`'s, the plain account when it names none, and none
+    /// when no account has that home. `home` is the `CLAUDE_CONFIG_DIR` the app's values
+    /// gave that attempt when it started, `None` when they gave none: then it ran on
+    /// rlxd's own. Never the runs' home now, which an `env.set` may have changed since.
+    /// Until rlx has said which accounts there are, the latest such init is held with its
+    /// home, and filed by it then.
+    pub fn observe(&self, init: Observed<'_>, home: Option<&str>) {
+        let home = runs_home(home, self.rlxd_dir.as_deref());
+        let account = {
+            let _settling = self.settling.lock().unwrap_or_else(|p| p.into_inner());
+            let known = self.known().clone();
+            let listed = self.cache().listed;
+            match runs_of(
+                home.as_deref(),
+                &known,
+                self.told.load(Ordering::SeqCst),
+                listed,
+            ) {
+                Runs::Waiting => {
+                    info!("connectors: a run's connectors wait for rlx to say which account it is");
+                    *self.held.lock().unwrap_or_else(|p| p.into_inner()) =
+                        Some((Seen::of(init), home));
+                    return;
+                }
+                Runs::Slot(slot) => known.get(&slot).cloned(),
+                Runs::Nowhere => None,
             }
-            _ => info!(
-                "connectors: a run's connectors are filed under no account: the runs' \
-                 CLAUDE_CONFIG_DIR is no account rlx knows"
-            ),
+        };
+        match account {
+            Some(account) => self.observe_on(&account, init, Read::Init),
+            None => filed_nowhere(),
         }
     }
 
@@ -1479,8 +1485,8 @@ mod tests {
         let none = (HashMap::new(), HashMap::new());
         let slack = [McpServer::new("claude.ai Slack", "connected")];
         let tools = ["mcp__claude_ai_Slack__read".to_owned()];
-        connectors.observe(seen(&slack, &tools, &none));
-        connectors.observe(seen(&[], &[], &none));
+        connectors.observe(seen(&slack, &tools, &none), None);
+        connectors.observe(seen(&[], &[], &none), None);
         let list = connectors.list(0, None);
         assert_eq!(list.connectors.len(), 1);
         assert_eq!(list.connectors[0].tools.len(), 1);
@@ -1499,7 +1505,7 @@ mod tests {
         let slack = |status| McpServer::new("claude.ai Slack", status);
         let local = McpServer::new("local", "connected");
         for status in ["needs-auth", "needs-auth", "connected", "connected"] {
-            connectors.observe(seen(&[slack(status), local.clone()], &[], &none));
+            connectors.observe(seen(&[slack(status), local.clone()], &[], &none), None);
         }
         let both = vec!["claude.ai Slack".to_owned(), "local".to_owned()];
         // local's coming, then Slack's sign-in back; nothing for no change.
@@ -1531,7 +1537,7 @@ mod tests {
         let none = (HashMap::new(), HashMap::new());
         assert_eq!(connectors.set_accounts(vec![managed(2, "b")]).len(), 2);
         let slack = |status| [McpServer::new("claude.ai Slack", status)];
-        connectors.observe(seen(&slack("connected"), &[], &none));
+        connectors.observe(seen(&slack("connected"), &[], &none), None);
         connectors.observe_on(
             &managed(2, "b"),
             seen(&slack("needs-auth"), &[], &none),
@@ -1580,7 +1586,7 @@ mod tests {
         assert_eq!(connectors.stale(Duration::from_secs(1)).len(), 1);
         let none = (HashMap::new(), HashMap::new());
         let slack = [McpServer::new("claude.ai Slack", "connected")];
-        connectors.observe(seen(&slack, &[], &none));
+        connectors.observe(seen(&slack, &[], &none), None);
         assert!(connectors.stale(Duration::from_secs(3600)).is_empty());
     }
 
@@ -1595,7 +1601,7 @@ mod tests {
         let connectors = Connectors::with_own_dir(home, Arc::new(bus.unwrap()), env, Some(&slot));
         let none = (HashMap::new(), HashMap::new());
         let slack = [McpServer::new("claude.ai Slack", "connected")];
-        connectors.observe(seen(&slack, &[], &none));
+        connectors.observe(seen(&slack, &[], &none), None);
         assert!(
             connectors.list(0, None).accounts[0].connectors.is_empty(),
             "held"
@@ -1628,13 +1634,13 @@ mod tests {
         let connectors = dir.connectors();
         let none = (HashMap::new(), HashMap::new());
         let slack = [McpServer::new("claude.ai Slack", "connected")];
-        connectors.observe(seen(&slack, &[], &none));
+        connectors.observe(seen(&slack, &[], &none), None);
         let error = ErrorBody::new("no_route", "no mcp_status").unwrap();
         connectors.refresh_failed(&Account::default_one(), error.clone());
         let list = connectors.list(0, None);
         assert_eq!(list.connectors.len(), 1);
         assert_eq!(list.accounts[0].error.as_ref(), Some(&error));
-        connectors.observe(seen(&slack, &[], &none));
+        connectors.observe(seen(&slack, &[], &none), None);
         assert_eq!(connectors.list(0, None).accounts[0].error, None);
     }
 
