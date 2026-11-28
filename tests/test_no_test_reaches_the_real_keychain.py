@@ -229,15 +229,22 @@ def test_a_test_that_reaches_the_tool_fails_at_teardown_naming_itself(
             f"""
             import os, subprocess, sys
 
+            # A variable, given to the child by repr: a Windows path's backslashes don't survive
+            # two string literals ("\\U" opens a unicode escape).
+            TOOL = {stand_in!r}
+
             def test_swallows_the_refusal():
                 try:
-                    subprocess.run([{stand_in!r}, "-h"], capture_output=True)
+                    subprocess.run([TOOL, "-h"], capture_output=True)
                 except OSError:
                     pass
 
             def test_its_child_tries():
-                code = "import subprocess; subprocess.run([{stand_in!r}, '-h'])"
-                subprocess.run([sys.executable, "-c", code], env=os.environ, capture_output=True)
+                code = "import subprocess; subprocess.run([" + repr(TOOL) + ", '-h'])"
+                done = subprocess.run(
+                    [sys.executable, "-c", code], env=os.environ, capture_output=True, text=True
+                )
+                assert "KeychainRefused" in done.stderr, done.stderr
 
             def test_never_tries():
                 assert True

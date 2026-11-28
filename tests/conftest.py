@@ -531,6 +531,13 @@ _SHELLS_CEILING = filter(None, os.environ.get("GIT_CEILING_DIRECTORIES", "").spl
 GIT_CEILING = os.pathsep.join(dict.fromkeys([str(_DEVELOPERS_HOME), *_SHELLS_CEILING]))
 os.environ["GIT_CEILING_DIRECTORIES"] = GIT_CEILING
 
+#: Where the native suites' homes go: a folder outside every agent sandbox's temporary roots
+#: (``/tmp``, ``$TMPDIR``). ``RLX_TESTS_NATIVE_HOMES`` names one; CI's ``RUNNER_TEMP`` is one.
+#: Under the run's temp root, a real Codex's launch is refused, rightly: the hooks' interpreter
+#: (a system Python, not a venv) loads ``$HOME``'s user site, which that sandbox could write
+#: (``store_broker.install_inside``; #646's run 46097597808, every Codex native job).
+NATIVE_HOMES = os.environ.get("RLX_TESTS_NATIVE_HOMES") or os.environ.get("RUNNER_TEMP") or None
+
 #: What the suite's guard refuses to let any test or child open, list or change (#54): the real
 #: home's ``.claude*``, ``.codex*``, ``.aisquare`` and ``.rlx``, and the Claude Code, Codex and
 #: rlx directories the shell named, as the run found them. Every test's ``HOME`` is its own
@@ -541,6 +548,8 @@ _GUARDED = rlx_keychain_guard.guarded_paths(_DEVELOPERS_HOME, os.environ)
 #: tmux folders, ``tests/private_fleets.py``, where ``no_real_fleet`` puts its stand-ins) and
 #: this checkout.
 _RUN_ROOTS = [tempfile.gettempdir(), "/tmp", str(SRC.parent)]
+if NATIVE_HOMES is not None:
+    _RUN_ROOTS.append(os.path.join(NATIVE_HOMES, "rlx-native-homes"))
 rlx_keychain_guard.configure(_GUARDED, _RUN_ROOTS, real_home=_DEVELOPERS_HOME)
 rlx_keychain_guard.install()
 
@@ -700,14 +709,28 @@ def isolated_user_home(
     (:data:`_TEMP_ROOT`): ``core.workspace`` walks up past a test's ``HOME``, so from inside the
     real home a markerless folder resolved to the real home as a project (reviewer #3717). A
     test file of the native suites may run the real ``claude`` and ``codex``
-    (:func:`real_agent_binaries`).
+    (:func:`real_agent_binaries`), and its home is outside every sandbox's temporary roots
+    (:data:`NATIVE_HOMES`).
     """
     home = tmp_path.with_name(tmp_path.name + "-home")
+    if request.node.path.name.startswith(NATIVE_SUITES):
+        request.getfixturevalue("real_agent_binaries")
+        home = _native_home(tmp_path, request) or home
     home.mkdir(exist_ok=True)
     for name in USER_HOME_VARS:
         monkeypatch.setenv(name, str(home))
-    if request.node.path.name.startswith(NATIVE_SUITES):
-        request.getfixturevalue("real_agent_binaries")
+    return home
+
+
+def _native_home(tmp_path: Path, request: pytest.FixtureRequest) -> Path | None:
+    """A native suite test's own home under :data:`NATIVE_HOMES`, removed after it; ``None``
+    with no such folder named (the native suites run on CI, which has one)."""
+    if NATIVE_HOMES is None:
+        return None
+    root = Path(NATIVE_HOMES) / "rlx-native-homes"
+    root.mkdir(parents=True, exist_ok=True)
+    home = Path(tempfile.mkdtemp(prefix=f"{tmp_path.name}-", dir=root))
+    request.addfinalizer(lambda: shutil.rmtree(home, ignore_errors=True))
     return home
 
 

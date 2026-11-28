@@ -402,9 +402,12 @@ def test_real_home_is_refused_to_a_test_outside_its_file(request: pytest.Fixture
 
 def test_the_opt_ins_go_by_file_name_in_a_run_of_their_own(tmp_path: Path) -> None:
     """With a scratch "developer": the e2e's file gets the real home and real agents, a native
-    suite's file gets real agents unasked, and any other file asking for the home fails."""
+    suite's file gets real agents unasked and a home under ``RLX_TESTS_NATIVE_HOMES`` (outside
+    every sandbox's temporary roots, so a real Codex's launch isn't refused), and any other
+    file asking for the home fails."""
     real = tmp_path / "developer"
     real.mkdir()
+    native_homes = tmp_path / "native-homes"
     files = {
         "conftest.py": INNER_CONFTEST
         + "from tests.conftest import real_agent_binaries, real_home  # noqa: F401\n",
@@ -419,12 +422,15 @@ def test_the_opt_ins_go_by_file_name_in_a_run_of_their_own(tmp_path: Path) -> No
                 state = guard.snapshot()
                 assert state["home_allowed"] and state["agents_allowed"]
         """,
-        "test_claude_native_probe.py": """
+        "test_claude_native_probe.py": f"""
+            from pathlib import Path
             from tests.keychain_guard import rlx_keychain_guard as guard
 
-            def test_a_native_file_gets_real_agents():
+            def test_a_native_file_gets_real_agents_and_a_home_outside_the_temp_roots():
                 state = guard.snapshot()
                 assert state["agents_allowed"] and not state["home_allowed"]
+                homes = Path({str(native_homes)!r}) / "rlx-native-homes"
+                assert Path.home().parent == homes, Path.home()
         """,
         "test_other.py": """
             def test_asks_for_the_home(real_home):
@@ -432,9 +438,11 @@ def test_the_opt_ins_go_by_file_name_in_a_run_of_their_own(tmp_path: Path) -> No
         """,
     }
     env = {name: str(real) for name in conftest.USER_HOME_VARS}
+    env["RLX_TESTS_NATIVE_HOMES"] = str(native_homes)
     inner = _inner_run(tmp_path, files, env, "--basetemp", str(tmp_path / "base"))
     out = inner.stdout
     assert "2 passed, 1 error" in out, out + inner.stderr
+    assert list((native_homes / "rlx-native-homes").iterdir()) == [], "each is removed after"
     assert "test_other.py::test_asks_for_the_home may not ask for real_home" in out, out
 
 
@@ -503,6 +511,10 @@ def test_a_test_that_reaches_the_real_home_fails_at_teardown_naming_itself(
             f"""
             import os, subprocess, sys
 
+            # A variable, given to the child by repr: a Windows path's backslashes don't survive
+            # two string literals ("\\U" opens a unicode escape).
+            TARGET = {str(real / ".claude")!r}
+
             def test_swallows_the_refusal():
                 try:
                     open({claude_json!r}).read()
@@ -510,8 +522,11 @@ def test_a_test_that_reaches_the_real_home_fails_at_teardown_naming_itself(
                     pass
 
             def test_its_child_reaches_it():
-                code = "import os; os.listdir({str(real / ".claude")!r})"
-                subprocess.run([sys.executable, "-c", code], env=os.environ, capture_output=True)
+                code = "import os; os.listdir(" + repr(TARGET) + ")"
+                done = subprocess.run(
+                    [sys.executable, "-c", code], env=os.environ, capture_output=True, text=True
+                )
+                assert "RealHomeRefused" in done.stderr, done.stderr
 
             def test_never_reaches_it():
                 assert True
