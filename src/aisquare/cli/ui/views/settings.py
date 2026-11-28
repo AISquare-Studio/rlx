@@ -139,10 +139,11 @@ class SettingsView(SavesAsYouGo, VerticalScroll):
             return
         if isinstance(field, CommitInput):
             # The stored name, kept whatever the field shows: what is being typed is the
-            # operator's, and leaving the field keeps it.
-            typing = field.value.strip() != before
-            field.kept = project.nickname or ""
-            if not typing:
+            # operator's, and leaving the field keeps it. Typing is a field showing other than
+            # what it last kept: the tab's project may already hold Undo's target (#56).
+            if field.value.strip() != field.kept.strip():
+                field.kept = project.nickname or ""
+            else:
                 field.keep(project.nickname or "")
         elif field.value.strip() == before:
             field.value = project.nickname or ""
@@ -281,6 +282,11 @@ class SettingsView(SavesAsYouGo, VerticalScroll):
         """How ctrl+z takes this rename back: the name it replaced, written again."""
 
         def undo() -> None:
+            # The tab's project takes the name Undo is writing, as it asks: a name asked before
+            # Undo's report is heard snapshots it (``_save_nickname``), and its own Undo goes
+            # back to it, not to the name just taken back (tester of #53, m3; #56). A frame
+            # from the store puts the project right if Undo's save fails.
+            self.project = self.project.model_copy(update={"nickname": previous or None})
             self._save_nickname(previous, undoing=True)
 
         return Change(f"{folder}'s nickname", undo)
@@ -325,7 +331,7 @@ class SettingsView(SavesAsYouGo, VerticalScroll):
         previous = asked_of.nickname or ""
         self.project = updated
         field = self.query_one("#nickname", CommitInput)
-        field.keep(updated.nickname or "")
+        field.keep(updated.nickname or "", over_typing=self._undoing)  # Undo wins (#3597)
         self.accept(field)
         self.query_one("#settings-title", Static).update(self._title())
         self.query_one("#fleet-id", Static).update(fleet_id_line(updated))
