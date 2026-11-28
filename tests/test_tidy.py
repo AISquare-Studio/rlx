@@ -33,9 +33,9 @@ from aisquare.core import cachedir, claude_accounts, locking, paths, process_tab
 from aisquare.core.config import TidySettings
 from aisquare.core.locking import holding
 from aisquare.core.store import FLEET_HELD, store_session
-from aisquare.models import EndedBy, FleetAgent, ProjectInfo, TeamSession
+from aisquare.models import EndedBy, FleetAgent, LaunchSpec, ProjectInfo, TeamSession
+from aisquare.services import agent_tmp, tidy
 from aisquare.services import fleet as fleet_service
-from aisquare.services import tidy
 from tests import test_fleet_service as fleet_suite
 from tests.test_fleet_pause_resume import _claim
 from tests.test_fleet_service import _add_task, _git, _stale_board_session
@@ -1585,7 +1585,7 @@ def test_a_cache_kept_for_what_tidy_cannot_read_is_named(tmp_path: Path) -> None
 
     assert rules(made) == {plain: tidy.SESSION_CACHE}
     named = [(k.rule, k.path, k.why) for k in made.kept if k.path.is_relative_to(cache)]
-    assert named == [(tidy.SESSION_CACHE, cache, tidy.UNREAD_INSIDE)]
+    assert named == [(tidy.SESSION_CACHE, cache, tidy.UNSEEN_THROUGH)]
     [size] = [k.bytes for k in made.kept if k.path == cache]
     assert size is not None and size >= 4096
     assert [k.bytes for k in unsized.kept if k.path == cache] == [None]
@@ -1803,6 +1803,54 @@ def test_an_ended_trees_build_output_killed_mid_delete_is_still_freed_with_its_t
     passed = PERIODIC_PASS(at)
     assert passed is not None and passed.freed == {tidy.ENDED_WORKTREE: 1}
     assert not built.cwd.exists() and not tidy.is_due(at, 60)
+
+
+def test_both_rules_keep_what_they_cannot_see_into_with_one_reason(tmp_path: Path) -> None:
+    """Manager #4001: a session's tagged cache (#59) and an ended agent's temp directory (#57),
+    each holding a folder tidy cannot read, are kept with ONE reason, the same text in
+    ``rlx tidy --dry-run --json``'s ``why`` for both."""
+    recent = session_dir()
+    cache = tag(recent / "scratchpad" / "target")
+    shut = cache / "deep"
+    shut.mkdir()
+    (shut / "inside.bin").write_bytes(b"x")
+    aged(recent, 3 * HOUR)
+    key = "a" * agent_tmp.KEY_LENGTH
+    temp = paths.agent_tmp_dir(key)
+    locked = temp / "locked"
+    locked.mkdir(parents=True)
+    with store_session() as store:
+        store.upsert_fleet_agent(
+            FleetAgent(
+                id=f"agt_{key}",
+                project_id=BOARD,
+                label="coder-1",
+                role="coder",
+                pane_id="%9",
+                cwd=tmp_path,
+                created_at=datetime.now(UTC) - timedelta(days=2),
+                ended_at=datetime.now(UTC) - timedelta(days=1),
+                launch_spec=LaunchSpec(binary="claude", tmp_key=key),
+            )
+        )
+    shut.chmod(0)
+    locked.chmod(0)
+    try:
+        shown = CliRunner().invoke(app, ["--json", "tidy", "--dry-run"])
+    finally:
+        shut.chmod(0o700)
+        locked.chmod(0o700)
+
+    assert shown.exit_code == 0, shown.output
+    said = {
+        (entry["rule"], entry["why"])
+        for entry in json.loads(shown.stdout)["kept"]
+        if entry["rule"] in (tidy.SESSION_CACHE, tidy.AGENT_TMPDIR)
+    }
+    assert said == {
+        (tidy.SESSION_CACHE, tidy.UNSEEN_THROUGH),
+        (tidy.AGENT_TMPDIR, tidy.UNSEEN_THROUGH),
+    }
 
 
 def test_a_plan_without_kept_sizes_walks_no_kept_repository(tmp_path: Path, repo: Path) -> None:

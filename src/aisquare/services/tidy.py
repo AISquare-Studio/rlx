@@ -141,13 +141,13 @@ ROOT_TAG = (
 NEVER_A_REPOSITORY = "rlx won't delete a repository: remove it by hand if you don't need it"
 """Why every repository in a session's temp is kept (manager #3585: ``rlx tidy`` never deletes
 a git repository in 0.10.2)."""
-UNREAD_INSIDE = "it holds a file or folder tidy cannot read, or a mount: kept"
-"""Why a session's tagged cache stays when it holds no repository tidy can name (tester #3875
-(d)): something in it could not be read (#3804) or is another filesystem (M3)."""
 UNSEEN_THROUGH = (
     "part of it cannot be read, or is another disk: kept, as a repository could be there"
 )
-"""Why an ended agent's temp directory with no repository found is kept all the same."""
+"""Why a folder tidy cannot see all the way into is kept, with no repository found in it: part
+of it could not be read (#3804) or is another filesystem (M3). One reason for every rule that
+says it (manager #4001): an ended agent's temp directory (#57), a session's tagged cache
+(tester #3875 (d))."""
 DELETES = sys.platform != "win32"
 """Whether tidy deletes here. Not on native Windows in 0.10.2 (manager #3647): it reports and
 lists, and removes nothing; the fleet there runs in WSL, where tidy deletes."""
@@ -802,7 +802,7 @@ def _session_caches(directory: Path, result: Plan) -> list[Path]:
         elif _kept_unread(here, unread):
             unread.append(here)
             size = cachedir.allocated_bytes(here) if result.size_kept else None
-            result.kept.append(Kept(SESSION_CACHE, here, UNREAD_INSIDE, size))
+            result.kept.append(Kept(SESSION_CACHE, here, UNSEEN_THROUGH, size))
         if cachedir._is_bare_repository(here):
             continue
         for inner in _subdirs(here):
