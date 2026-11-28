@@ -292,7 +292,10 @@ impl Drop for Ending {
 /// What the Claude Code `resolved` names says about itself now, and where it was looked
 /// for: `claude --version` and `claude auth status --json`, run at once with the app's
 /// environment `env` (4.3), each given [`TIMEOUT`]. A command that fails says why in
-/// `error`, never what it printed; the sign-in then reads as signed out.
+/// `error`, never what it printed; the sign-in then reads as signed out. Failing is not
+/// starting, not answering in time, being ended by a signal, and for `--version` exiting
+/// other than 0 or printing no version; `auth status` exits 1 when signed out, so its
+/// exit code is not read, only its JSON.
 pub async fn probe_at(resolved: &Resolved, source: Source, env: &EnvValues) -> Claude {
     probe_within(resolved, source, env, TIMEOUT).await
 }
@@ -317,10 +320,16 @@ async fn probe_within(
     );
     let mut errors = Vec::new();
     match version {
-        Ok(text) => claude.version = parse_version(&text),
+        Ok((status, _)) if !status.success() => {
+            errors.push(format!("claude --version {}", ended(status)));
+        }
+        Ok((_, text)) => match parse_version(&text) {
+            Some(version) => claude.version = Some(version),
+            None => errors.push("claude --version printed no version".to_owned()),
+        },
         Err(why) => errors.push(format!("claude --version {why}")),
     }
-    match auth.map(|text| serde_json::from_str::<Value>(&text)) {
+    match auth.map(|(_, text)| serde_json::from_str::<Value>(&text)) {
         Ok(Ok(status)) if status.is_object() => read_auth_status(&mut claude, &status),
         Ok(_) => errors.push("claude auth status --json printed no JSON object".to_owned()),
         Err(why) => errors.push(format!("claude auth status --json {why}")),
@@ -385,14 +394,16 @@ fn executable_extensions(pathext: Option<&std::ffi::OsStr>) -> Vec<String> {
         .collect()
 }
 
-/// What `program args` printed, when it ran to an end within [`TIMEOUT`]. Its exit status
-/// does not matter: `auth status` exits 1 when signed out, and says so.
+/// How `program args` ended and what it printed, when it ran to an end within
+/// [`TIMEOUT`] and no signal ended it (a program the OS kills prints nothing to read).
+/// Its exit code is the caller's to read: `auth status` exits 1 when signed out, and says
+/// so.
 async fn output(
     program: &Path,
     args: &[&str],
     env: &EnvValues,
     timeout: Duration,
-) -> Result<String, String> {
+) -> Result<(std::process::ExitStatus, String), String> {
     let mut command = Command::new(program);
     command
         .args(args)
@@ -420,7 +431,32 @@ async fn output(
         .await
         .map_err(|_| format!("did not answer within {} ms", timeout.as_millis()))?
         .map_err(|e| format!("could not be read: {e}"))?;
-    String::from_utf8(output.stdout).map_err(|_| "printed text that is not UTF-8".to_owned())
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt;
+        if output.status.signal().is_some() {
+            return Err(ended(output.status));
+        }
+    }
+    let text = String::from_utf8(output.stdout)
+        .map_err(|_| "printed text that is not UTF-8".to_owned())?;
+    Ok((output.status, text))
+}
+
+/// How a probe command that did not succeed ended: its exit code, or the signal that
+/// ended it.
+fn ended(status: std::process::ExitStatus) -> String {
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt;
+        if let Some(signal) = status.signal() {
+            return format!("was ended by signal {signal}");
+        }
+    }
+    match status.code() {
+        Some(code) => format!("exited with code {code}"),
+        None => format!("ended: {status}"),
+    }
 }
 
 /// `2.1.314` from `2.1.314 (Claude Code)`: the first word of the first line, when it
@@ -677,6 +713,79 @@ esac"#,
         assert!(error.contains("printed no JSON object"), "{error}");
         assert!(!error.contains("secret"), "never what it printed: {error}");
         std::fs::remove_dir_all(program.parent().unwrap()).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_probe_command_killed_or_failing_says_how_it_ended() {
+        // Tester #3715: a `claude --version` the OS killed read as installed, with no
+        // version and no error.
+        let program = script(
+            "killed",
+            r#"case "$1" in
+  --version) kill -9 $$;;
+  auth) printf '{"loggedIn":true,"authMethod":"claude.ai","email":"probe@example.com"}';;
+esac"#,
+        );
+        let resolved = Resolved::Found(program.clone());
+        let claude = probe_within(&resolved, Source::Rlxd, &EnvValues::default(), TIMEOUT).await;
+        assert!(claude.installed && claude.signed_in, "{claude:?}");
+        assert_eq!(claude.version, None, "{claude:?}");
+        let error = claude.error.unwrap();
+        assert_eq!(error, "claude --version was ended by signal 9", "{error}");
+        std::fs::remove_dir_all(program.parent().unwrap()).unwrap();
+
+        let program = script(
+            "auth-killed",
+            r#"case "$1" in
+  --version) echo "2.1.332 (Claude Code)";;
+  auth) kill -9 $$;;
+esac"#,
+        );
+        let resolved = Resolved::Found(program.clone());
+        let claude = probe_within(&resolved, Source::Rlxd, &EnvValues::default(), TIMEOUT).await;
+        assert!(claude.installed && !claude.signed_in, "{claude:?}");
+        assert_eq!(claude.version.as_deref(), Some("2.1.332"), "{claude:?}");
+        let error = claude.error.unwrap();
+        assert_eq!(
+            error, "claude auth status --json was ended by signal 9",
+            "{error}"
+        );
+        std::fs::remove_dir_all(program.parent().unwrap()).unwrap();
+
+        // --version exiting 2, or printing no version; auth status exiting 1, signed out,
+        // is no error.
+        for (name, version, error) in [
+            (
+                "version-exits",
+                "echo '2.1.332 (Claude Code)'; exit 2",
+                "claude --version exited with code 2",
+            ),
+            (
+                "no-version",
+                "echo 'secret-looking text'",
+                "claude --version printed no version",
+            ),
+        ] {
+            let program = script(
+                name,
+                &format!(
+                    r#"case "$1" in
+  --version) {version};;
+  auth) printf '{{"loggedIn":false,"authMethod":"none"}}'; exit 1;;
+esac"#
+                ),
+            );
+            let resolved = Resolved::Found(program.clone());
+            let claude =
+                probe_within(&resolved, Source::Rlxd, &EnvValues::default(), TIMEOUT).await;
+            assert!(claude.installed && !claude.signed_in, "{claude:?}");
+            assert_eq!(
+                (claude.version, claude.error.as_deref()),
+                (None, Some(error))
+            );
+            std::fs::remove_dir_all(program.parent().unwrap()).unwrap();
+        }
     }
 
     #[tokio::test]

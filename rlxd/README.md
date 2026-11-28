@@ -158,9 +158,11 @@ Claude Code for long:
   until the new one ends, there is no `as_of`, and `signed_in` is false: no `as_of` means
   still checking, not signed out. A probe that ends however it ends, a panic included, no
   longer runs, so a later `status` probes again.
-- **A probe that fails** (Claude Code won't start, doesn't answer within its time, prints
-  no JSON) reads as signed out, with `error` saying why. `error` never holds what Claude
-  Code printed.
+- **A probe that fails** (Claude Code won't start, doesn't answer within its time, is
+  ended by a signal, prints no JSON) reads as signed out, with `error` saying why.
+  `claude --version` exiting other than 0, or printing no version, is an `error` too;
+  `auth status` exits 1 when signed out, so only its JSON is read. `error` never holds
+  what Claude Code printed.
 - **Not installed** gives `installed: false`, with only `path_source` beside it.
 - Only §7.4's fields of Claude Code's answer reach `status`: never its org, folders or
   sign-in expiry. The probe's output is never logged.
