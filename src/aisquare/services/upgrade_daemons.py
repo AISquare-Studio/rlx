@@ -791,6 +791,11 @@ def _rlx_verb(kind: str, verb: Sequence[str]) -> bool:
     )
 
 
+def _as_path(text: str) -> str:
+    """``text`` as the OS compares paths: on Windows, case and ``/`` or ``\\`` alike."""
+    return os.path.normcase(os.path.normpath(text))
+
+
 def _same_program(given: str, expected: str, *, kind: str) -> str | None:
     """Why ``given``, a record's ``argv[0]``, is not the program ``expected``, or ``None``.
     Not "the same file" (``samefile``), which a symlink passes (review #3471):
@@ -807,11 +812,13 @@ def _same_program(given: str, expected: str, *, kind: str) -> str | None:
         return f"its program {given} is not a file"
     wrong = f"it runs {given}, not {expected}"
     if kind != "rlxd":
-        return None if given == expected else wrong
+        # As a path, not a file: case and separators are one on Windows (normcase follows
+        # no link, so another venv's python is still another path).
+        return None if _as_path(given) == _as_path(expected) else wrong
     target = Path(expected)
     try:
         same = (
-            program.name == target.name
+            os.path.normcase(program.name) == os.path.normcase(target.name)
             and program.parent.resolve() == target.parent.resolve()
             and os.path.samefile(program, target)
         )

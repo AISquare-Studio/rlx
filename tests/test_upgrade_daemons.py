@@ -39,6 +39,10 @@ REAL_PYTHON_COMMAND = upgrade_daemons.python_command
 REAL_RLXD_COMMAND = upgrade_daemons.rlxd_command
 """The real commands records must start with, which the `fake` fixture replaces."""
 
+posix_only = pytest.mark.skipif(
+    sys.platform == "win32", reason="Windows can't replace a running rlx: its route refuses"
+)
+
 
 @dataclass
 class Daemons:
@@ -542,6 +546,7 @@ def test_json_lines_restarts_rlxd_on_the_new_release_and_ends_upgrade_done(
     assert [step for step, _ in _steps(lines)][:2] == ["check", "check"]
 
 
+@posix_only
 @pytest.mark.parametrize(
     ("state", "flags", "code"),
     [
@@ -595,10 +600,6 @@ def test_json_lines_needs_yes() -> None:
 
 
 # --- the review of #626 (#2826): its probes and minors ------------------------------------
-
-posix_only = pytest.mark.skipif(
-    sys.platform == "win32", reason="Windows can't replace a running rlx: its route refuses"
-)
 
 
 def _lines(result: Any) -> list[dict[str, Any]]:
@@ -977,9 +978,17 @@ def _wheel(tmp_path: Path, version: str = "2.0.0") -> Path:
     return wheel
 
 
+def _on_linux(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The route as Linux's, on every OS: what is tested is the package's, not Windows'
+    refusal of a self-upgrade (which the package keeps, as every route refusal)."""
+    facts = install_route.facts()
+    monkeypatch.setattr(install_route, "facts", lambda: replace(facts, platform="linux"))
+
+
 def test_the_package_is_a_local_wheel_and_nothing_else(
     tool: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    _on_linux(monkeypatch)
     plan = lifecycle.upgrade_plan(None)
     for value in (
         "https://example.com/aisquare_cli-2.0.0-py3-none-any.whl",
@@ -1012,6 +1021,7 @@ def test_the_package_is_a_local_wheel_and_nothing_else(
 def test_the_package_keeps_the_routes_own_refusals(
     tool: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    _on_linux(monkeypatch)
     monkeypatch.setattr(install_route, "find_uv", lambda: None)
     monkeypatch.setenv(upgrade_daemons.PACKAGE_ENV, str(_wheel(tmp_path)))
     planned, _ = upgrade_daemons.with_package(lifecycle.upgrade_plan(None), lifecycle, pinned=False)
@@ -1134,6 +1144,13 @@ def test_the_helper_is_shown_logs_each_step_and_starts_rlxd_once(fake: Daemons, 
     assert [(p["id"], p["kind"], p["pid"]) for p in pending] == [(old.id, "rlxd", old.pid)]
     log = Path(pending[0]["log"])
     upgrade_daemons.restart_when_gone(old)  # a second helper, for the same record
+    # It is refused while the first waits: wait for it to say so, not a fixed time (a
+    # Python takes its time to start on Windows, and the first could be done by then).
+    refused = f"another helper waits for rlxd (record {old.id}): nothing to do"
+    deadline = time.monotonic() + 30
+    while refused not in (log.read_text(encoding="utf-8") if log.exists() else ""):
+        assert time.monotonic() < deadline, log.read_text(encoding="utf-8")
+        time.sleep(0.1)
     (fake.dir / "stuck-rlxd").unlink()  # rlxd finishes the stop it took
     new = fake.wait_live("rlxd", not_pid=old.pid)
     assert [d.pid for d in _settled(fake)] == [new.pid], "started once"
