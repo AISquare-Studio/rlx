@@ -652,6 +652,54 @@ fn erase(home: &TestHome) -> common::Run {
 }
 
 #[test]
+fn a_run_routed_to_the_plain_account_is_cleared_by_a_sign_in_there() {
+    // #4306 G1, the owner's main route: Slack connected on slot 1 alone. The run is routed
+    // there, its init finds Slack signed out, and its needs-you for the sign-in is out.
+    // Slack signed in on slot 1 again clears it. (Its recorded home is ~/.claude, which is
+    // no account's CLAUDE_CONFIG_DIR once rlx has listed the accounts: the sign-in goes by
+    // the run's slot, never by that home.)
+    let (home, accounts) = routing_home(Some("connected"), None, None);
+    std::fs::write(home.root().join("scenario"), "connectors-needs-auth").unwrap();
+    let since = seq(&home);
+    let id = run_id();
+    assert_eq!(start(&home, &task(&[SLACK], None), &id).code(), Some(0));
+    ended(&home, &id, "failed");
+    let got = home
+        .rlxd(&["call", "run.get", &json!({"run_id": id}).to_string()])
+        .data();
+    assert_eq!(
+        got["account"],
+        json!({"slot": 1, "by": "connectors"}),
+        "{got:#}"
+    );
+    assert_eq!(recorded_home(&home, &id), accounts.plain.to_str().unwrap());
+    let needs_you = |kind: &str, since: u64| {
+        home.rlxd(&[
+            "events",
+            "--topics",
+            "needs_you",
+            "--since",
+            &since.to_string(),
+        ])
+        .lines()
+        .iter()
+        .any(|e| e["type"] == kind && e["data"]["id"] == format!("run:{id}:1"))
+    };
+    assert!(needs_you("needs_you.raised", since), "no needs-you raised");
+    eventually("the init is filed on slot 1", || {
+        slack_on(&home, 1) == "needs-auth"
+    });
+    let since = seq(&home);
+    std::fs::write(home.root().join("scenario"), "mcp-accounts").unwrap();
+    accounts.set(1, &slack("connected"));
+    read_map(&home);
+    assert_eq!(slack_on(&home, 1), "connected");
+    eventually("slot 1's sign-in clears the run's needs-you", || {
+        needs_you("needs_you.cleared", since)
+    });
+}
+
+#[test]
 fn erasing_a_space_takes_a_routed_runs_transcript_from_its_own_accounts_home_alone() {
     let (home, accounts) = routing_home(Some("needs-auth"), Some("connected"), None);
     let (id, ours) = routed_and_done(&home, &accounts);
