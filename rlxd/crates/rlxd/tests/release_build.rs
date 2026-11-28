@@ -267,31 +267,8 @@ fn a_release_build_has_no_gate_dev_mode() {
 #[test]
 fn a_release_build_has_no_fake_claude() {
     // Every binary of the package that a release build makes, as `cargo build --release
-    // -p rlxd` makes them: fake-claude needs the test-only feature, so it is not one.
-    let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
-    let output = std::process::Command::new(cargo)
-        .args([
-            "build",
-            "--release",
-            "--locked",
-            "--package",
-            "rlxd",
-            "--bins",
-            "--message-format=json-render-diagnostics",
-        ])
-        .current_dir(common::workspace())
-        .stdin(std::process::Stdio::null())
-        .stderr(std::process::Stdio::inherit())
-        .output()
-        .expect("cargo runs");
-    assert!(output.status.success(), "cargo build --release failed");
-    let built: Vec<String> = String::from_utf8_lossy(&output.stdout)
-        .lines()
-        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
-        .filter(|message| message["reason"] == "compiler-artifact")
-        .filter(|message| message["executable"].is_string())
-        .filter_map(|message| message["target"]["name"].as_str().map(str::to_owned))
-        .collect();
+    // -p rlxd --bins` makes them: fake-claude needs the test-only feature, so it is not one.
+    let built = &common::release_build().binaries;
     assert!(built.iter().any(|name| name == "rlxd"), "{built:?}");
     assert!(!built.iter().any(|name| name == "fake-claude"), "{built:?}");
 }
