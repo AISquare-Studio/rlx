@@ -159,6 +159,10 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   the right name, and a save that finishes while you type no longer replaces what you typed.
 - rlx no longer leaves an empty lock file in the temp folder after moving a home; the lock
   now sits beside the home and is removed when the move ends.
+- The rlx app's Doctor and explainability page no longer show a fix that names an rlx
+  command as words to type (`status`, `service`, `tidy` and 22 more were shown as written),
+  and attaching a persona whose board note rlx could not confirm no longer tells you to run
+  `aisquare log`.
 - A Codex agent spawned with Claude Code flags now starts. `--effort` reaches Codex as its
   reasoning effort, `--model` and `--add-dir` pass as they are, and any flag Codex has no
   equivalent for is refused before its window opens, with the setting it came from and why.
