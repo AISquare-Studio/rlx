@@ -12,6 +12,7 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -173,7 +174,10 @@ def stored_ended(session: str) -> bool:
 
 
 def row(project: ProjectInfo, session: str, **fields: object) -> FleetAgent:
-    """A fleet row naming ``session``, written to the sandbox store."""
+    """A fleet row naming ``session``, written to the sandbox store. ``created_at`` is set at
+    the insert: an upsert never moves it (nor ``ended_by``, nor ``paused_at``)."""
+    created = fields.pop("created_at", datetime.now(UTC) - 5 * HOUR)
+    assert isinstance(created, datetime)
     agent = FleetAgent(
         id=f"agt_{uuid.uuid4().hex[:26]}",
         project_id=project.id,
@@ -182,7 +186,7 @@ def row(project: ProjectInfo, session: str, **fields: object) -> FleetAgent:
         pane_id="%9",
         session_id=session,
         cwd=fields.pop("cwd", project.root),
-        created_at=datetime.now(UTC) - 5 * HOUR,
+        created_at=created,
         **fields,
     )
     with store_session() as store:
@@ -494,13 +498,16 @@ def test_stale_or_missing_evidence_ends_no_session(
         session = session_dir(ended=None)
         row(project, session.name, ended_at=datetime.now(UTC) - 3 * HOUR)
     else:
+        # Ended on rlx's word, so only its being made after the board's end (a resume) says
+        # the session is not ended now (an upsert never moved created_at: written at insert).
         session = session_dir(ended=5 * HOUR)
-        resumed = row(project, session.name, ended_at=datetime.now(UTC) - 3 * HOUR)
-        assert resumed.created_at > datetime.now(UTC) - 6 * HOUR
-        with store_session() as store:
-            store.upsert_fleet_agent(
-                resumed.model_copy(update={"created_at": datetime.now(UTC) - 4 * HOUR})
-            )
+        row(
+            project,
+            session.name,
+            ended_at=datetime.now(UTC) - 3 * HOUR,
+            ended_by="stopped",
+            created_at=datetime.now(UTC) - 4 * HOUR,
+        )
     tag(session / "scratchpad" / "target")
     aged(session, 3 * HOUR)
 
@@ -1488,10 +1495,7 @@ def test_a_real_pause_ends_its_row_stopped_and_the_pause_alone_holds_the_session
     assert paused is not None and paused.session_id
     assert paused.ended_by == "stopped" and paused.paused_at is not None
     session = session_dir(session=paused.session_id)
-    with store_session() as store:  # made before the board's end: no resume says it is live
-        store.upsert_fleet_agent(
-            paused.model_copy(update={"created_at": datetime.now(UTC) - 5 * HOUR})
-        )
+    _made_at(paused, datetime.now(UTC) - 5 * HOUR)  # before the board's end: no resume after
     cache = tag(session / "scratchpad" / "target")
     aged(session, 3 * HOUR)
 
@@ -1500,6 +1504,22 @@ def test_a_real_pause_ends_its_row_stopped_and_the_pause_alone_holds_the_session
     assert made.items == []
     tidy.apply(made)
     assert (cache / cachedir.TAG).is_file()
+
+
+def _made_at(agent: FleetAgent, when: datetime) -> None:
+    """``agent``'s row made at ``when``: written in the store itself, as an upsert never moves
+    ``created_at``."""
+    connection = sqlite3.connect(str(paths.db_path()))
+    try:
+        connection.execute(
+            "UPDATE fleet_agent SET created_at = ? WHERE id = ?", (when.isoformat(), agent.id)
+        )
+        connection.commit()
+    finally:
+        connection.close()
+    with store_session() as store:
+        found = store.get_fleet_agent(agent.id)
+    assert found is not None and found.created_at == when
 
 
 def _bundle(where: Path, repo: Path) -> Path:
