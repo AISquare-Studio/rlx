@@ -30,15 +30,17 @@ def home_between_tests() -> Path:
     return paths.aisquare_home()
 
 
-def test_between_tests_the_home_is_the_runs_own_or_the_one_the_shell_named(
+def test_between_tests_the_home_is_the_runs_own_even_where_the_shell_named_one(
     home_between_tests: Path, home_outside_a_test: Path, isolated_home: Path
 ) -> None:
+    """A home the shell named (a fleet pane's live one, CI's ambient legs' configured one) is
+    not kept: it is guarded instead (#54, ``conftest._GUARDED``)."""
     assert paths.aisquare_home() == isolated_home, "the control: in a test, the test's own"
     assert home_between_tests != isolated_home
     assert home_between_tests == home_outside_a_test
     if conftest.SHELL_HOME is not None:
-        return  # the CI ambient job's configured home, which it is there to keep
-    assert home_between_tests != Path.home() / ".aisquare", (
+        assert home_between_tests != Path(conftest.SHELL_HOME), "the shell's home is not kept"
+    assert home_between_tests != conftest._DEVELOPERS_HOME / ".aisquare", (
         "between two tests the home is the developer's own: what a test left running "
         "writes into it, and a module-scoped fixture reads it"
     )

@@ -424,18 +424,21 @@ def test_the_spawn_dialogs_persona_picker_has_the_captain_when_on(
 # --- doctor -----------------------------------------------------------------------------------
 
 
-def test_doctor_shows_one_ok_captain_row_when_off(off: None) -> None:
-    rows = [check for check in diagnostics.doctor() if check.name == "captain"]
+def test_doctor_shows_the_captain_off_in_its_one_ok_experimental_row(off: None) -> None:
+    """One row for both experimental switches since #46 (it was a captain row of its own)."""
+    rows = [check for check in diagnostics.doctor() if check.name == "experimental"]
     assert len(rows) == 1, rows
     (row,) = rows
     assert row.status is CheckStatus.ok
-    assert row.detail.startswith("off (experimental)"), row.detail
+    assert row.detail.startswith("captain off"), row.detail
     assert "rlx config set experimental.captain true" in row.detail
 
 
 @pytest.mark.needs_captain
-def test_doctor_has_no_captain_row_when_on() -> None:
+def test_doctor_shows_the_captain_on_and_no_row_of_its_own() -> None:
     assert [check for check in diagnostics.doctor() if check.name == "captain"] == []
+    (row,) = [check for check in diagnostics.doctor() if check.name == "experimental"]
+    assert row.detail.startswith("captain on"), row.detail
 
 
 # --- the docs ---------------------------------------------------------------------------------

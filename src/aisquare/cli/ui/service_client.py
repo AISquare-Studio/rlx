@@ -16,9 +16,12 @@ it, Remote and the reads would stop with nobody told.
 from __future__ import annotations
 
 from collections.abc import Callable
+from typing import TYPE_CHECKING
 
-from aisquare.cli.ui.remote_control import RemoteController
 from aisquare.services.service_host import SERVICE, Hosting
+
+if TYPE_CHECKING:  # Remote loads only while it is on (#46)
+    from aisquare.cli.ui.remote_control import RemoteController
 
 TAKEN_BACK = (
     f"the {SERVICE} stopped: this rlx keeps Remote and the fleet's nudges going while it is open"
@@ -34,18 +37,27 @@ turned it off): there is no Remote to keep going."""
 class ServiceClient:
     """What a TUI knows of the rlx service, from each frame's registry read, and its take-back."""
 
-    def __init__(self, remote: RemoteController, say: Callable[[str], object]) -> None:
+    def __init__(self, remote: RemoteController | None, say: Callable[[str], object]) -> None:
         self._remote = remote
+        """Remote's controller; ``None`` while Remote is off (#46), when there is none."""
         self._say = say
         self.hosting: Hosting | None = None
         """The live service of this release, as the last frame found it."""
         self._client = False
         """Whether this TUI was the service's client: what a take-back takes over from."""
 
+    def use_remote(self, remote: RemoteController | None) -> None:
+        """Remote turned on (its controller) or off (``None``) while the TUI runs (#46): a new
+        controller is the service's client at once, as the last frame found the service."""
+        self._remote = remote
+        if remote is not None:
+            remote.service = None if self.hosting is None else self.hosting.remote
+
     def note_hosting(self, hosting: Hosting | None) -> None:
         """A frame's read: the service live (its Remote as it says), or none."""
         self.hosting = hosting
-        self._remote.service = None if hosting is None else hosting.remote
+        if self._remote is not None:
+            self._remote.service = None if hosting is None else hosting.remote
         if hosting is not None:
             self._client = True
 
@@ -60,6 +72,9 @@ class ServiceClient:
         if not self._client or self.hosting is not None:
             return False
         self._client = False
+        if self._remote is None:  # Remote off (#46): only the nudges to take back
+            self._say(TAKEN_BACK_NUDGES)
+            return True
         self._remote.reload_switches()
         on = self._remote.state.remote_enabled
         self._remote.restore(wait=False)

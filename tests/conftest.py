@@ -110,6 +110,18 @@ def pytest_sessionstart(session: pytest.Session) -> None:
     reason = _foreign_package_reason(aisquare.__file__, SRC)
     if reason is not None:
         pytest.exit(reason, returncode=4)
+    if _TEMP_PROBLEM is not None:
+        pytest.exit(_TEMP_PROBLEM, returncode=4)
+    # Here, not in a fixture: under xdist the controller runs no fixture, and makes the
+    # basetemp in its own pytest_sessionstart, which is trylast (reviewer #3783).
+    named = session.config.getoption("basetemp", None)
+    if named is not None and inside(named, _DEVELOPERS_HOME):
+        pytest.exit(
+            f"--basetemp {named} is inside your home ({_DEVELOPERS_HOME}): no test's folder "
+            "may be, or a markerless one resolves to the home as a project (#54). Name one "
+            "outside it.",
+            returncode=4,
+        )
     # Once per run, in the process that starts it: an xdist worker's siblings are alive,
     # so a sweep there would find nothing more, only race the others for it.
     if not hasattr(session.config, "workerinput"):
@@ -438,19 +450,178 @@ AMBIENT_ENV_PREFIXES = ("AISQUARE_BIN_", "AISQUARE_MODEL_", "AISQUARE_EFFORT_")
 #: ``PYTHONPATH``, so its ``sitecustomize`` installs the guard there (:func:`keychain_guard`).
 KEYCHAIN_GUARD_DIR = str(Path(__file__).resolve().parent / "keychain_guard")
 
-#: The home the shell named, if it named one; ``None`` leaves the run to name its own
-#: for wherever no test's own home is in force (:func:`home_outside_a_test`).
+#: The rlx home the shell named, if it named one. The run never uses it: it names its own for
+#: wherever no test's own home is in force (:func:`home_outside_a_test`), and the guard refuses
+#: this one (:data:`_GUARDED`).
 SHELL_HOME: str | None = os.environ.get("RLX_HOME") or os.environ.get(HOME_ENV_VAR) or None
 
 #: The developer's home directory as the run found it, and which project markers
 #: (``core.workspace.ROOT_MARKERS``) it held already: one that appears in it during the
 #: run is named in the summary (:func:`pytest_terminal_summary`).
 _DEVELOPERS_HOME = Path.home()
+_DEVELOPERS_USERPROFILE = os.environ.get("USERPROFILE")
+
+#: A folder outside the developer's home the run may take for its temp root (#54 round 2).
+TEMP_ROOT_VAR = "RLX_TESTS_TEMP"
+
+
+def inside(path: str | os.PathLike[str], home: str | os.PathLike[str]) -> bool:
+    """Whether ``path`` is ``home`` or under it, both resolved, with case folded where the
+    platform folds it (macOS, Windows)."""
+    try:
+        one, top = (os.path.normcase(os.path.realpath(p)) for p in (path, home))
+    except (OSError, ValueError):
+        return False
+    if sys.platform == "darwin":
+        one, top = one.casefold(), top.casefold()
+    return one == top or one.startswith(top.rstrip(os.sep) + os.sep)
+
+
+def temp_candidates(environ: Mapping[str, str]) -> list[str]:
+    """Where the run's temp root may go, in order: :data:`TEMP_ROOT_VAR`, the developer's
+    pick; then ``/tmp`` and ``/var/tmp`` on POSIX, or on Windows the system drive's
+    ``\\rlx-tests`` and CI's ``RUNNER_TEMP``."""
+    found = [environ.get(TEMP_ROOT_VAR, "")]
+    if os.name == "nt":
+        drive = environ.get("SystemDrive", "C:")
+        found += [os.path.join(drive + os.sep, "rlx-tests"), environ.get("RUNNER_TEMP", "")]
+    else:
+        found += ["/tmp", "/var/tmp"]
+    return [candidate for candidate in found if candidate]
+
+
+def temp_root_outside(home: Path, current: str, candidates: Sequence[str]) -> str | None:
+    """The temp root for a run whose temp dir is ``current``: ``current`` itself when it lies
+    outside ``home``, else the first of ``candidates`` outside it that can be made and written;
+    ``None`` when none can."""
+    if not inside(current, home):
+        return current
+    for candidate in candidates:
+        if inside(candidate, home):
+            continue
+        try:
+            os.makedirs(candidate, exist_ok=True)
+        except OSError:
+            continue
+        if os.access(candidate, os.W_OK):
+            return candidate
+    return None
+
+
+def temp_problem(home: Path, current: str) -> str:
+    """Why the run refuses to start when its temp dir is in the home and none outside it can be
+    had: what the developer can do about it."""
+    return (
+        f"The run's temp dir, {current}, is inside your home ({home}), and no folder outside it "
+        f"could be made for the run. Inside the home, a test's markerless folder resolves to "
+        f"the home itself as a project (core.workspace walks up past the test's own HOME), so "
+        f"the suite refuses to run there (#54). Set {TEMP_ROOT_VAR} to a folder outside your "
+        f"home, such as C:\\rlx-tests or /tmp/rlx-tests."
+    )
+
+
+#: The temp dir the run found (``PYTEST_DEBUG_TEMPROOT`` wins in pytest, as here), and the one
+#: it takes: the same unless that was inside the developer's home, which it never may be
+#: (#54 round 2, reviewer #3717). In the home (Windows' ``%TEMP%`` always; a POSIX
+#: ``TMPDIR`` under ``~/.rlx``, as #57 gives agents) a test's markerless folder walked up past
+#: the test's own ``HOME`` to the real one, and ``core.workspace`` took the real home, with
+#: its dotfiles ``.git``, for the project. Moved before pytest makes its basetemp, and told
+#: to every child.
+_SYSTEM_TEMP = os.environ.get("PYTEST_DEBUG_TEMPROOT") or tempfile.gettempdir()
+_TEMP_ROOT = temp_root_outside(_DEVELOPERS_HOME, _SYSTEM_TEMP, temp_candidates(os.environ))
+_TEMP_PROBLEM = None if _TEMP_ROOT is not None else temp_problem(_DEVELOPERS_HOME, _SYSTEM_TEMP)
+if _TEMP_ROOT is not None and _TEMP_ROOT != _SYSTEM_TEMP:
+    for _name in ("TMPDIR", "TEMP", "TMP"):
+        os.environ[_name] = _TEMP_ROOT
+    os.environ.pop("PYTEST_DEBUG_TEMPROOT", None)
+    tempfile.tempdir = _TEMP_ROOT
+#: git never looks in the developer's home, or above it, for a repository: a git a test (or
+#: its child) runs where it finds none of its own stops below the home, whose dotfiles
+#: ``.git`` would otherwise be the answer.
+_SHELLS_CEILING = filter(None, os.environ.get("GIT_CEILING_DIRECTORIES", "").split(os.pathsep))
+GIT_CEILING = os.pathsep.join(dict.fromkeys([str(_DEVELOPERS_HOME), *_SHELLS_CEILING]))
+os.environ["GIT_CEILING_DIRECTORIES"] = GIT_CEILING
+
+#: Where the native suites' homes go: a folder outside every agent sandbox's temporary roots
+#: (``/tmp``, ``$TMPDIR``). ``RLX_TESTS_NATIVE_HOMES`` names one; CI's ``RUNNER_TEMP`` is one.
+#: Under the run's temp root, a real Codex's launch is refused, rightly: the hooks' interpreter
+#: (a system Python, not a venv) loads ``$HOME``'s user site, which that sandbox could write
+#: (``store_broker.install_inside``; #646's run 46097597808, every Codex native job).
+NATIVE_HOMES = os.environ.get("RLX_TESTS_NATIVE_HOMES") or os.environ.get("RUNNER_TEMP") or None
+
+#: What the suite's guard refuses to let any test or child open, list or change (#54): the real
+#: home's ``.claude*``, ``.codex*``, ``.aisquare`` and ``.rlx``, and the Claude Code, Codex and
+#: rlx directories the shell named, as the run found them. Every test's ``HOME`` is its own
+#: (:func:`isolated_user_home`), so nothing should look there; the guard proves nothing does.
+_GUARDED = rlx_keychain_guard.guarded_paths(_DEVELOPERS_HOME, os.environ)
+#: The run's own roots, never refused even inside a guarded directory, and where a stand-in
+#: ``claude`` or ``codex`` may live: the temp dir (every ``tmp_path``), ``/tmp`` (the private
+#: tmux folders, ``tests/private_fleets.py``, where ``no_real_fleet`` puts its stand-ins) and
+#: this checkout.
+_RUN_ROOTS = [tempfile.gettempdir(), "/tmp", str(SRC.parent)]
+if NATIVE_HOMES is not None:
+    _RUN_ROOTS.append(os.path.join(NATIVE_HOMES, "rlx-native-homes"))
+rlx_keychain_guard.configure(_GUARDED, _RUN_ROOTS, real_home=_DEVELOPERS_HOME)
+rlx_keychain_guard.install()
+
+#: The variables that name a user's home: ``HOME``, and on Windows ``USERPROFILE``, which is
+#: the one ``Path.home()`` reads there.
+USER_HOME_VARS = ("HOME", "USERPROFILE") if os.name == "nt" else ("HOME",)
+#: The test files that exist to run the real ``claude`` and ``codex`` (the native suites, as
+#: ``tests/run_claude_native.py`` and ``tests/run_codex_native.py`` select them).
+NATIVE_SUITES = ("test_claude_native", "test_codex_native")
+#: The one test file that may ask for :func:`real_home`: the opt-in real-account e2e.
+REAL_HOME_FILES = frozenset({"test_cross_account_e2e.py"})
+
+
+def _may_ask(request: pytest.FixtureRequest, fixture: str, allowed: bool) -> None:
+    """Fail the asking test, at setup, unless its file is on ``fixture``'s allow-list: enforced
+    here, by the file's name, not by reading the source (reviewer #3717, minor 1)."""
+    if allowed:
+        return
+    who = ", ".join(sorted(REAL_HOME_FILES))
+    if fixture != "real_home":
+        who = f"the native suites' files (test_claude_native*, test_codex_native*) and {who}"
+    pytest.fail(
+        f"{request.node.nodeid} may not ask for {fixture}: only {who} may (tests/conftest.py)",
+        pytrace=False,
+    )
+
+
 _ROOT_MARKERS = (".git", ".hg", ".aisquare")
 _MARKERS_AT_START = frozenset(m for m in _ROOT_MARKERS if (_DEVELOPERS_HOME / m).exists())
 _RUN_HOME: list[Path] = []
 _OUTSIDE_A_TEST: dict[str, str] = {}
 """What appeared outside every test's own home, and the test that had just ended."""
+
+
+@pytest.fixture(scope="session", autouse=True)
+def _home_of_the_run(tmp_path_factory: pytest.TempPathFactory) -> Path:
+    """The user's home wherever no test's own is in force: a directory of the run's, never the
+    developer's (#54). Named to sort first among the session's autouse fixtures (pytest takes
+    them alphabetically), so none of them sees the real home.
+
+    ``HOME`` (and ``USERPROFILE`` on Windows) is the run's, and the Claude Code and Codex
+    directories the shell named are cleared: a module-scoped fixture, or a thread a test left
+    running, finds no signed-in account, so it never asks the Keychain for one. What the run's
+    children are told to guard (:data:`_GUARDED`) and where its own roots are goes into the
+    environment for the guard's ``sitecustomize``. Left as is at the end, as
+    :func:`home_outside_a_test` leaves its home, for what still runs at the interpreter's exit.
+    """
+    basetemp = tmp_path_factory.getbasetemp()  # never in the home (pytest_sessionstart)
+    home = tmp_path_factory.mktemp("user-home-outside-a-test", numbered=False)
+    for name in USER_HOME_VARS:
+        os.environ[name] = str(home)
+    for name in rlx_keychain_guard.REAL_DIR_VARS:
+        if name not in (HOME_ENV_VAR,):  # the rlx home is home_outside_a_test's to name
+            os.environ.pop(name, None)
+    run_roots = [*_RUN_ROOTS, str(basetemp)]
+    rlx_keychain_guard.configure(_GUARDED, run_roots, real_home=_DEVELOPERS_HOME)
+    os.environ[rlx_keychain_guard.REAL_HOME_VAR] = str(_DEVELOPERS_HOME)
+    os.environ[rlx_keychain_guard.GUARDED_VAR] = os.pathsep.join(_GUARDED)
+    os.environ[rlx_keychain_guard.ALLOWED_VAR] = os.pathsep.join(run_roots)
+    os.environ.pop(rlx_keychain_guard.AGENTS_VAR, None)
+    return home
 
 
 @pytest.fixture(scope="session", autouse=True)
@@ -472,12 +643,15 @@ def home_outside_a_test(tmp_path_factory: pytest.TempPathFactory) -> Path:
     So the run names a home of its own, in its own temp tree beside the tests' and above
     none of them, for module-scoped fixtures and for what outlives a test. Left set at
     the end on purpose: the panel's writer thread is joined at the interpreter's exit,
-    and what it still had to write lands here, not in the developer's home. A home the
-    shell named is kept: CI's two ambient legs (py3.11 and py3.13) name a configured one,
-    and a fixture reading it outside a test is the leak those legs exist to catch.
+    and what it still had to write lands here, not in the developer's home.
+
+    A home the shell named is NOT kept, and ``RLX_HOME``, which wins over this, is cleared
+    (:func:`_home_of_the_run`). Run from a fleet pane, that home is the fleet's live one, and
+    what a test left running wrote into it (#54). It is guarded instead (:data:`_GUARDED`):
+    on CI's two ambient legs (py3.11 and py3.13), which name a configured home, a fixture or
+    module that still reads it, by a path taken at import, is refused and named, which is
+    the leak those legs exist to catch.
     """
-    if SHELL_HOME is not None:
-        return Path(SHELL_HOME)
     home = tmp_path_factory.mktemp("home-outside-a-test", numbered=False)
     os.environ[HOME_ENV_VAR] = str(home)
     _RUN_HOME.append(home)
@@ -520,6 +694,84 @@ def pytest_terminal_summary(terminalreporter: pytest.TerminalReporter) -> None:
     terminalreporter.section("written outside every test's own home")
     for path, nodeid in _OUTSIDE_A_TEST.items():
         terminalreporter.write_line(f"{path}  (there when {nodeid} ended)")
+
+
+@pytest.fixture(autouse=True)
+def isolated_user_home(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, request: pytest.FixtureRequest
+) -> Path:
+    """Every test's ``HOME`` (and ``USERPROFILE`` on Windows) is a directory of its own (#54).
+
+    :func:`isolated_home` moves rlx's home and :func:`isolated_agent_home` the product's
+    ``_home`` in this process, but a child read the real ``HOME``: the developer's
+    ``~/.claude.json`` named a signed-in account, and the child asked the Keychain for its
+    login (#52's nine tests). These are environment variables, so every child gets them,
+    ``python -E`` children too (``-E`` drops only ``PYTHON*``). Beside ``tmp_path``, not in
+    it, so a test that lists ``tmp_path`` finds only its own files, and above no test's
+    directory. Both are in the run's temp root, which is never inside the real home
+    (:data:`_TEMP_ROOT`): ``core.workspace`` walks up past a test's ``HOME``, so from inside the
+    real home a markerless folder resolved to the real home as a project (reviewer #3717). A
+    test file of the native suites may run the real ``claude`` and ``codex``
+    (:func:`real_agent_binaries`), and its home is outside every sandbox's temporary roots
+    (:data:`NATIVE_HOMES`).
+    """
+    home = tmp_path.with_name(tmp_path.name + "-home")
+    if request.node.path.name.startswith(NATIVE_SUITES):
+        request.getfixturevalue("real_agent_binaries")
+        home = _native_home(tmp_path, request) or home
+    home.mkdir(exist_ok=True)
+    for name in USER_HOME_VARS:
+        monkeypatch.setenv(name, str(home))
+    return home
+
+
+def _native_home(tmp_path: Path, request: pytest.FixtureRequest) -> Path | None:
+    """A native suite test's own home under :data:`NATIVE_HOMES`, removed after it; ``None``
+    with no such folder named (the native suites run on CI, which has one)."""
+    if NATIVE_HOMES is None:
+        return None
+    root = Path(NATIVE_HOMES) / "rlx-native-homes"
+    root.mkdir(parents=True, exist_ok=True)
+    home = Path(tempfile.mkdtemp(prefix=f"{tmp_path.name}-", dir=root))
+    request.addfinalizer(lambda: shutil.rmtree(home, ignore_errors=True))
+    return home
+
+
+@pytest.fixture
+def real_agent_binaries(
+    monkeypatch: pytest.MonkeyPatch, request: pytest.FixtureRequest
+) -> Iterator[None]:
+    """A real ``claude`` or ``codex`` may run in this test and its children. Only for the
+    native suites (:data:`NATIVE_SUITES`, given it by :func:`isolated_user_home`) and the
+    opt-in real-account e2e (:data:`REAL_HOME_FILES`): a test in any other file that asks for
+    it fails at setup. Everywhere else the guard refuses one, wherever it resolves outside the
+    run's own roots (``tests/keychain_guard/rlx_keychain_guard.py``)."""
+    name = request.node.path.name
+    _may_ask(
+        request, "real_agent_binaries", name.startswith(NATIVE_SUITES) or name in REAL_HOME_FILES
+    )
+    monkeypatch.setenv(rlx_keychain_guard.AGENTS_VAR, "1")
+    before, _ = rlx_keychain_guard.lift(agents=True)
+    yield
+    rlx_keychain_guard.lift(agents=before)
+
+
+@pytest.fixture
+def real_home(monkeypatch: pytest.MonkeyPatch, request: pytest.FixtureRequest) -> Iterator[Path]:
+    """The developer's real home, for the one test that must use it: the opt-in real-account
+    e2e (``tests/test_cross_account_e2e.py``, marked ``e2e`` and skipped unless two signed-in
+    config dirs are named). ``HOME`` is put back, and the guard lets this test and its
+    children open what it refuses everywhere else. A test in any other file that asks for it
+    fails at setup (:data:`REAL_HOME_FILES`)."""
+    _may_ask(request, "real_home", request.node.path.name in REAL_HOME_FILES)
+    for name, real in (("HOME", str(_DEVELOPERS_HOME)), ("USERPROFILE", _DEVELOPERS_USERPROFILE)):
+        if name in USER_HOME_VARS and real is not None:
+            monkeypatch.setenv(name, real)
+    monkeypatch.delenv(rlx_keychain_guard.GUARDED_VAR, raising=False)
+    monkeypatch.delenv(rlx_keychain_guard.REAL_HOME_VAR, raising=False)
+    _, before = rlx_keychain_guard.lift(home=True)
+    yield _DEVELOPERS_HOME
+    rlx_keychain_guard.lift(home=before)
 
 
 @pytest.fixture(autouse=True)
@@ -779,7 +1031,9 @@ def project_capture(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 @pytest.fixture(autouse=True)
-def no_real_ngrok(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def no_real_ngrok(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, isolated_user_home: Path
+) -> None:
     """No test reaches ngrok's service, or reads the developer's own ngrok config (#34).
 
     - **the bundled ngrok is a stand-in** (``tests/fake_ngrok_sdk``) that refuses every
@@ -787,15 +1041,17 @@ def no_real_ngrok(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
       test that wants a tunnel puts its own stand-in in ``sys.modules["ngrok"]``.
     - **ngrok's own configs are the test's**: ``~/.config/ngrok/ngrok.yml`` (or macOS's, or
       ``%LocalAppData%``'s) and ``~/.ngrok2/ngrok.yml`` hold the developer's authtoken, and a
-      tunnel's start reads them. Asked for with the developer's home in force, they are looked
-      for in a folder of the test's; a test that names a home of its own (``HOME``, or
-      ``home=``) gets that one's, as ever.
+      tunnel's start reads them. Asked for with the developer's home, or the one the suite
+      gave the test (:func:`isolated_user_home`), in force, they are looked for in a folder of
+      the test's, and never in the real ``%LocalAppData%``; a test that names a home of its
+      own (``HOME``, or ``home=``) gets that one's, as ever.
     """
     from aisquare.services import ngrok_sdk, ngrok_tunnel
     from tests.fake_ngrok_sdk import Script, fake_sdk
 
     monkeypatch.setitem(sys.modules, "ngrok", fake_sdk(Script(refuse="ERR_NGROK_TEST")))
     stand_in = tmp_path / "ngrok-home"
+    unnamed = (_DEVELOPERS_HOME, isolated_user_home)
     real_config, real_ngrok2 = ngrok_tunnel.ngrok_default_config, ngrok_sdk.ngrok2_config
 
     def config(
@@ -804,15 +1060,13 @@ def no_real_ngrok(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         environ: Mapping[str, str] = os.environ,
         home: Path | None = None,
     ) -> Path:
-        if home is None and Path.home() == _DEVELOPERS_HOME:
+        if home is None and Path.home() in unnamed:
             home = stand_in
             environ = {k: v for k, v in environ.items() if k not in ("LOCALAPPDATA",)}
         return real_config(platform=platform, environ=environ, home=home)
 
     def ngrok2() -> Path:
-        return (
-            stand_in / ".ngrok2" / "ngrok.yml" if Path.home() == _DEVELOPERS_HOME else real_ngrok2()
-        )
+        return stand_in / ".ngrok2" / "ngrok.yml" if Path.home() in unnamed else real_ngrok2()
 
     monkeypatch.setattr(ngrok_tunnel, "ngrok_default_config", config)
     monkeypatch.setattr(ngrok_sdk, "ngrok2_config", ngrok2)
@@ -1756,6 +2010,22 @@ def captain_gate_off(request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyP
     from aisquare.services.captain import gate
 
     monkeypatch.setattr(gate, "configured", lambda: False)
+
+
+@pytest.fixture(autouse=True)
+def remote_on(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The suite runs with Remote ON (``AISQUARE_EXPERIMENTAL_REMOTE=1``, #46): every Remote
+    pin was written while Remote was always there, and runs unchanged. Remote's switch has its
+    own pins (``tests/test_remote_flag.py``), which unset or set it themselves, or ask
+    :func:`remote_off`."""
+    monkeypatch.setenv(experimental.REMOTE_ENV, "1")
+
+
+@pytest.fixture
+def remote_off(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Remote OFF, as a fresh home has it: the variable set to ``0``, which wins over the
+    config and the home's state."""
+    monkeypatch.setenv(experimental.REMOTE_ENV, "0")
 
 
 @pytest.fixture

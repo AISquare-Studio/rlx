@@ -986,9 +986,10 @@ def test_the_card_names_the_project_not_its_codename_and_a_path_tells_twins_apar
         "🗂 unique",
     ]
     # The two `api` projects are told apart by their path alone: no codename on a card (Q3);
-    # the unique one is not decorated.
-    assert cards["prj_w"][1] and cards["prj_w"][2].endswith("work/api")
-    assert cards["prj_o"][1] and cards["prj_o"][2].endswith("oss/api")
+    # the unique one is not decorated. In the platform's own spelling: on Windows the suite's
+    # temp root is outside the home (#54), so the path is not the home's `~/...`.
+    assert cards["prj_w"][1] and cards["prj_w"][2].replace("\\", "/").endswith("work/api")
+    assert cards["prj_o"][1] and cards["prj_o"][2].replace("\\", "/").endswith("oss/api")
     assert cards["prj_u"][1] is False and cards["prj_u"][2] == ""
 
 

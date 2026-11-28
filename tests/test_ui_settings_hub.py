@@ -51,7 +51,7 @@ from aisquare.cli.ui.views.app_settings import (
 )
 from aisquare.cli.ui.views.personas_tab import PersonasTab
 from aisquare.cli.ui.views.remote import RemotePanel
-from aisquare.cli.ui.views.settings_captain import CaptainToggle
+from aisquare.cli.ui.views.settings_captain import CaptainToggle, ExperimentalSection
 from aisquare.cli.ui.views.settings_hub import SettingsHubView
 from aisquare.cli.ui.views.tmux_page import TmuxView
 from aisquare.core import claude_accounts as core
@@ -304,7 +304,7 @@ def test_the_keyboard_reaches_settings_and_walks_the_hubs_links_but_never_the_st
     keys, first, second, current = _drive(go)
     assert keys[-1] == SETTINGS_KEY and "" not in keys  # the status line is no row
     assert first == "hub-app-settings"  # opened from the keyboard: the first link has it
-    assert second == "hub-remote"  # Remote control, then Captain (#41)
+    assert second == "hub-remote"  # Remote control, then Experimental (#41, #46)
     assert current == "RemotePanel", "Enter on Remote control: the Remote page (Q17)"
 
 
@@ -337,12 +337,12 @@ def test_remote_control_opens_the_remote_page_and_captain_app_settings_last_tab(
         app.query_one("#app-settings-tabs", TabbedContent).active = PREFERENCES_TAB
         await pilot.click(app.query_one(SettingsRow))
         await settle_page(app)
-        await pilot.click("#hub-captain")
+        await pilot.click("#hub-experimental")
         await settle_page(app)
         tabs = app.query_one("#app-settings-tabs", TabbedContent)
         seen["captain"] = (app.content.current, app.sidebar.selected_key, tabs.active)
         view = app.query_one(AppSettingsView)
-        box = view.query_one(CaptainToggle)
+        box = view.query_one(ExperimentalSection)  # the captain's box's section since #46
         agent = view.query_one("#agent-settings")
         seen["captain last"] = agent.children[-1] is box
         seen["captain shown"] = box.region.area > 0 and agent.region.contains_region(box.region)
@@ -374,7 +374,7 @@ def test_the_hub_is_titled_settings_and_says_what_each_link_opens() -> None:
     assert links == [
         "App settings",
         "Remote control",
-        "Captain",
+        "Experimental",
         "Accounts",
         "Personas",
         "Usage & stats",
