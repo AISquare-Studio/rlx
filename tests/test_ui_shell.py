@@ -2628,6 +2628,44 @@ def test_the_app_keys_are_refused_while_focus_is_in_a_view(tmp_path: Path, scrip
     assert quit_code == 0  # …and the sidebar still quits
 
 
+def test_ctrl_q_quits_from_inside_a_settings_page_where_q_and_w_stay_the_sidebars(
+    tmp_path: Path, script: Script
+) -> None:
+    """The validator's F15: with focus inside a Settings page, q, w and even ctrl+q did
+    nothing; the footer showed only "? help". ctrl+q quits from there now. q and w stay gated
+    as they were (``test_the_app_keys_are_refused_while_focus_is_in_a_view``), and an agent's
+    pane still gets ctrl+q (``test_q_quits_from_the_sidebar_but_reaches_a_focused_terminal_pane``).
+    """
+    seed(tmp_path, ("prj_a", "alpha", None))
+
+    async def go(pilot: Pilot[None]) -> dict[str, Any]:
+        app = fleet_app(pilot)
+        await open_doctor(pilot)
+        page = app.content.current
+        inside = next(
+            widget
+            for widget in app.screen.focus_chain
+            if app.sidebar not in widget.ancestors_with_self
+            and app.content in widget.ancestors
+            and not isinstance(widget, TerminalPane)
+        )
+        inside.focus()
+        await settle(app)
+        seen: dict[str, Any] = {"focused": app.focused is inside, "page": page}
+        await pilot.press("q", "w")
+        await settle(app)  # a refused key has bubbled all the way up and been refused
+        seen["after q and w"] = (app.return_code, app.content.current, app.focused is inside)
+        await pilot.press("ctrl+q")
+        await settle(app)
+        seen["after ctrl+q"] = app.return_code
+        return seen
+
+    seen = drive(go)
+    assert seen["focused"] and seen["page"] == "doctor", seen
+    assert seen["after q and w"] == (None, "doctor", True), "q and w stay the sidebar's"
+    assert seen["after ctrl+q"] == 0, "ctrl+q quits from inside the page"
+
+
 def test_escape_hatch_focuses_the_sidebar(tmp_path: Path, script: Script) -> None:
     seed(tmp_path, ("prj_a", "alpha", None))
 

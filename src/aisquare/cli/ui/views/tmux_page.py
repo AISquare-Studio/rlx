@@ -183,6 +183,12 @@ def stop_question(pane: Pane) -> Text:
         else "It has exited: its window closes, and its last screen with it.",
         style="dim",
     )
+    if pane.agent is not None:
+        # Stopped through the fleet (``tmux_panes.stop``): its row ends as a Stop ends it.
+        question.append(
+            f"\n{pane.agent.label} is recorded as stopped, as its own Stop records it.",
+            style="dim",
+        )
     if pane.siblings:
         others = ", ".join(pane.siblings)
         many = len(pane.siblings) > 1
@@ -647,4 +653,7 @@ class TmuxView(VerticalScroll):
                     refresh()
             elif isinstance(result, str):
                 self.notify(result, timeout=6, markup=False)
+                refresh = getattr(self.app, "refresh_data", None)
+                if pane is not None and pane.agent is not None and callable(refresh):
+                    refresh()  # an agent stopped: the sidebar reads its row again
         self.tick()

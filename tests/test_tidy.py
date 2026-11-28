@@ -1002,6 +1002,67 @@ def test_only_a_stale_free_migration_lock_of_the_exact_name_goes(tmp_path: Path)
     assert held.exists() and fresh.exists() and other.exists()
 
 
+@pytest.mark.parametrize(
+    ("answer", "expected"),
+    [
+        ("per-user", ["per-user", "/tmp"]),
+        ("/tmp", ["/tmp"]),
+        (None, ["/tmp"]),
+    ],
+    ids=["its-own-and-tmp", "its-own-is-tmp", "none-known"],
+)
+def test_on_macos_the_locks_are_looked_for_in_the_per_user_temp_dir_and_in_tmp(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, answer: str | None, expected: list[str]
+) -> None:
+    """The validator's F12: the brief found stale locks in macOS's per-user temp dir AND in
+    ``/tmp`` (a mover run with ``TMPDIR`` unset or ``/tmp`` leaves its lock there), and the
+    rule looked in the per-user one alone. The real lookup, asked only for the paths: nothing
+    there is listed or read. ``/tmp`` once, when the per-user answer is ``/tmp`` itself."""
+    own = tmp_path / "var-folders" / "T"
+    said = {"per-user": str(own), "/tmp": "/tmp", None: None}[answer]
+
+    def confstr(name: int) -> str | None:
+        assert name == tidy._DARWIN_USER_TEMP_DIR
+        if said is None:
+            raise ValueError("unrecognized configuration name")
+        return said
+
+    monkeypatch.setattr(sys, "platform", "darwin")
+    monkeypatch.setattr(os, "confstr", confstr, raising=False)  # Windows has none
+    places = {"per-user": own, "/tmp": Path("/tmp")}
+
+    assert SYSTEM_TEMP_DIRS() == [places[each] for each in expected]
+
+
+def test_a_stale_free_lock_goes_from_either_temp_dir_and_nothing_else_in_tmp_does(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """With both temp dirs looked in (F12), each keeps the rule: the exact name, this user's,
+    stale and free. ``shared`` stands for ``/tmp``, in the sandbox."""
+    own, shared = tmp_path / "system-temp", tmp_path / "shared-temp"
+    shared.mkdir()
+    monkeypatch.setattr(tidy, "_system_temp_dirs", lambda: [own, shared])
+    stale_own, stale_shared, held, fresh = (
+        directory / f"rlx-home-migration-{n * 16}.lock"
+        for directory, n in ((own, "a"), (shared, "b"), (shared, "c"), (shared, "d"))
+    )
+    others = [shared / "rlx-home-migration-notours.lock", shared / "rlx-tidy-501.lock"]
+    for path in (stale_own, stale_shared, held, fresh, *others):
+        path.write_bytes(b"")
+    for path in (stale_own, stale_shared, held, *others):
+        aged(path, 25 * HOUR)
+
+    made = planned(tmp_path)
+
+    expected = {stale_own: tidy.MIGRATION_LOCK, stale_shared: tidy.MIGRATION_LOCK}
+    assert rules(made) == {**expected, held: tidy.MIGRATION_LOCK}
+    with holding(held, wait_s=0):  # a move running now
+        report = tidy.apply(made)
+    assert sorted(i.path for i in report.freed) == sorted(expected)
+    assert [(i.path, why) for i, why in report.not_freed] == [(held, "skipped: a move holds it")]
+    assert held.exists() and fresh.exists() and all(path.exists() for path in others)
+
+
 # --- 9. a real run frees exactly the dry run's list -------------------------------------------
 
 

@@ -631,3 +631,41 @@ def test_no_new_lines_marker_while_the_feed_shows_its_last_line(board: dict[str,
     overflow, unseen, marker = drive(go)
     assert overflow == 0, "the premise: four lines fit the feed"
     assert (unseen, marker) == (0, "")
+
+
+def test_a_refresh_that_pushes_a_short_feed_past_its_foot_counts_only_the_lines_below(
+    board: dict[str, Any],
+) -> None:
+    """The validator's F10 (the tester's, on #4): with autoscroll off, one refresh took a feed
+    that fit past its foot, and ``↓ N new`` counted every line it brought, those the view still
+    showed among them. It counts the lines below the view, since the first of those."""
+    from textual.widgets import OptionList
+
+    def line(seq: int) -> TeamEvent:
+        event = _event(seq, "ses_coder", "note", f"line {seq}")
+        return event.model_copy(update={"created_at": NOW - timedelta(hours=2, minutes=-seq)})
+
+    board["events"] = [line(1)]
+
+    async def go(app: Host, panel: BoardPanel) -> dict[str, Any]:
+        panel.action_toggle_autoscroll()  # off
+        feed = panel.query_one("#feed", OptionList)
+        await settle_page(app)
+        seen: dict[str, Any] = {"fit": feed.max_scroll_y == 0}
+        board["events"] = [line(seq) for seq in range(2, 61)]
+        panel.refresh_data()
+        await settle_page(app)
+        seen["top"] = feed.scroll_y == 0
+        seen["rows"] = feed.scrollable_content_region.height
+        seen["lines"] = feed.option_count
+        seen["marker"] = (panel.unseen, str(feed.border_subtitle))
+        return seen
+
+    seen = drive(go)
+    assert seen["fit"] and seen["top"], "the premise: a feed that fit, and a view that stayed"
+    assert seen["lines"] == 60 and 1 < seen["rows"] < 59, seen
+    below = seen["lines"] - seen["rows"]
+    since = watch.clock(line(60 - below + 1).created_at)
+    assert seen["marker"] == (below, f"↓ {below} new since {since} — End shows them"), (
+        f"{seen['rows']} rows in view; 59 lines came"
+    )

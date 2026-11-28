@@ -538,15 +538,24 @@ def warnings(persona: Persona) -> list[str]:
     found: list[str] = []
     if len(persona.body) > BODY_SOFT_CAP:
         # The command that does it: --condense keeps the persona's name, which this persona
-        # holds, so without --force it is refused (review of #201, R2-F6).
-        layer = " --project" if persona.layer == "project" else ""
-        found.append(
-            f"the body is {len(persona.body):,} characters, over the {BODY_SOFT_CAP:,} soft "
-            "cap — it is always-injected context"
-            + prog.shell_advice(
-                f"; `{prog.word()} persona import {persona.path} --condense --force{layer}` "
+        # holds, so without --force it is refused (review of #201, R2-F6). It writes yours (the
+        # user layer) alone: `persona import` refuses --project since 0.10.2, so a project's
+        # own persona is told that its shorter copy is yours, which the project's still
+        # shadows there until it goes (the validator's F8).
+        if persona.layer == "project":
+            advice = prog.shell_advice(
+                f"; `{prog.word()} persona import {persona.path} --condense --force` writes a "
+                "shorter copy into your personas, which this project's own copy shadows here "
+                f"until {persona.path} is removed"
+            )
+        else:
+            advice = prog.shell_advice(
+                f"; `{prog.word()} persona import {persona.path} --condense --force` "
                 "rewrites it shorter"
             )
+        found.append(
+            f"the body is {len(persona.body):,} characters, over the {BODY_SOFT_CAP:,} soft "
+            "cap — it is always-injected context" + advice
         )
     label = persona.frontmatter.get("name")
     if label is not None and label != persona.name:

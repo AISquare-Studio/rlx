@@ -1499,3 +1499,32 @@ def test_the_soft_cap_warning_names_an_import_that_condenses_the_persona_in_plac
     assert any(hint in warning for warning in warned), warned
     assert result.replaced and result.persona.path == long
     assert len(result.persona.body) < personas.BODY_SOFT_CAP
+
+
+def test_a_project_personas_soft_cap_warning_names_an_import_that_runs(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, runner: CliRunner
+) -> None:
+    """The validator's F8: for a project's own persona the warning added ``--project``, which
+    ``persona import`` refuses since 0.10.2 (``project_layer_retired``). The command it names
+    runs as it says it, and the warning says the shorter copy is yours, which the project's
+    own copy still shadows there."""
+    _drafts_named(monkeypatch, "long-skill")
+    theirs = tmp_path / "repo" / ".aisquare" / "personas" / "long-skill"
+    theirs.mkdir(parents=True)
+    source = "---\nname: long-skill\ndescription: Long.\n---\n" + "w" * 4_100 + "\n"
+    (theirs / "SKILL.md").write_text(source, encoding="utf-8")
+
+    warned = personas.warnings(personas.load(theirs, layer="project"))
+    advice = next(warning for warning in warned if "soft cap" in warning)
+    said = advice.split("`")[1]
+    program, *argv = said.split(" ")
+    ran = runner.invoke(app, [*argv, "--yes"])  # what it says, as it says it
+
+    assert program == "rlx" and argv[:2] == ["persona", "import"], said
+    assert argv[2] == str(theirs) and "--project" not in argv, said
+    assert ran.exit_code == 0, ran.output
+    assert "project_layer_retired" not in ran.output and "--project is retired" not in ran.output
+    mine = personas.load(_user_layer() / "long-skill", layer="user")
+    assert len(mine.body) < personas.BODY_SOFT_CAP, "the shorter copy is yours"
+    assert (theirs / "SKILL.md").read_text(encoding="utf-8") == source, "theirs is untouched"
+    assert f"shadows here until {theirs} is removed" in advice, advice

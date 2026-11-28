@@ -78,6 +78,11 @@ ATTACH_ACTIONS = frozenset({"attach_existing", "attach_new"})
 ATTACH_WORKER = "persona-attach"
 """The worker that attaches a persona to a running agent."""
 
+MIGRATE_WORKER = "persona-migrate"
+"""The worker that runs the one-time copy of the project personas to yours
+(``services.personas.migrate_once``) when the page opens: it reads every project's folder
+and writes your layer and ``state.json``, off the UI thread (the validator's F8)."""
+
 BUNDLED_REASON = "bundled — open it and Save as… to make it yours"
 
 
@@ -284,14 +289,30 @@ class PersonasTab(SavesAsYouGo, Vertical):
 
     def on_mount(self) -> None:
         self.query_one(DataTable).add_columns("persona", "layer", "description", "roles", "marks")
-        report = personas_service.migrate_once()
+        self.query_one("#personas-migrated", Collapsible).display = False
+        self.reload()
+        # Once per machine, and it copies folders and writes state.json: on a thread, never
+        # Textual's (the validator's F8). The page is listed meanwhile, and again after.
+        self.run_worker(
+            personas_service.migrate_once,
+            name=MIGRATE_WORKER,
+            group=MIGRATE_WORKER,
+            thread=True,
+            exit_on_error=False,  # it never raises; were it to, the page stays as listed
+        )
+
+    def _migrated(self, report: personas_service.MigrationReport) -> None:
+        """Show what the one-time copy did, behind its fold; list the page again when it
+        copied a persona into yours (the page was listed at mount, and is read once per
+        opening otherwise)."""
         self.migrated = report.summary()
         fold = self.query_one("#personas-migrated", Collapsible)
         fold.title = report.headline() or ""
         fold.display = self.migrated is not None
         detail = self.query_one("#personas-migrated-detail", Static)
         detail.update(Text(self.migrated) if self.migrated else "")
-        self.reload()
+        if report.copied:
+            self.reload()
 
     # --- reading and painting ---------------------------------------------------------
 
@@ -494,6 +515,11 @@ class PersonasTab(SavesAsYouGo, Vertical):
         )
 
     def on_worker_state_changed(self, event: Worker.StateChanged) -> None:
+        if event.worker.name == MIGRATE_WORKER:
+            report = event.worker.result
+            if event.state is WorkerState.SUCCESS and report is not None:
+                self._migrated(report)
+            return
         if event.worker.name != ATTACH_WORKER:
             return
         if event.state is WorkerState.SUCCESS:
