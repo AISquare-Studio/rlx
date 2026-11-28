@@ -151,7 +151,7 @@ pub mod topics {
     pub const CONNECTOR: &str = "connector";
     /// PTYs: `pty.output`, `pty.exited`.
     pub const PTY: &str = "pty";
-    /// Claude Code hooks, such as `hook.session_start` and `hook.pre_tool_use`.
+    /// Claude Code hooks, such as `hook.session_start` and `hook.stop`.
     pub const HOOK: &str = "hook";
     /// Fleet agents: `fleet.agent_spawned`, `fleet.agent_state`, `fleet.agent_ended`.
     pub const FLEET: &str = "fleet";
@@ -220,10 +220,9 @@ pub mod types {
     pub const HOOK_STOP: &str = "hook.stop";
     /// See [`HOOK_SESSION_START`].
     pub const HOOK_STOP_FAILURE: &str = "hook.stop_failure";
-    /// See [`HOOK_SESSION_START`].
+    /// See [`HOOK_SESSION_START`]. (`pre-tool-use` has none: the gate answers it and
+    /// publishes nothing, 5.1.)
     pub const HOOK_NOTIFICATION: &str = "hook.notification";
-    /// See [`HOOK_SESSION_START`]. The gate's (5.1).
-    pub const HOOK_PRE_TOOL_USE: &str = "hook.pre_tool_use";
 }
 
 impl Event {
