@@ -36,7 +36,7 @@
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use rlxd_client::Home;
 use rlxd_proto::{
@@ -88,10 +88,6 @@ const HELLO_TIMEOUT: Duration = Duration::from_secs(10);
 /// client to read it and close first.
 const LINGER: Duration = Duration::from_secs(1);
 
-/// How long a `claude` probe's answer is reused, so a client polling `status` does not
-/// start Claude Code several times a second.
-const CLAUDE_FRESH: Duration = Duration::from_secs(5);
-
 /// What this rlxd can do, by name, for `hello`'s reply and `status`, beside what its
 /// connectors add ([`Connectors::capabilities`]). The later items add theirs.
 const CAPABILITIES: &[&str] = &[];
@@ -103,7 +99,8 @@ pub struct Daemon {
     pid: u32,
     pipe_acl: Option<&'static str>,
     clients: Mutex<Clients>,
-    claude: tokio::sync::Mutex<Option<(Instant, Claude)>>,
+    /// `status.claude`, probed in the background (7.4).
+    claude: Arc<claude::Probe>,
     bus: Arc<Bus>,
     runner: Arc<Runner>,
     connectors: Arc<Connectors>,
@@ -251,7 +248,7 @@ impl Daemon {
             pid: std::process::id(),
             pipe_acl,
             clients: Mutex::new(Clients::default()),
-            claude: tokio::sync::Mutex::new(None),
+            claude: Arc::new(claude::Probe::new()),
             ptys: Arc::new(Host::new(Arc::clone(&bus))),
             bus,
             runner,
@@ -294,6 +291,7 @@ impl Daemon {
 
     /// Publishes `daemon.started {version, pid}`, the first event of this rlxd's life.
     pub fn started(&self) {
+        self.claude.start(&self.env);
         let data = object(&json!({"version": VERSION, "pid": self.pid}));
         if let Err(e) = self
             .bus
@@ -454,7 +452,7 @@ impl Daemon {
             if let Err(e) = off_worker(|| self.env.set(&change, &who)) {
                 return Err(reply_err(id, codes::INTERNAL, e.to_string()));
             }
-            *self.claude.lock().await = None;
+            self.claude.start(&self.env);
         }
         info!(
             "hello: {} {} as {}{}",
@@ -733,7 +731,7 @@ impl Daemon {
         let who = format!("{} {}", role_name(session.role), session.client);
         let values = off_worker(|| self.env.set(&change, &who))
             .map_err(|e| error(codes::INTERNAL, &e.to_string()))?;
-        *self.claude.lock().await = None;
+        self.claude.start(&self.env);
         printed(&values)
     }
 
@@ -948,19 +946,9 @@ impl Daemon {
         }
     }
 
-    /// What Claude Code says about itself, asked at most every [`CLAUDE_FRESH`]. Calls
-    /// that come while it is being asked wait for that answer.
+    /// What Claude Code says about itself: the background probe's answer (7.4).
     async fn claude(&self) -> Claude {
-        let mut cached = self.claude.lock().await;
-        if let Some((at, claude)) = cached.as_ref()
-            && at.elapsed() < CLAUDE_FRESH
-        {
-            return claude.clone();
-        }
-        let (resolved, source) = self.env.claude();
-        let claude = claude::probe_at(&resolved, source).await;
-        *cached = Some((Instant::now(), claude.clone()));
-        claude
+        self.claude.answer(&self.env).await
     }
 
     /// `debug.run_start`: `run.start`'s params plus a scheduler `job_id`, which only rlxd

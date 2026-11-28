@@ -24,7 +24,12 @@ use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
 
-use rlxd_proto::Claude;
+use std::sync::Arc;
+
+use rlxd_proto::{Claude, EnvValues};
+
+use crate::clock;
+use crate::env::Env;
 use serde_json::Value;
 use tokio::process::Command;
 
@@ -32,7 +37,7 @@ use tokio::process::Command;
 pub const BIN_ENV: &str = "RLXD_CLAUDE_BIN";
 
 /// How long each of the two commands may take.
-const TIMEOUT: Duration = Duration::from_secs(10);
+pub const TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Where `claude` was looked for: `status.claude.path_source`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -124,9 +129,181 @@ fn is_batch_file(program: &Path) -> bool {
             .is_some_and(|ext| ext.eq_ignore_ascii_case("cmd") || ext.eq_ignore_ascii_case("bat"))
 }
 
+/// How long a probe's answer is reused: a client polling `status` doesn't start Claude
+/// Code each time. A change to the app's values or the `claude` they resolve to, or
+/// rlxd's start, probes again at once.
+pub const FRESH: Duration = Duration::from_secs(30);
+
+/// How long `status` waits for a probe in flight before it answers with what it has: a
+/// quick probe's first answer is then fresh, and a hanging one never holds `status` up.
+pub const WAIT: Duration = Duration::from_millis(500);
+
+/// `status.claude`, probed in the background (7.4): `status` gets the last answer and
+/// never waits on Claude Code for more than [`WAIT`]. Each probe has a generation, and
+/// one started for an older environment never overwrites a newer one's answer.
+///
+/// The answer is for what it was probed with ([`Probed`]): only a change to that drops
+/// it. An app's `hello` or `env.set` with the values it had (every reconnect) changes
+/// nothing, and `status` goes on with the answer and its `as_of`.
+pub struct Probe {
+    state: std::sync::Mutex<ProbeState>,
+    /// The generation of the last probe that ended.
+    done: tokio::sync::watch::Sender<u64>,
+}
+
+/// What a probe runs with: the app's values, and the `claude` they resolved to and where
+/// it was looked for (`Env::snapshot`).
+type Probed = (EnvValues, (Resolved, Source));
+
+#[derive(Default)]
+struct ProbeState {
+    /// The last answer, for [`ProbeState::probed`]; none while its first probe runs.
+    answer: Option<Claude>,
+    /// When it ended.
+    at: Option<std::time::Instant>,
+    /// What the answer, and the probe running, are for.
+    probed: Option<Probed>,
+    /// The latest probe started.
+    generation: u64,
+    /// The probe running, by generation.
+    running: Option<u64>,
+}
+
+impl Probe {
+    /// No answer yet: [`Probe::start`] the first.
+    pub fn new() -> Self {
+        Self {
+            state: std::sync::Mutex::new(ProbeState::default()),
+            done: tokio::sync::watch::Sender::new(0),
+        }
+    }
+
+    /// Starts a probe in the background, with `env`'s values and the `claude` they
+    /// resolve to, read together. When the answer so far is for other values or another
+    /// `claude` (rlxd's start, an env change that changed them), always, and that answer
+    /// is dropped. For the same, only when none is running and the answer is older than
+    /// [`FRESH`], which is kept meanwhile. Needs the runtime.
+    pub fn start(self: &Arc<Self>, env: &Env) {
+        let now = env.snapshot();
+        let generation = {
+            let mut state = self.state();
+            if state.probed.as_ref() == Some(&now) {
+                let stale = state.at.is_none_or(|at| at.elapsed() >= FRESH);
+                if state.running.is_some() || !stale {
+                    return;
+                }
+            } else {
+                state.answer = None;
+                state.at = None;
+                state.probed = Some(now.clone());
+            }
+            state.generation += 1;
+            state.running = Some(state.generation);
+            state.generation
+        };
+        let (values, (resolved, source)) = now;
+        self.run(generation, async move {
+            probe_at(&resolved, source, &values).await
+        });
+    }
+
+    /// Runs `probe` as generation `generation`, in the background: its answer is kept
+    /// unless a later generation started meanwhile. However it ends, a panic included,
+    /// the generation no longer runs ([`Ending`]), so a later `status` probes again.
+    fn run(
+        self: &Arc<Self>,
+        generation: u64,
+        probe: impl Future<Output = Claude> + Send + 'static,
+    ) {
+        let ending = Ending {
+            probe: Arc::clone(self),
+            generation,
+        };
+        tokio::spawn(async move {
+            let mut claude = probe.await;
+            claude.as_of = Some(clock::now());
+            {
+                let mut state = ending.probe.state();
+                if state.generation == generation {
+                    state.answer = Some(claude);
+                    state.at = Some(std::time::Instant::now());
+                }
+            }
+            drop(ending);
+        });
+    }
+
+    /// The answer for `status`: the last probe's, a running one's when it ends within
+    /// [`WAIT`], else, before any has ended, what the resolution alone says, with no
+    /// `as_of`. Starts a probe when the answer is stale, or for other values.
+    pub async fn answer(self: &Arc<Self>, env: &Env) -> Claude {
+        self.start(env);
+        let running = self.state().running;
+        if let Some(generation) = running {
+            let mut done = self.done.subscribe();
+            let _ = tokio::time::timeout(WAIT, done.wait_for(|ended| *ended >= generation)).await;
+        }
+        if let Some(answer) = self.state().answer.clone() {
+            return answer;
+        }
+        let (resolved, source) = env.claude();
+        let mut claude = Claude::default();
+        claude.path_source = Some(source.name().to_owned());
+        if let Some(program) = resolved.program() {
+            claude.installed = true;
+            claude.path = Some(program.display().to_string());
+        }
+        claude
+    }
+
+    fn state(&self) -> std::sync::MutexGuard<'_, ProbeState> {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+}
+
+/// Ends a probe's generation when dropped, as its task ends or unwinds: it no longer
+/// runs, and `status` waiting for it ([`Probe::answer`]) is told.
+struct Ending {
+    probe: Arc<Probe>,
+    generation: u64,
+}
+
+impl Drop for Ending {
+    fn drop(&mut self) {
+        {
+            let mut state = self.probe.state();
+            if state.running == Some(self.generation) {
+                state.running = None;
+            }
+        }
+        let generation = self.generation;
+        self.probe.done.send_if_modified(|done| {
+            let later = *done < generation;
+            if later {
+                *done = generation;
+            }
+            later
+        });
+    }
+}
+
 /// What the Claude Code `resolved` names says about itself now, and where it was looked
-/// for.
-pub async fn probe_at(resolved: &Resolved, source: Source) -> Claude {
+/// for: `claude --version` and `claude auth status --json`, run at once with the app's
+/// environment `env` (4.3), each given [`TIMEOUT`]. A command that fails says why in
+/// `error`, never what it printed; the sign-in then reads as signed out.
+pub async fn probe_at(resolved: &Resolved, source: Source, env: &EnvValues) -> Claude {
+    probe_within(resolved, source, env, TIMEOUT).await
+}
+
+/// [`probe_at`], each command given `timeout`.
+async fn probe_within(
+    resolved: &Resolved,
+    source: Source,
+    env: &EnvValues,
+    timeout: Duration,
+) -> Claude {
     let mut claude = Claude::default();
     claude.path_source = Some(source.name().to_owned());
     let Some(program) = resolved.program() else {
@@ -135,15 +312,21 @@ pub async fn probe_at(resolved: &Resolved, source: Source) -> Claude {
     claude.installed = true;
     claude.path = Some(program.display().to_string());
     let (version, auth) = tokio::join!(
-        output(program, &["--version"]),
-        output(program, &["auth", "status", "--json"]),
+        output(program, &["--version"], env, timeout),
+        output(program, &["auth", "status", "--json"], env, timeout),
     );
-    claude.version = version.as_deref().and_then(parse_version);
-    if let Some(status) = auth
-        .as_deref()
-        .and_then(|text| serde_json::from_str(text).ok())
-    {
-        read_auth_status(&mut claude, &status);
+    let mut errors = Vec::new();
+    match version {
+        Ok(text) => claude.version = parse_version(&text),
+        Err(why) => errors.push(format!("claude --version {why}")),
+    }
+    match auth.map(|text| serde_json::from_str::<Value>(&text)) {
+        Ok(Ok(status)) if status.is_object() => read_auth_status(&mut claude, &status),
+        Ok(_) => errors.push("claude auth status --json printed no JSON object".to_owned()),
+        Err(why) => errors.push(format!("claude auth status --json {why}")),
+    }
+    if !errors.is_empty() {
+        claude.error = Some(errors.join("; "));
     }
     claude
 }
@@ -204,10 +387,16 @@ fn executable_extensions(pathext: Option<&std::ffi::OsStr>) -> Vec<String> {
 
 /// What `program args` printed, when it ran to an end within [`TIMEOUT`]. Its exit status
 /// does not matter: `auth status` exits 1 when signed out, and says so.
-async fn output(program: &Path, args: &[&str]) -> Option<String> {
+async fn output(
+    program: &Path,
+    args: &[&str],
+    env: &EnvValues,
+    timeout: Duration,
+) -> Result<String, String> {
     let mut command = Command::new(program);
     command
         .args(args)
+        .envs(env.pairs())
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
@@ -219,16 +408,19 @@ async fn output(program: &Path, args: &[&str]) -> Option<String> {
         command.creation_flags(0x0800_0000);
     }
     // Started as no other program of rlxd's starts (`crate::spawn`): the brain must not
-    // inherit this probe's stdout, nor this probe the brain's stdin.
+    // inherit this probe's stdout, nor this probe the brain's stdin. Only the start is
+    // held, never the wait.
     let child = {
         let _alone = crate::spawn::alone();
-        command.spawn().ok()?
+        command
+            .spawn()
+            .map_err(|e| format!("could not start: {e}"))?
     };
-    let output = tokio::time::timeout(TIMEOUT, child.wait_with_output())
+    let output = tokio::time::timeout(timeout, child.wait_with_output())
         .await
-        .ok()?
-        .ok()?;
-    String::from_utf8(output.stdout).ok()
+        .map_err(|_| format!("did not answer within {} ms", timeout.as_millis()))?
+        .map_err(|e| format!("could not be read: {e}"))?;
+    String::from_utf8(output.stdout).map_err(|_| "printed text that is not UTF-8".to_owned())
 }
 
 /// `2.1.314` from `2.1.314 (Claude Code)`: the first word of the first line, when it
@@ -254,9 +446,20 @@ fn read_auth_status(claude: &mut Claude, status: &Value) {
     };
     claude.signed_in = status.get("loggedIn").and_then(Value::as_bool) == Some(true);
     if claude.signed_in {
-        claude.auth_method = text("authMethod");
+        claude.auth_method = auth_method(text("authMethod"), text("apiProvider"));
         claude.account = text("email");
         claude.plan = text("subscriptionType");
+    }
+}
+
+/// `auth_method` from what `claude auth status` reports: its `authMethod` (`claude.ai`,
+/// `api_key`, `oauth_token`), but for `third_party` the provider it names (`bedrock`,
+/// `vertex`, `foundry`, …), and nothing for `none`.
+fn auth_method(method: Option<String>, provider: Option<String>) -> Option<String> {
+    match method.as_deref() {
+        None | Some("none") => None,
+        Some("third_party") => provider.or(method),
+        Some(_) => method,
     }
 }
 
@@ -265,6 +468,29 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+
+    /// Review #3345's nit: a probe whose task panics must not leave its generation
+    /// running, which would keep every later `status` waiting [`WAIT`] and starting none.
+    #[tokio::test]
+    async fn a_probe_that_panics_no_longer_runs_and_the_next_status_probes_again() {
+        let probe = Arc::new(Probe::new());
+        {
+            let mut state = probe.state();
+            state.generation = 1;
+            state.running = Some(1);
+        }
+        let mut done = probe.done.subscribe();
+        probe.run(1, async { panic!("a probe that panics") });
+        tokio::time::timeout(Duration::from_secs(5), done.wait_for(|ended| *ended >= 1))
+            .await
+            .expect("its generation ends")
+            .unwrap();
+        let state = probe.state();
+        assert_eq!(state.running, None);
+        assert!(state.answer.is_none());
+        // Stale (no answer), and none running: `start` would probe again.
+        assert!(state.at.is_none_or(|at| at.elapsed() >= FRESH));
+    }
 
     #[cfg(unix)]
     #[test]
@@ -317,6 +543,151 @@ mod tests {
         assert_eq!(parse_version("\n  2.1.400\n").as_deref(), Some("2.1.400"));
         assert_eq!(parse_version("error: no such flag\n"), None);
         assert_eq!(parse_version(""), None);
+    }
+
+    #[test]
+    fn status_carries_only_its_own_fields_of_claude_codes_answer() {
+        // Manager #2554: nothing of auth status's org, folders or expiry is passed on.
+        let mut claude = Claude::default();
+        let status = json!({"loggedIn": true, "authMethod": "claude.ai",
+            "apiProvider": "firstParty", "analyticsDisabled": false,
+            "projectsDirectory": "/p", "configDirectory": "/c",
+            "loginExpiresAt": "2026-12-01T00:00:00.000Z", "email": "probe@example.com",
+            "orgId": "00000000-0000-0000-0000-000000000000", "orgName": "Probe Org",
+            "subscriptionType": "pro", "storedClaudeAiLogin": true, "planTier": "pro_1"});
+        read_auth_status(&mut claude, &status);
+        let printed = serde_json::to_value(&claude).unwrap();
+        let keys: Vec<&str> = printed
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        assert_eq!(
+            keys,
+            ["account", "auth_method", "installed", "plan", "signed_in"],
+            "{printed}"
+        );
+        let text = printed.to_string();
+        for kept_out in ["Probe Org", "00000000", "/c", "/p", "2026-12-01", "pro_1"] {
+            assert!(!text.contains(kept_out), "{kept_out}: {text}");
+        }
+    }
+
+    #[test]
+    fn auth_method_is_claude_codes_or_the_provider_for_a_third_party() {
+        let method =
+            |m: &str, p: Option<&str>| auth_method(Some(m.to_owned()), p.map(str::to_owned));
+        assert_eq!(
+            method("claude.ai", Some("firstParty")).as_deref(),
+            Some("claude.ai")
+        );
+        assert_eq!(
+            method("api_key", Some("firstParty")).as_deref(),
+            Some("api_key")
+        );
+        assert_eq!(method("oauth_token", None).as_deref(), Some("oauth_token"));
+        assert_eq!(
+            method("third_party", Some("bedrock")).as_deref(),
+            Some("bedrock")
+        );
+        assert_eq!(
+            method("third_party", Some("vertex")).as_deref(),
+            Some("vertex")
+        );
+        assert_eq!(method("third_party", None).as_deref(), Some("third_party"));
+        assert_eq!(method("none", None), None);
+        assert_eq!(auth_method(None, Some("bedrock".to_owned())), None);
+        let mut claude = Claude::default();
+        read_auth_status(
+            &mut claude,
+            &json!({"loggedIn": true, "authMethod": "third_party", "apiProvider": "vertex"}),
+        );
+        assert_eq!(claude.auth_method.as_deref(), Some("vertex"));
+        assert_eq!((claude.account, claude.plan), (None, None));
+    }
+
+    /// A program in a fresh folder: a shell script of `body`.
+    #[cfg(unix)]
+    fn script(name: &str, body: &str) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("rlxd-probe-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let program = dir.join("claude");
+        std::fs::write(&program, format!("#!/bin/sh\n{body}\n")).unwrap();
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
+        program
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn the_probe_runs_claude_with_the_apps_environment() {
+        let program = script(
+            "env",
+            r#"case "$1" in
+  --version) echo "2.1.332 (Claude Code)";;
+  auth) printf '{"loggedIn":true,"authMethod":"claude.ai","email":"probe+%s@example.com","subscriptionType":"pro"}' "$CLAUDE_CONFIG_DIR";;
+esac"#,
+        );
+        let mut env = EnvValues::default();
+        env.claude_config_dir = Some("cc-test".to_owned());
+        let resolved = Resolved::Found(program.clone());
+        let claude = probe_within(&resolved, Source::App, &env, TIMEOUT).await;
+        assert!(claude.installed && claude.signed_in, "{claude:?}");
+        assert_eq!(claude.version.as_deref(), Some("2.1.332"));
+        assert_eq!(claude.account.as_deref(), Some("probe+cc-test@example.com"));
+        assert_eq!(claude.plan.as_deref(), Some("pro"));
+        assert_eq!(claude.path_source.as_deref(), Some("app"));
+        assert_eq!(claude.error, None);
+        std::fs::remove_dir_all(program.parent().unwrap()).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_probe_that_hangs_or_prints_no_json_says_why_and_reads_as_signed_out() {
+        let program = script("hangs", "exec sleep 30");
+        let resolved = Resolved::Found(program.clone());
+        let started = std::time::Instant::now();
+        let claude = probe_within(
+            &resolved,
+            Source::Rlxd,
+            &EnvValues::default(),
+            Duration::from_millis(300),
+        )
+        .await;
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "{:?}",
+            started.elapsed()
+        );
+        assert!(claude.installed && !claude.signed_in, "{claude:?}");
+        let error = claude.error.unwrap();
+        assert!(
+            error.contains("claude auth status --json did not answer within 300 ms"),
+            "{error}"
+        );
+        std::fs::remove_dir_all(program.parent().unwrap()).unwrap();
+
+        let program = script("not-json", "echo 'secret-looking text'");
+        let resolved = Resolved::Found(program.clone());
+        let claude = probe_within(&resolved, Source::Rlxd, &EnvValues::default(), TIMEOUT).await;
+        assert!(!claude.signed_in);
+        let error = claude.error.unwrap();
+        assert!(error.contains("printed no JSON object"), "{error}");
+        assert!(!error.contains("secret"), "never what it printed: {error}");
+        std::fs::remove_dir_all(program.parent().unwrap()).unwrap();
+    }
+
+    #[tokio::test]
+    async fn not_installed_is_installed_false_and_nothing_else_but_where_it_looked() {
+        let claude = probe_at(&Resolved::NotFound, Source::App, &EnvValues::default()).await;
+        assert!(!claude.installed && !claude.signed_in);
+        assert_eq!(
+            (claude.version, claude.path, claude.error),
+            (None, None, None)
+        );
+        assert_eq!(claude.path_source.as_deref(), Some("app"));
     }
 
     #[test]

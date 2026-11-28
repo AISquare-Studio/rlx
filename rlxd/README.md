@@ -140,6 +140,37 @@ program rlxd runs as Claude Code; tests point it at `tests/fixtures/fake-claude/
 read from rlxd's own environment only, and wins over the app's `PATH` (see [The app's
 environment](#the-apps-environment-for-claude-code)).
 
+`status.claude` (7.4) comes from a probe in the background, so `status` never waits on
+Claude Code for long:
+
+- **The probe** runs the `claude` rlxd resolved, with the app's environment: `claude
+  --version` and `claude auth status --json`, at once, each given 5 s. `signed_in` is its
+  `loggedIn`. `account` is its `email`, and `plan` its `subscriptionType`. `auth_method` is
+  its `authMethod` (`claude.ai`, `api_key`, `oauth_token`), or for `third_party` the
+  provider it names (`bedrock`, `vertex`, `foundry`, …).
+- **When.** At rlxd's start, when the app's values or the `claude` they resolve to
+  change (`env.set`, an app `hello`'s `env`), and when `status` finds the last answer
+  older than 30 s. A probe for an older environment never overwrites a newer one's answer.
+  An `env.set` or app `hello` with the values rlxd has, as on each reconnect, changes
+  nothing: `status` keeps the answer and its `as_of`.
+- **What `status` gets.** The last answer, with `as_of`, when its probe ended. A probe
+  in flight is waited for at most 500 ms. Before the first one ends, and after a change
+  until the new one ends, there is no `as_of`, and `signed_in` is false: no `as_of` means
+  still checking, not signed out. A probe that ends however it ends, a panic included, no
+  longer runs, so a later `status` probes again.
+- **A probe that fails** (Claude Code won't start, doesn't answer within its time, prints
+  no JSON) reads as signed out, with `error` saying why. `error` never holds what Claude
+  Code printed.
+- **Not installed** gives `installed: false`, with only `path_source` beside it.
+- Only §7.4's fields of Claude Code's answer reach `status`: never its org, folders or
+  sign-in expiry. The probe's output is never logged.
+
+The rest of `status`: `runs` counts the runner's live and queued runs, `jobs` is the
+scheduler's ([The scheduler](#the-scheduler)), and `capabilities` lists what this rlxd can do by 5.3's names
+(`connectors.call`, `connectors.no_turn`, `connectors.gate_before_turn`), none of which
+exist yet. `crates/rlxd/tests/status.rs` runs 7.4's Accept lines and these, on three
+OSes, and `rlxd-proto`'s schema tests check `status` declares every field of 7.4's JSON.
+
 ## The event bus
 
 One numbered stream of events per home (1.7, 7.3), the `crate::bus` module:
