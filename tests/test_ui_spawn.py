@@ -54,7 +54,12 @@ from textual.widgets import (
 from aisquare.cli.ui import app as app_module
 from aisquare.cli.ui import spawn as spawn_module
 from aisquare.cli.ui.app import FleetApp
-from aisquare.cli.ui.attach import AttachTargetScreen, NewAccountRequested, args_hint
+from aisquare.cli.ui.attach import (
+    SECTION_TITLES,
+    AttachTargetScreen,
+    NewAccountRequested,
+    args_hint,
+)
 from aisquare.cli.ui.persona_dialogs import ImportPersonaScreen
 from aisquare.cli.ui.sidebar import (
     AddProject,
@@ -1078,10 +1083,12 @@ def test_accounts_are_read_in_a_worker_and_listed_by_slot(git_project: ProjectIn
         scenario,
         accounts=lambda: overview((1, "me@example.com"), (2, None)),
     )
+    # Named as the Accounts page names them (Q1; finding 7 of #4295): the slot, then who,
+    # never the built-in "account 2" or the overview's own label beside the email.
     assert options == [
         "(this shell's)",
-        "1 · default · me@example.com",
-        "2 · account 2 · not signed in",
+        "1 · me@example.com",
+        "2 · not signed in",
     ]
 
 
@@ -1298,6 +1305,69 @@ def test_default_account_label_names_each_rung() -> None:
     assert label(choice(work, "project default")) == "(default: project default · work)"
     assert label(choice(None, None)) == "(this shell's)"
     assert label(choice(None, None), bound=True) == "(default: coder's CLAUDE_CONFIG_DIR)"
+
+
+def test_the_no_account_option_names_its_account_by_email_as_the_accounts_page_does() -> None:
+    """Q1, finding 7 of the 0.10.2 gate (#4295): the option said ``(default: headroom ·
+    account 2)`` of an account every other page names by its email. Named off the accounts
+    read: the alias, else the email; the built-in name only for one not read or signed out."""
+    spare = _account(2)
+    read = overview((1, "me@example.com"), (2, "two@example.com"), (3, None)).accounts
+
+    def label(account: ClaudeAccount, statuses: Sequence[ClaudeAccountStatus]) -> str:
+        default = accounts_service.LaunchDefault(
+            accounts_service.AccountChoice(account, "headroom")
+        )
+        return spawn_module.default_account_label(default, "coder", None, statuses)
+
+    assert label(spare, read) == "(default: headroom · two@example.com)"
+    assert label(_account(2, alias="work"), read) == "(default: headroom · work)", "its alias"
+    assert label(_account(3), read) == "(default: headroom · account 3)", "signed in as no one"
+    assert label(spare, []) == "(default: headroom · account 2)", "before the accounts read"
+
+
+def test_a_default_read_that_lands_before_the_accounts_is_named_by_email_once_they_do(
+    git_project: ProjectInfo, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The label is the default read's and the email the accounts read's, two workers. Held
+    here so the default lands first: the option names the account as it can, then by its
+    email when the accounts land, with no read of the default again."""
+    labels: list[str] = []
+    labelled = threading.Event()
+    reads: list[str] = []
+    label_default = SpawnDialog._label_default
+
+    def record(dialog: SpawnDialog, label: str) -> None:
+        labels.append(label)
+        if label != spawn_module.DEFAULT_PENDING:
+            labelled.set()
+        label_default(dialog, label)
+
+    def accounts() -> AccountsOverview:
+        labelled.wait(timeout=10)  # bounded: the default's label first, the order tested here
+        return overview((1, "me@example.com"), (2, "two@example.com"))
+
+    def defaults(
+        project: ProjectInfo,
+        role: str,
+        args: list[str],
+        model: str | None = None,
+        agent: str | None = None,
+    ) -> accounts_service.LaunchDefault:
+        reads.append(role)
+        return accounts_service.LaunchDefault(
+            accounts_service.AccountChoice(_account(2), "headroom")
+        )
+
+    monkeypatch.setattr(SpawnDialog, "_label_default", record)
+
+    async def scenario(pilot: Pilot[None], host: Host, dialog: SpawnDialog) -> str:
+        return account_field(dialog)[1]
+
+    shown_now = drive(git_project, scenario, accounts=accounts, defaults=defaults)
+    assert labels[0] == "(default: headroom · account 2)", "the premise: the default first"
+    assert shown_now == "(default: headroom · two@example.com)", labels
+    assert reads == ["coder"], "named again from the read it had, not read again"
 
 
 # --- refusals, cancel, and the receipt --------------------------------------------------
@@ -2892,7 +2962,7 @@ def test_the_accounts_are_read_once_off_the_ui_thread_whatever_the_agent_or_role
 
     labels = drive(git_project, scenario, accounts=accounts)
     assert len(readers) == 1 and threading.main_thread() not in readers
-    assert labels == ["(this shell's)", "2 · account 2 · slot2@example.com"]
+    assert labels == ["(this shell's)", "2 · slot2@example.com"]
 
 
 def test_a_codex_teammate_hands_off_on_its_own_agent_and_accounts_until_another_is_picked(
@@ -3204,6 +3274,23 @@ def test_the_pick_note_shows_only_beside_a_pick_that_presses(
     assert free_note is not None and "fills Role, Binary and Account" in free_note
     assert handed_note is None
     assert back_note == free_note
+
+
+def test_the_preset_row_says_preset_as_its_label_tooltip_and_picker_do(
+    git_project: ProjectInfo,
+) -> None:
+    """Q15, finding 6 of the 0.10.2 gate (#4295): the row is *Preset*, its tooltip and its
+    picker's section say preset, and the note under it still said "a bind or an account"."""
+
+    async def scenario(pilot: Pilot[None], host: Host, dialog: SpawnDialog) -> list[Any]:
+        pick = dialog.query_one("#spawn-pick", Button)
+        return [note(dialog, "#spawn-pick-note"), str(pick.tooltip)]
+
+    said, tooltip = drive(git_project, scenario)
+    assert said == "a preset or an account: fills Role, Binary and Account"
+    assert tooltip == "choose a preset or an account"
+    assert SECTION_TITLES["binds"].startswith("Presets — "), "the picker's word for it"
+    assert re.search(r"\bbind\b", said) is None, said
 
 
 @pytest.mark.needs_captain

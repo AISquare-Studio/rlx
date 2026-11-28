@@ -795,8 +795,9 @@ class AppSettingsView(SavesAsYouGo, Vertical):
 
     @staticmethod
     def bindings_section() -> tuple[str, str]:
-        """The Role bindings section's title and line."""
-        return ("Role bindings", "binary, environment and args per role, each written at once")
+        """The Presets section's title and line: a role's binding is a *preset*, as the Spawn
+        dialog's Preset row and its picker name it (Q15, finding 6 of #4295)."""
+        return ("Presets", "binary, environment and args per role, each written at once")
 
     ALWAYS_SHOW_PATH_ABOUT: ClassVar[str] = (
         "Show each project's path under its name in the sidebar. "
@@ -1201,7 +1202,7 @@ class AppSettingsView(SavesAsYouGo, Vertical):
         # Where each thing is set in rlx: the page's own rows, never a command (R13).
         yield Static(
             Text(
-                "Each role's binding (binary, environment, args) is under Role bindings below, "
+                "Each role's preset (binary, environment, args) is under Presets below, "
                 "and its account in the select beside it. The machine and project account "
                 "defaults are on the Accounts page. No value on this tab is read from the "
                 "environment."
@@ -1215,12 +1216,12 @@ class AppSettingsView(SavesAsYouGo, Vertical):
         with Vertical(id="role-bindings"):
             yield from self._binding_rows()
         with Horizontal(classes="row"):
-            yield Button("+ New bind", id="bindings-new")
+            yield Button("+ New preset", id="bindings-new")
 
     def _binding_rows(self) -> Iterable[Vertical | Static]:
         """One block per bound role — its binding, then Edit, Unset key… and Clear."""
         if not self._role_bindings:
-            yield Static(Text("no role bindings — + New bind makes one"), id="bindings-empty")
+            yield Static(Text("no presets — + New preset makes one"), id="bindings-empty")
             return
         for role, profile in sorted(self._role_bindings.items()):
             yield Vertical(

@@ -38,7 +38,7 @@ from textual.widgets import Button, Static, TabbedContent, TabPane
 from textual.worker import Worker, WorkerState
 
 from aisquare.cli.ui.board import BoardPanel
-from aisquare.cli.ui.sidebar import CUSTOM_ROLE_ICON, ROLE_ICON, STATE_CHIP
+from aisquare.cli.ui.sidebar import CUSTOM_ROLE_ICON, ROLE_ICON, STATE_CHIP, agent_name
 from aisquare.cli.ui.terminal import PANE_GONE, TerminalPane
 from aisquare.cli.ui.views.agent import InfoLine, SlotLabels, key_spellings, shown_pane
 from aisquare.cli.ui.views.fleet_bulk import BulkAsked
@@ -85,7 +85,7 @@ def no_manager_text(
         text.append(f"{name}'s manager is paused.\n", style="bold")
         text.append(
             "Its session, claims and team wait for Resume agents, which brings back every "
-            f"paused agent of {name} and clears its fleet-paused signal.",
+            f"paused agent of {name} and lifts the project's pause.",
         )
     elif exited is not None:
         status = exited.agent.exit_status
@@ -395,13 +395,11 @@ class ManagerTab(Vertical):
         if event.state is WorkerState.SUCCESS:
             receipt = event.worker.result
             if isinstance(receipt, fleet_service.SpawnReceipt):
-                agent = receipt.agent
-                where = f"{receipt.tmux_session} {agent.pane_id}"
-                self.notify(
-                    f"✓ spawned {agent.label} ({agent.id}) → {where}",
-                    timeout=6,
-                    markup=False,
-                )
+                # Named as the Spawn dialog's toast names it (app.py's ``spawn_finished``): no
+                # agent id, tmux session or pane id, which are nobody's words but tmux's (Q2;
+                # finding 5 of #4295: with the Manager tab as home, this is the toast most see).
+                named = agent_name(receipt.agent.label, self.project)
+                self.notify(f"✓ spawned {named}", timeout=6, markup=False)
                 for note in receipt.notes:
                     done = note in receipt.shared
                     self.notify(

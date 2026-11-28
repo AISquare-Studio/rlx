@@ -1415,7 +1415,9 @@ def test_every_agent_state_has_its_own_badge_and_sentence(node_report: dict[str,
     assert badges["paused"] == ["paused ⏸", "s-paused"]
     assert STATE_CHIP["paused"][0] == "⏸", "the sidebar's own paused mark"
     assert "⏯" not in _text("app.js")
-    assert sentences["paused"].startswith("paused") and "fleet resume" in sentences["paused"]
+    # A person's page names no command (R13, finding 3 of #4295): it was "… wait for fleet
+    # resume", the shell's words; it is rlx's Resume, where a person finds it.
+    assert sentences["paused"].startswith("paused") and "Resume in rlx" in sentences["paused"]
     assert ".s-paused" in _text("app.css")
 
 

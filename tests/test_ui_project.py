@@ -60,6 +60,7 @@ from aisquare.cli.app import app
 from aisquare.cli.ui.board import COLUMN_WIDTH_KEY, DETAIL_HEIGHT_KEY, EMPTY_ROW, BoardPanel
 from aisquare.cli.ui.divider import Divider
 from aisquare.cli.ui.save_model import CommitInput
+from aisquare.cli.ui.sidebar import agent_name, project_name
 from aisquare.cli.ui.terminal import TerminalPane
 from aisquare.cli.ui.views import personas_tab
 from aisquare.cli.ui.views import project as project_view_module
@@ -554,6 +555,39 @@ def test_a_share_the_manager_spawn_made_is_told_as_done_not_as_a_warning(
     notices = drive(project, scenario)
     assert (shared, "information") in notices
     assert (warning, "warning") in notices
+
+
+def test_the_start_manager_toast_names_the_manager_as_the_spawn_dialogs_toast_does(
+    project: ProjectInfo, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Q2, finding 5 of the 0.10.2 gate (#4295): the Spawn dialog's toast lost the agent id,
+    the codename session and the pane id, and the Manager tab's Start manager, the home's
+    one button (L1), still said ``✓ spawned manager (agt_…) → asq-amber-otter %7``. It says
+    what the dialog's says: the label and its project's name, nothing of tmux's or the
+    store's."""
+    fleet: dict[str, FleetAgent | None] = {"manager": None}
+
+    def spawn(target: ProjectInfo, role: str, **_: object) -> fleet_service.SpawnReceipt:
+        fleet["manager"] = fake_agent(target)
+        return fleet_service.SpawnReceipt(
+            agent=fake_agent(target), asked_label=None, tmux_session="asq-amber-otter"
+        )
+
+    monkeypatch.setattr(fleet_service, "spawn", spawn)
+    monkeypatch.setattr(fleet_service, "manager_of", lambda target: fleet["manager"])
+
+    async def scenario(pilot: Pilot[None], host: Host) -> list[tuple[str, str]]:
+        await pilot.click("#start-manager")
+        await settle(pilot)
+        return host.notices
+
+    notices = drive(project, scenario)
+    toasts = [message for message, _ in notices if message.startswith("✓ spawned")]
+    assert toasts == [f"✓ spawned {agent_name('manager', project)}"], notices
+    assert project_name(project) in toasts[0], "the dialog's way: the project named"
+    agent = fake_agent(project)
+    for tmux_or_store in (agent.id, agent.pane_id, "%", "asq-amber-otter", "→"):
+        assert tmux_or_store not in toasts[0], (tmux_or_store, toasts[0])
 
 
 def test_the_manager_pane_is_scripted_and_never_addresses_the_real_fleet(
@@ -1252,7 +1286,11 @@ def test_the_board_names_its_accounts_from_a_worker_never_from_the_ui_thread(
     """Review of #205, fourth round: the sessions block read the slot labels itself — a
     ``context.db`` open with a busy timeout of seconds and a scan of the account
     directories — on the event loop, at every tick of every open board. The panel reads
-    them in a thread worker, at most every ``LABELS_TTL``, and paints the map it has."""
+    them in a thread worker, at most every ``LABELS_TTL``, and paints the map it has.
+
+    By email, as the Accounts page and the agent header name them (Q1; finding 7 of the
+    0.10.2 gate, #4295): the block read ``slot_labels`` and said ``account 2``. That map is
+    the text board's, which hooks inject into agents, and it is never asked here."""
     import threading
 
     from aisquare.core import claude_accounts as accounts_core
@@ -1277,11 +1315,17 @@ def test_the_board_names_its_accounts_from_a_worker_never_from_the_ui_thread(
         lambda **kwargs: team_service.BoardRead(project, sessions, [], [], {}),
     )
     asked: list[str] = []
+    built_in: list[str] = []
+
+    def display_labels(statuses: Any = None) -> dict[int, str]:
+        asked.append(threading.current_thread().name)
+        return {two.slot: "two@example.com", three.slot: "three@example.com"}
 
     def slot_labels(store: Any = None) -> dict[int, str]:
-        asked.append(threading.current_thread().name)
-        return {two.slot: "work", three.slot: "home"}
+        built_in.append(threading.current_thread().name)
+        return {two.slot: f"account {two.slot}", three.slot: f"account {three.slot}"}
 
+    monkeypatch.setattr(accounts_service, "display_labels", display_labels)
     monkeypatch.setattr(accounts_service, "slot_labels", slot_labels)
 
     async def scenario(pilot: Pilot[None], host: Host) -> str:
@@ -1296,7 +1340,8 @@ def test_the_board_names_its_accounts_from_a_worker_never_from_the_ui_thread(
     painted = drive(project, scenario)
     assert asked and threading.main_thread().name not in asked
     assert len(asked) == 1  # ticks inside the TTL paint the map they have
-    assert "work" in painted and "home" in painted
+    assert "two@example.com" in painted and "three@example.com" in painted, painted
+    assert built_in == [] and "account " not in painted, painted
 
 
 def _event(project: ProjectInfo, index: int) -> TeamEvent:

@@ -708,7 +708,7 @@ const STATES = {
 const STATE_SENTENCES = {
   working: "working", waiting: "waiting at its prompt", attention: "waiting on you", limited: "at its usage limit",
   exited: "exited", lost: "gone: its pane is lost",
-  paused: "paused: its claims, worktree and session wait for fleet resume", unknown: "in a state tmux does not say",
+  paused: "paused (Resume in rlx brings it back where it was)", unknown: "in a state tmux does not say",
 };
 
 /* The state badge, and a NEEDS YOU badge beside it when the feed has an item for this
@@ -1621,7 +1621,7 @@ function offScreen(kind) {
 const OFF_SCREENS = {
   off: ["Remote is off on the machine", "Turn Remote on again on the machine, then retry."],
   gone: [OFF_OR_MOVED, "Turn it on again, or open the link the machine shows now: the link changes when ngrok " +
-    "restarts without a static domain, and with regenerate-password --new-link."],
+    "restarts without a static domain, and when New link is pressed on rlx's Remote page."],
   link: ["This link is no longer valid", "Open the link the machine shows now."],
   origin: ["Open this page from the link the machine shows", "This copy of the page came from somewhere else."],
 };

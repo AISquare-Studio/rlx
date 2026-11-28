@@ -407,8 +407,11 @@ def test_a_signal_with_no_agent_paused_is_cleared_from_the_card(
 
     options, listed, label = drive(go)
     assert options == [("pause", False), ("resume", False)], "both act: alpha runs, and is paused"
-    assert listed[0] == "no agent is paused; Resume clears the fleet-paused signal of alpha"
-    assert label == "Clear fleet-paused"
+    # In plain words (finding 17 of #4295): it said "clears the fleet-paused signal of alpha"
+    # under a "Clear fleet-paused" button, a name of the board's and the CLI's.
+    assert listed[0] == "no agent is paused; Resume lifts the pause left on alpha"
+    assert label == "Lift the pause"
+    assert "fleet-paused" not in listed[0] + label and "signal" not in listed[0]
     assert acting_on_running.signals == [("off", "prj_a")]
     assert acting_on_running.calls == [], "no agent was started or stopped"
 
@@ -442,6 +445,7 @@ def test_a_paused_managers_tab_says_paused_and_offers_resume_not_start(
 
     header, start, resume, title = drive(go)
     assert header.startswith("alpha's manager is paused.") and "exited" not in header
+    assert "lifts the project's pause" in header and "fleet-paused" not in header, header
     assert (start, resume) == (False, True), "Resume agents in place of Start manager"
     assert title == "Resume the paused agents of alpha?"
 

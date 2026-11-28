@@ -108,6 +108,12 @@ WILL_RESUME = "will be resumed"
 WILL_END = "its pause will be ended, not resumed"
 """A paused row whose task closed meanwhile, which a resume stops for good (its claims go back
 to the board) rather than resume: after its task's state in the dialog's list."""
+NO_AGENT_PAUSED = "no agent is paused; Resume lifts the pause left on"
+"""A resume with no agent paused, before the projects whose ``fleet-paused`` signal reads on
+(a signal-only pause, an earlier version's): the signal in plain words (finding 17 of #4295),
+which tells a project's manager to start nothing until the pause is lifted."""
+LIFT_THE_PAUSE = "Lift the pause"
+"""That resume's button: it clears the signal alone, with no agent to resume."""
 
 
 class BulkAsked(Message):
@@ -180,7 +186,7 @@ def plan_text(plan: fleet_service.BulkPlan) -> Text:
     text = Text()
     if not plan.targets and plan.acts:  # a resume with no agent paused: the signal alone
         named = [project_name(p) for p in plan.projects if p.id in plan.fleet_paused]
-        text.append("no agent is paused; Resume clears the fleet-paused signal of ", style="bold")
+        text.append(f"{NO_AGENT_PAUSED} ", style="bold")
         text.append(", ".join(named) + "\n", style="bold")
     elif not plan.targets:
         text.append(f"nothing to {plan.action}\n", style="bold")
@@ -426,7 +432,7 @@ class ConfirmBulk(ModalScreen[fleet_service.BulkPlan | None]):
         widgets: list[Widget] = []
         if not plan.targets and plan.acts:  # a resume with no agent paused: the signal alone
             named = [project_name(p) for p in plan.projects if p.id in plan.fleet_paused]
-            words = "no agent is paused; Resume clears the fleet-paused signal of "
+            words = f"{NO_AGENT_PAUSED} "
             widgets.append(
                 Static(Text(words + ", ".join(named), style="bold"), classes="bulk-note")
             )
@@ -498,7 +504,7 @@ class ConfirmBulk(ModalScreen[fleet_service.BulkPlan | None]):
         select_all.value = picked == total
         select_all.label = Text(f"Select all ({picked} of {total})")
         if total == 0 and plan.acts:  # a resume of the signal alone
-            confirm.label = "Clear fleet-paused"
+            confirm.label = LIFT_THE_PAUSE
             confirm.refresh(layout=True)
             confirm.disabled = False
             return

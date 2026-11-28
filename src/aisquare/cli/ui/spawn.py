@@ -196,6 +196,7 @@ from aisquare.core.personas import Persona
 from aisquare.core.store import store_session
 from aisquare.models import (
     AccountsOverview,
+    ClaudeAccount,
     ClaudeAccountStatus,
     FleetAgentStatus,
     ProjectInfo,
@@ -395,10 +396,14 @@ def read_launch_default(
 
 
 def default_account_label(
-    default: accounts_service.LaunchDefault, role: str, agent: str | None = None
+    default: accounts_service.LaunchDefault,
+    role: str,
+    agent: str | None = None,
+    statuses: Iterable[ClaudeAccountStatus] = (),
 ) -> str:
-    """``(default: rank 1 · work)`` — what the Account field's no-account option runs on,
-    by the rung that picked it (rank, headroom, the role's binding, the project's default).
+    """``(default: rank 1 · me@example.com)`` — what the Account field's no-account option runs
+    on, by the rung that picked it (rank, headroom, the role's binding, the project's default),
+    the account named as the Accounts page names it (:func:`account_name`, off ``statuses``).
 
     ``(this shell's)`` only when the ladder picks nothing — no account signed in — and the
     launch leaves this shell's environment as it is; a role whose binding sets the agent's
@@ -420,13 +425,33 @@ def default_account_label(
         why = f"bound to {role}"
     else:
         why = source or "picked"
-    return f"(default: {why} · {accounts_core.label(account)})"
+    return f"(default: {why} · {account_name(account, statuses)})"
+
+
+def account_name(account: ClaudeAccount, statuses: Iterable[ClaudeAccountStatus]) -> str:
+    """``me@example.com``, or ``work`` for an aliased one: ``account`` as the Accounts page
+    names it (``accounts_service.display_name``, the 0.10.2 UX audit's Q1), its identity read
+    off ``statuses`` (the dialog's one accounts read: no file read here). Its built-in name,
+    ``account 2``, only while it is signed in as no one or not read yet (finding 7 of #4295:
+    the no-account option said ``account 2`` of an account every other page names by email)."""
+    identity = next(
+        (
+            status.identity
+            for status in statuses
+            if (status.account.agent, status.account.slot) == (account.agent, account.slot)
+        ),
+        None,
+    )
+    return accounts_service.display_name(account, identity)
 
 
 def account_choice(status: ClaudeAccountStatus) -> str:
-    """``2 · account 2 · me@example.com`` — who a slot is, as the Accounts page names it."""
+    """``2 · me@example.com``, ``3 · work · w@example.com`` for an aliased one: the slot, then
+    who it is as the Accounts page and the target picker name it (Q1), never its built-in
+    ``account 2`` (finding 7 of #4295); ``2 · not signed in`` for one signed in as no one."""
     who = status.identity.email if status.identity is not None else "not signed in"
-    return f"{status.account.slot} · {status.label} · {who}"
+    named = [status.account.alias, who] if status.account.alias else [who]
+    return " · ".join([str(status.account.slot), *named])
 
 
 def persona_choice(persona: Persona) -> str:
@@ -570,6 +595,10 @@ class SpawnDialog(ModalScreen[fleet_service.SpawnReceipt | None]):
         """What the no-account option was last read with (:meth:`_default_inputs`)."""
         self._default_label = DEFAULT_PENDING
         """The no-account option's label: what the spawn runs on (:func:`default_account_label`)."""
+        self._default_read: tuple[accounts_service.LaunchDefault, str, str | None] | None = None
+        """The default read the label was made from, with its role and agent: named again when
+        the accounts read lands after it, so its account reads by its email
+        (:func:`account_name`)."""
         self._default_noted = False
         """Whether the Account note holds what the last default read said (a refusal), not the
         accounts read's."""
@@ -953,7 +982,7 @@ class SpawnDialog(ModalScreen[fleet_service.SpawnReceipt | None]):
                             disabled=self._captain,
                         )
                         yield Static(
-                            "a bind or an account: fills Role, Binary and Account",
+                            "a preset or an account: fills Role, Binary and Account",
                             id="spawn-pick-note",
                         )
                     # Who runs it — the agent, by the role's binding unless one is picked …
@@ -2498,12 +2527,16 @@ class SpawnDialog(ModalScreen[fleet_service.SpawnReceipt | None]):
             )
             if current and isinstance(default, accounts_service.LaunchDefault):
                 agent = key[4] if isinstance(key, tuple) else None
-                self._label_default(default_account_label(default, self._role, agent))
+                self._default_read = (default, self._role, agent)
+                self._label_default(
+                    default_account_label(default, self._role, agent, self._account_statuses)
+                )
                 if self._default_noted:
                     self._default_noted = False
                     self._note("#spawn-account-note", None)
         elif state is WorkerState.ERROR:
             error = worker.error
+            self._default_read = None
             self._label_default(DEFAULT_PENDING)
             self._default_noted = True
             if isinstance(error, accounts_service.NoSuchAccount):
@@ -2527,6 +2560,10 @@ class SpawnDialog(ModalScreen[fleet_service.SpawnReceipt | None]):
             self._account_statuses = list(worker.result.accounts)
             self._adopt_preset_account_owner()
             self._follow_agent()
+            if self._default_read is not None:  # read first: its account named by email now
+                self._label_default(
+                    default_account_label(*self._default_read, self._account_statuses)
+                )
         elif state is WorkerState.ERROR:
             error = worker.error
             self._default_noted = False

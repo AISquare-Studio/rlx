@@ -21,6 +21,7 @@ from textual.widgets import Button, DataTable, Input, OptionList
 from aisquare.cli import watch
 from aisquare.cli.ui import board as board_mod
 from aisquare.cli.ui.board import (
+    BOARD_KEYS,
     GROUP_ROW,
     TASK_COLUMNS,
     BoardPanel,
@@ -518,6 +519,29 @@ def test_a_click_on_the_heading_under_the_cursor_folds_it_once(board: dict[str, 
     under, folded = drive((140, 40), go)
     assert under == f"{GROUP_ROW}doing", "the premise: the cursor is on Doing's heading"
     assert folded, "one click, one fold"
+
+
+def test_the_help_says_what_a_click_on_a_task_does_and_a_click_does_it(
+    board: dict[str, Any],
+) -> None:
+    """Finding 17 of the 0.10.2 gate (#4295): the help said a click on a task shows "its full
+    content below", and the detail's title "click a task or feed line", while a click on a
+    task opens its reader (B2). Both say what a click does now, and a click does it."""
+
+    async def go(pilot: Any, app: Host, panel: BoardPanel) -> tuple[str, str]:
+        table = panel.query_one("#tasks", DataTable)
+        row = table.get_row_index("tsk_0002")
+        table.move_cursor(row=0, column=0)  # the cursor elsewhere: the click picks the task
+        await settle_page(app)
+        await pilot.click("#tasks", offset=(2, 2 + row))  # under the border and the header
+        await settle_page(app)
+        return panel.reader_text, str(panel.query_one("#detailwrap").border_title)
+
+    reader, detail_title = drive((140, 40), go)
+    assert reader.startswith("fix the login race\n#2 · blocked"), "a click opens its reader"
+    said = dict(BOARD_KEYS)["click"]
+    assert said == "a task: its reader · a stream line: in full below", said
+    assert detail_title == "detail — click a stream line", "a task's click is the reader's"
 
 
 @SIZES

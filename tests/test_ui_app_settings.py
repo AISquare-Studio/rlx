@@ -1077,12 +1077,26 @@ def test_role_bindings_list_each_binding_with_its_claude_dirs_called_out() -> No
 
 
 def test_no_binding_shows_how_to_make_one() -> None:
-    async def scenario(pilot: Pilot[None], host: AppHost) -> str:
-        await settle(pilot)
-        return str(host.query_one("#bindings-empty", Static).render())
+    """Q15, finding 6 of the 0.10.2 gate (#4295): a role's binding is a *preset*, as the
+    Spawn dialog's Preset row and its picker's *+ New preset* say; here *+ New bind* opened a
+    form headed *New preset*. The section, its button, its empty line and the note that
+    points to it say preset too."""
 
-    said = drive(scenario)
-    assert said == "no role bindings — + New bind makes one", "the button, never a command (R13)"
+    async def scenario(pilot: Pilot[None], host: AppHost) -> list[str]:
+        await settle(pilot)
+        return [
+            str(host.query_one("#bindings-empty", Static).render()),
+            str(host.query_one("#bindings-new", Button).label),
+            str(host.query_one("#agent-settings-note", Static).render()),
+        ]
+
+    said, button, pointer = drive(scenario)
+    assert said == "no presets — + New preset makes one", "the button, never a command (R13)"
+    assert button == "+ New preset"
+    assert AppSettingsView.bindings_section()[0] == "Presets"
+    assert "is under Presets below" in pointer, pointer
+    for shown in (said, button, pointer):
+        assert "bind" not in shown, shown
 
 
 def test_edit_opens_the_bind_form_on_the_binding_and_writes_what_team_bind_writes(

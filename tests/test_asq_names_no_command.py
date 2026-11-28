@@ -207,6 +207,105 @@ def test_a_command_the_cli_gains_is_known_with_no_hand_list(stand_ins: list[str]
     assert set(stand_ins) <= _commands(cli_app)
 
 
+# --- the phone page (web/remote/app.js) --------------------------------------------------------
+
+PHONE_PAGE = ROOT / "src" / "aisquare" / "web" / "remote" / "app.js"
+"""The page Remote serves to a phone: a person's, who has no shell there at all."""
+
+_JS_TOKEN = re.compile(
+    r"//[^\n]*|/\*.*?\*/"  # a comment, a developer's: skipped
+    r"|\"(?:\\.|[^\"\\\n])*\"|'(?:\\.|[^'\\\n])*'|`(?:\\.|[^`\\])*`",  # a string, a person's
+    re.S,
+)
+"""A comment or a string literal of the page's script. The leftmost wins, so a quote inside a
+comment opens no string and a ``//`` inside a string (a URL) opens no comment."""
+
+
+def _js_strings(source: str) -> Iterator[tuple[int, str]]:
+    """Each string literal of ``source``, its quotes off, with its line; comments skipped."""
+    for match in _JS_TOKEN.finditer(source):
+        token = match.group(0)
+        if token[0] in "\"'`":
+            yield source.count("\n", 0, match.start()) + 1, token[1:-1]
+
+
+def _command_paths(app: typer.Typer) -> list[tuple[str, ...]]:
+    """Every command the CLI runs, as the words typed after the program: ``("fleet", "resume")``,
+    hidden ones too, read off the command group Typer builds (as :func:`_commands` is)."""
+
+    def walk(command: object, path: tuple[str, ...]) -> Iterator[tuple[str, ...]]:
+        children = getattr(command, "commands", None)
+        if not children:
+            yield path
+            return
+        for name, child in children.items():
+            yield from walk(child, (*path, name))
+
+    return list(walk(typer.main.get_command(app), ()))
+
+
+def _alternatives(words: Iterable[str]) -> str:
+    return "|".join(sorted(map(re.escape, words), key=lambda word: (-len(word), word)))
+
+
+def _phone_guard(app: typer.Typer) -> re.Pattern[str]:
+    """What a command looks like on the phone page (R13; finding 3 of the 0.10.2 gate, #4295):
+    the guard's own, and what slipped past it there. A command without its program ("wait for
+    fleet resume"); a subcommand no prose names, any with a hyphen (``regenerate-password``);
+    a long flag in a sentence (``--new-link``), never a CSS property's ``--cols`` alone."""
+    paths = _command_paths(app)
+    pairs = {" ".join(path[-2:]) for path in paths if len(path) >= 2}
+    hyphenated = {word for path in paths for word in path if "-" in word}
+    return re.compile(
+        rf"{_guard(app).pattern}"
+        rf"|\b(?:{_alternatives(pairs)})\b"
+        rf"|(?<![\w-])(?:{_alternatives(hyphenated)})(?![\w-])"
+        r"|(?<=\s)--[a-z][\w-]*"
+    )
+
+
+PHONE_GUARD = _phone_guard(cli_app)
+
+
+def test_the_phone_page_names_no_command_to_type() -> None:
+    """The phone page's strings say where in rlx to do a thing, never a command: a paused agent
+    is Resumed in rlx, and a link changes when New link is pressed on rlx's Remote page."""
+    found = [
+        f"app.js:{line}: {PHONE_GUARD.search(text).group(0)!r} in {text[:70]!r}"  # type: ignore[union-attr]
+        for line, text in _js_strings(PHONE_PAGE.read_text(encoding="utf-8"))
+        if PHONE_GUARD.search(text)
+    ]
+    assert found == []
+
+
+def test_the_phone_guard_catches_what_it_is_for() -> None:
+    source = (
+        'const S = {paused: "paused: its claims, worktree and session wait for fleet resume"};\n'
+        "const OFF = ['the link changes with regenerate-password --new-link.'];\n"
+        "const SEE = `run rlx remote status`; // a comment's own: rlx fleet ls, --json\n"
+        '/* "fleet resume" in a block comment */ const URL = "https://example.com/a//b";\n'
+        'el.style.setProperty("--cols", n); const PROSE = "Open the link the machine shows now.";\n'
+    )
+    assert [text for _, text in _js_strings(source)] == [
+        "paused: its claims, worktree and session wait for fleet resume",
+        "the link changes with regenerate-password --new-link.",
+        "run rlx remote status",  # the comment after it is no string
+        "https://example.com/a//b",  # whole: its // opens no comment
+        "--cols",
+        "Open the link the machine shows now.",
+    ]
+    caught = [line for line, text in _js_strings(source) if PHONE_GUARD.search(text)]
+    assert caught == [1, 2, 3], "each command, and never a comment's, a URL, a CSS name or prose"
+    for prose in (
+        "paused (Resume in rlx brings it back where it was)",
+        "the link changes when ngrok restarts without a static domain, and when New link is "
+        "pressed on rlx's Remote page.",
+        "Turn Remote on again on the machine, then retry.",
+        "--cols",
+    ):
+        assert not PHONE_GUARD.search(prose), prose
+
+
 # --- the Doctor's own list (#69) ---------------------------------------------------------------
 
 
