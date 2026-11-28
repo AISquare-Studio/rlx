@@ -80,6 +80,10 @@ pub struct Record {
     /// it is out.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub auth: Vec<String>,
+    /// The `CLAUDE_CONFIG_DIR` the app's values gave its latest attempt (4.3): whose
+    /// sign-in `auth` waits on. None when they gave none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub home: Option<String>,
     /// Whether the run is a `connectors.call` (5.3): it is never resumed.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub connectors_call: bool,

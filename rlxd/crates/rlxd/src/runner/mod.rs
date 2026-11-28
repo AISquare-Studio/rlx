@@ -184,6 +184,14 @@ pub struct Runner {
     /// Test builds only: a space whose runs' state events wait this long, once published,
     /// before their lines are appended to the log (`RLXD_TEST_SLOW_APPEND=<space>:<ms>`).
     slow_append: Option<(String, Duration)>,
+    /// Test builds only: a space whose runs' records wait this long before a resume or a
+    /// launch writes their new state ([`Runner::write_state`]), to widen the window in
+    /// which showing or publishing it first would show (`RLXD_TEST_SLOW_RECORD=<space>:<ms>`).
+    slow_record: Option<(String, Duration)>,
+    /// Test builds only: a space whose runs' ends, once durable, wait this long before
+    /// their `needs_you.raised` (`RLXD_TEST_SLOW_RAISE=<space>:<ms>`): a crash in between
+    /// is a crash after the end is on disk and before anyone heard of its needs-you.
+    slow_raise: Option<(String, Duration)>,
     /// Test builds only: how long `run.cancel` waits before it answers, once the attempt
     /// it cancelled has ended (`RLXD_TEST_CANCEL_REPLY_DELAY_MS`): room for a resume.
     cancel_reply_delay: Option<Duration>,
@@ -322,8 +330,13 @@ struct RunInner {
     /// The `needs_you.raised` the run has out, to clear when it goes on or ends.
     needs_you: Option<String>,
     /// The connectors its `needs_you {reason: "auth"}` waits on (5.5): it is cleared,
-    /// too, once each is `connected` again. Empty when it has none out.
+    /// too, once each is `connected` again on the account [`RunInner::home`] is. Empty
+    /// when it has none out.
     auth: Vec<String>,
+    /// The `CLAUDE_CONFIG_DIR` the app's values gave its latest attempt when it started
+    /// (4.3), `None` when they gave none: then it ran on rlxd's own. Whose sign-in its
+    /// `auth` waits on.
+    home: Option<String>,
     /// Events appended to the log since its last fsync.
     unsynced: u32,
     /// The last `run_seq` in the run's log: an event whose append failed is not counted,
@@ -360,6 +373,13 @@ enum Durability {
     /// before it is published: an event that changes the run's state, so an app never
     /// sees an end that a restart would not find.
     State,
+}
+
+/// What the `needs_you` topic hears of a run's end, once the end is durable
+/// ([`Runner::tell`]): the needs-you it settled, and the one it raised.
+struct Heard {
+    cleared: Option<String>,
+    raised: Vec<NeedsYouRaisedData>,
 }
 
 /// The most events of a run appended to its log without an fsync. After an OS crash, at
@@ -461,6 +481,8 @@ impl Runner {
             slow_start: test_slow_in("RLXD_TEST_SLOW_START"),
             slow_erase: test_slow_in("RLXD_TEST_SLOW_ERASE"),
             slow_append: test_slow_in("RLXD_TEST_SLOW_APPEND"),
+            slow_record: test_slow_in("RLXD_TEST_SLOW_RECORD"),
+            slow_raise: test_slow_in("RLXD_TEST_SLOW_RAISE"),
             cancel_reply_delay: test_delay("RLXD_TEST_CANCEL_REPLY_DELAY_MS"),
             resume_delay: test_delay("RLXD_TEST_RESUME_DELAY_MS"),
             runs: Mutex::new(Runs::default()),
@@ -478,11 +500,13 @@ impl Runner {
         });
         runner.load();
         let told = Arc::downgrade(&runner);
-        runner.connectors.on_connected(Box::new(move |connected| {
-            if let Some(runner) = told.upgrade() {
-                runner.signed_in(connected);
-            }
-        }));
+        runner
+            .connectors
+            .on_connected(Box::new(move |slot, connected| {
+                if let Some(runner) = told.upgrade() {
+                    runner.signed_in(slot, connected);
+                }
+            }));
         runner
     }
 
@@ -622,6 +646,7 @@ impl Runner {
                     reply: None,
                     needs_you,
                     auth,
+                    home: record.home.clone(),
                     unsynced: 0,
                     logged: tail.last_run_seq,
                     // A call still executing when its rlxd stopped may have run: unknown.
@@ -849,6 +874,7 @@ impl Runner {
                 reply: None,
                 needs_you: None,
                 auth: Vec::new(),
+                home: None,
                 unsynced: 0,
                 logged: 0,
                 session_started: false,
@@ -1079,12 +1105,9 @@ impl Runner {
             Some(position) => {
                 let mut inner = run.inner();
                 // Unless a cancel ended it meanwhile: its place in the queue then goes on
-                // when its turn comes (launch()).
+                // when its turn comes (launch()). Its record says queued already
+                // (resume_under_its_lock).
                 if inner.state == RunState::Queued {
-                    let record = run.record(&inner);
-                    if let Err(e) = blocking(|| run.dir.write_record(&record)) {
-                        warning!("run {id}: its record was not written: {e}");
-                    }
                     self.emit(
                         &run,
                         &mut inner,
@@ -1149,10 +1172,49 @@ impl Runner {
         inner.reply = reply;
         inner.ended_at = None;
         inner.state = RunState::Queued;
+        // Durable before shown or published: the record holds the new attempt, queued and
+        // with no needs-you out, before run.list shows it or anyone hears the needs-you
+        // cleared. The next rlxd after a crash between the two never finds it out again.
+        inner.auth.clear();
+        let needs_you = inner.needs_you.take();
+        self.write_state(run, &inner);
         run.state.send_replace(RunState::Queued);
-        self.clear_needs_you(&mut inner);
         run.show(&inner);
+        self.publish_cleared(needs_you);
         Ok(inner.attempt)
+    }
+
+    /// Writes `run`'s record as `inner` holds it, a new state of the run's, before
+    /// anything shows or publishes it (test builds: held for `RLXD_TEST_SLOW_RECORD`).
+    fn write_state(&self, run: &Run, inner: &RunInner) {
+        let record = run.record(inner);
+        let written = blocking(|| {
+            wait_if(self.slow_record.as_ref(), &run.params.space);
+            run.dir.write_record(&record)
+        });
+        if let Err(e) = written {
+            warning!("run {}: its record was not written: {e}", run.params.run_id);
+        }
+    }
+
+    /// Publishes `needs_you.cleared` for `needs_you`, a needs-you the run's record no
+    /// longer holds.
+    fn publish_cleared(&self, needs_you: Option<String>) {
+        if let Some(id) = needs_you {
+            self.publish_needs_you(run_types::NEEDS_YOU_CLEARED, &NeedsYouClearedData::new(id));
+        }
+    }
+
+    /// Publishes what `run`'s end settled and raised on the `needs_you` topic, its record
+    /// holding the end already (test builds: the raise held for `RLXD_TEST_SLOW_RAISE`).
+    fn tell(&self, run: &Run, heard: Heard) {
+        self.publish_cleared(heard.cleared);
+        if !heard.raised.is_empty() {
+            blocking(|| wait_if(self.slow_raise.as_ref(), &run.params.space));
+        }
+        for raised in &heard.raised {
+            self.publish_needs_you(run_types::NEEDS_YOU_RAISED, raised);
+        }
     }
 
     /// `run.get`: one run, from what rlxd holds of it, which its record and log on disk
@@ -1533,12 +1595,11 @@ impl Runner {
             inner.placed = true;
             inner.state = RunState::Running;
             inner.text.clear();
+            // Durable before shown: run.list never says running of a run whose record
+            // does not.
+            self.write_state(run, &inner);
             run.state.send_replace(RunState::Running);
             run.show(&inner);
-            let record = run.record(&inner);
-            if let Err(e) = blocking(|| run.dir.write_record(&record)) {
-                warning!("run {}: its record was not written: {e}", run.params.run_id);
-            }
         }
         let runner = Arc::clone(self);
         let run = Arc::clone(run);
@@ -1595,8 +1656,15 @@ impl Runner {
                 )
             }
         };
-        // A needs-you that was out is settled by any end, a new needs-you included.
-        self.clear_needs_you(inner);
+        // A needs-you that was out is settled by any end, a new needs-you included. Each is
+        // heard, settled or raised, only once the end is durable ([`Runner::
+        // publish_telling`]): no client hears of a needs-you that the next rlxd, after a
+        // crash, would hold otherwise.
+        inner.auth.clear();
+        let mut heard = Heard {
+            cleared: inner.needs_you.take(),
+            raised: Vec::new(),
+        };
         // A call still open as the run ends is denied; one still executing may have run
         // (5.1). The attempt's hook key goes, so no hook of it is answered from now on.
         self.settle_open(run, inner);
@@ -1611,8 +1679,8 @@ impl Runner {
         inner.tree = None;
         inner.process = None;
         if let Some(needs) = question {
-            // Raised before the run's own event, so a capture that stops at
-            // run.needs_you holds it (7.3).
+            // Raised once the end is durable and before the run's own event, so a capture
+            // that stops at run.needs_you holds it (7.3).
             let id = format!("run:{}:{}", run.params.run_id, inner.attempt);
             let reason = match needs.reason {
                 NeedsYouReason::Question => "question",
@@ -1623,7 +1691,7 @@ impl Runner {
                 .clone()
                 .unwrap_or_else(|| "The run needs you.".to_owned());
             let raised = NeedsYouRaisedData::run(&id, run.params.run_id.as_str(), reason, text);
-            self.publish_needs_you(run_types::NEEDS_YOU_RAISED, &raised);
+            heard.raised.push(raised);
             inner.needs_you = Some(id);
         }
         if !auth.is_empty() {
@@ -1640,12 +1708,15 @@ impl Runner {
                 auth.join(", ")
             );
             let raised = NeedsYouRaisedData::run(&id, run.params.run_id.as_str(), "auth", text);
-            self.publish_needs_you(run_types::NEEDS_YOU_RAISED, &raised);
+            heard.raised.push(raised);
             inner.needs_you = Some(id);
             inner.auth = auth;
         }
+        let mut heard = Some(heard);
         let published = match data {
-            Ok(Value::Object(data)) => self.publish(run, inner, r#type, data, Durability::State),
+            Ok(Value::Object(data)) => {
+                self.publish_telling(run, inner, r#type, data, Durability::State, &mut heard)
+            }
             other => Err(format!("it did not print as an object: {other:?}")),
         };
         if let Err(why) = published {
@@ -1664,14 +1735,24 @@ impl Runner {
                 "",
             );
             if let Ok(Value::Object(data)) = serde_json::to_value(&failed)
-                && let Err(why) =
-                    self.publish(run, inner, run_types::FAILED, data, Durability::State)
+                && let Err(why) = self.publish_telling(
+                    run,
+                    inner,
+                    run_types::FAILED,
+                    data,
+                    Durability::State,
+                    &mut heard,
+                )
             {
                 warning!(
                     "run {}: its end was not published either: {why}",
                     run.params.run_id
                 );
             }
+        }
+        // Whatever was published, what the end settled or raised is heard.
+        if let Some(heard) = heard.take() {
+            self.tell(run, heard);
         }
         inner.events = None;
         let state = inner.state;
@@ -1691,7 +1772,9 @@ impl Runner {
         std::mem::take(&mut inner.placed)
     }
 
-    /// Clears the `needs_you.raised` the run has out, if it has one.
+    /// Clears the `needs_you.raised` the run has out, if it has one, at once: for a run
+    /// whose record is gone already (space.erase). A run that goes on writes its record
+    /// first ([`Runner::write_state`], [`Runner::publish_telling`]).
     fn clear_needs_you(&self, inner: &mut RunInner) {
         inner.auth.clear();
         if let Some(id) = inner.needs_you.take() {
@@ -1700,11 +1783,28 @@ impl Runner {
     }
 
     /// Clears each failed run's `needs_you {reason: "auth"}` whose connectors are all
-    /// among `connected` (5.5): their sign-in is back. Called with no run's lock held.
-    fn signed_in(&self, connected: &[String]) {
+    /// among `connected` on account `slot` (5.5), when its own attempt ran on that account
+    /// ([`RunInner::home`]): their sign-in is back there. A run on another home keeps its
+    /// needs-you. Called with no run's lock held.
+    fn signed_in(&self, slot: u32, connected: &[String]) {
+        let waits = |inner: &RunInner| {
+            !inner.auth.is_empty() && inner.auth.iter().all(|id| connected.contains(id))
+        };
         for run in self.snapshot() {
+            let home = {
+                let inner = run.inner();
+                if !waits(&inner) {
+                    continue;
+                }
+                inner.home.clone()
+            };
+            // Only a sign-in on the account its own attempt ran on (4.3), worked out with no
+            // run's lock held.
+            if self.connectors.slot_of_home(home.as_deref()) != Some(slot) {
+                continue;
+            }
             let mut inner = run.inner();
-            if inner.auth.is_empty() || !inner.auth.iter().all(|id| connected.contains(id)) {
+            if !waits(&inner) || inner.home != home {
                 continue;
             }
             info!(
@@ -1790,6 +1890,7 @@ impl Runner {
         // never a lookup now (4.3), read with the values it goes with. Refused at run.start
         // when there was none; this is for an environment changed since.
         let (values, resolved) = self.env.snapshot();
+        run.inner().home.clone_from(&values.claude_config_dir);
         let program = match claude_from(resolved) {
             Ok(program) => program,
             Err(refused) => return failed(refused.message),
@@ -2502,6 +2603,20 @@ impl Runner {
         data: Data,
         durability: Durability,
     ) -> Result<(), String> {
+        self.publish_telling(run, inner, r#type, data, durability, &mut None)
+    }
+
+    /// [`Runner::publish`], telling `heard` ([`Runner::tell`]) once the event is durable
+    /// and before it is published: an end's needs-you, settled or raised.
+    fn publish_telling(
+        &self,
+        run: &Run,
+        inner: &mut RunInner,
+        r#type: &str,
+        data: Data,
+        durability: Durability,
+        heard: &mut Option<Heard>,
+    ) -> Result<(), String> {
         let id = run.params.run_id.as_str();
         if !inner.seeded {
             self.bus.seed_run(id, inner.last_run_seq);
@@ -2520,6 +2635,9 @@ impl Runner {
             if !inner.state.is_live() {
                 run.ended_as(inner.attempt, inner.state);
             }
+        }
+        if let Some(heard) = heard.take() {
+            self.tell(run, heard);
         }
         let scope = bus::Run {
             id,
@@ -2678,6 +2796,7 @@ impl Run {
             calls: inner.calls.clone(),
             pinned_call_used: inner.pinned_call_used,
             auth: inner.auth.clone(),
+            home: inner.home.clone(),
             connectors_call: self.call.is_some(),
         }
     }

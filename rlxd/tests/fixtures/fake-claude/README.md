@@ -60,6 +60,7 @@ One connector, `claude.ai Slack`, with made-up tools (`init-connectors/expected-
 | `connectors-needs-auth` | Slack `needs-auth` throughout |
 | `stdin-eof-empty` | No servers in `system/init` when stdin is at EOF by then, as E9 found; Slack connected while it is open |
 | `mcp-login` | `claude mcp login <name>`: prints an `https://` URL whose query holds made-up secrets, waits, says it signed in, and exits 0 |
+| `mcp-login-slow` | As `mcp-login`, its wait 3 s: room to change the app's environment while it runs |
 | `mcp-login-fails` | The same URL, then says the sign-in failed, and exits 1 |
 | `mcp-login-http` | Prints an `http://` URL, then waits a minute |
 | `mcp-login-silent` | Prints no URL, and exits 0 |
@@ -111,9 +112,12 @@ text, as a tool would. Then it tries the identical call again, which rlxd denies
 account's connectors (task #14): `initialize` as `mcp-direct`'s, then `mcp_status` lists no
 server for its first 300 ms, then the rows `<config dir>/fake-connectors.json` holds,
 read at each ask (`CLAUDE_CONFIG_DIR`, else `~/.claude`), so each account home answers its
-own and a test changes a status by writing the file. Anything else (`mcp_call` included)
-is refused; the log keeps each request under `control_requests`. `mcp-accounts-old`
-refuses `mcp_status` too, as a Claude Code without it would.
+own and a test changes a status by writing the file. An `mcp_call` (an identity read) of
+a tool a row lists is logged under `mcp_calls`; with `check_permissions: true` it asks rlxd
+one `can_use_tool` first and runs the tool only on an allow, answering with the row tool's
+`result` (a content list), each run logged under `tool_runs_of`. Anything else is
+refused; the log keeps each request under `control_requests`. `mcp-accounts-old` refuses
+`mcp_status` and `mcp_call` too, as a Claude Code without them would.
 
 **`mcp-direct`** plays Claude Code on a `connectors.call` run's control channel (5.3), as
 spike #5 found 2.1.332: no user message, no `system/init`, only answers to rlxd's
@@ -140,6 +144,7 @@ a watch job's fallback run is), each plays `watch-call`.
 | `mcp-direct-unasked` | Ignores `check_permissions`: runs the call with no `can_use_tool` |
 | `mcp-direct-respelled` | Asks `can_use_tool` with the input's whole numbers written as `1.0` |
 | `mcp-direct-needs-auth` | Lists the connector `needs-auth` |
+| `mcp-direct-needs-auth-slow` | Lists the connector `pending` for 3 s, then `needs-auth` |
 | `mcp-direct-silent` | Never answers `initialize` |
 | `mcp-direct-huge` | Writes a 5 MiB line after `initialize` |
 | `mcp-direct-turn` | Writes an `assistant` line after `initialize` |

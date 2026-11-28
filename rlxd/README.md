@@ -523,9 +523,10 @@ listing, 5.5 and 7.7): `crate::connectors`, and the gate in `crate::runner::conn
   states before it sends the prompt. A `needs-auth` or `failed` connector stops the gate
   at once. When it gives up, the run ends `run.failed {reason: "connectors", connectors:
   [{id, status}]}`, after `needs_you.raised {reason: "auth"}` when a connector's sign-in
-  lapsed. That needs-you is kept in the run's record, and cleared once rlxd sees each
-  connector it names `connected` again (a login's end, or any later `system/init`), or
-  by a resume or the space's erase. A run that never reached `run.started` has no
+  lapsed. That needs-you is kept in the run's record, with the home the run's attempt
+  ran on, and cleared once rlxd sees each connector it names `connected` again on that
+  home's account (a login's end, or any later `system/init`), never another's, or by a
+  resume or the space's erase. A run that never reached `run.started` has no
   session to resume (`no_session`): a new run is the way on.
 - **What a missed try leaves.** Nothing of a try ended unconfirmed stays in the run's
   session: a miss, or any other end before its connectors are confirmed (a cancel, the
@@ -562,13 +563,17 @@ listing, 5.5 and 7.7): `crate::connectors`, and the gate in `crate::runner::conn
   with that home and files it by it then; one that is no account rlx knows is filed
   nowhere, never under a guess. That is an ungated run's (not `no_tools`, which lists none), a gated run's once
   confirmed, the last try's of one that failed, and a one-turn probe's. So does a
-  `connectors.call` that finds its connector `needs-auth` or `failed`. A read that lists
+  `connectors.call` that finds its connector `needs-auth` or `failed`, and a login's
+  end: each in the account of the home its own start read (the app's `CLAUDE_CONFIG_DIR`
+  then, else rlxd's own), and nowhere when that is no account rlx knows. The runs'
+  account now only says what a run, call or login started now runs on; it never files
+  a result. A read that lists
   no server at all empties nothing, since a Claude Code that loaded none (E9's stdin at
   EOF) says the same. A server's `source` is its kind (`claude.ai`, or `mcp` for a local
   one), init's where it gives one (`claudeai` is a claude.ai connector), and its tools
   are those under `mcp__<name>__`, the name as Claude Code writes it (the tool-call
   gate's `claude_server_name`). Each connector has the `checked_at` of its last read, and
-  an `identity`, `null` until rlxd reads one (a later step). The cache is kept in
+  an `identity`, `null` until rlxd reads one (below). The cache is kept in
   `<home>/rlxd/connectors.json` (0600), each account's entry by slot, written whole
   (`durable::write`) under the cache's lock before any change is published; a file from
   before accounts loads as the default account's. Each change is an event on the
@@ -611,6 +616,26 @@ listing, 5.5 and 7.7): `crate::connectors`, and the gate in `crate::runner::conn
     `claude_not_found` or `claude_not_runnable` as `run.start` is. rlxd's log says when
     each probe and each read ran, of which slot, and holds neither a probe's prompt nor
     what either listed.
+  - **Identity** (task #14, step 2; `crate::identity`): after an explicit refresh's reads
+    by an `app`, `cli` or `tui` client (a `remote` refresh reads the statuses alone, as
+    `connectors.call` refuses `remote`), and only with the capability `connectors.call`
+    on and an app connected now, rlxd asks
+    who each account is on each connector its identity table names: `{workspace?, user?,
+    email?}`. One call per account and connector, at most, of the table's read tool with
+    its fixed input, and only when that account's own listing holds the connector
+    `connected` and the tool with `read_only_hint: true`. Each is a `connectors.call` run
+    on that account's environment (as a read's: the app's `claude` and values, then the
+    account's homes, and no Keychain login dir but its own), a gated `watch` run in
+    `run.list` and the ledger
+    started by `rlxd-identity`, and the app decides it. Its result is the identity
+    reader's alone: the run's `run.tool_result` carries no content (`null`), so no event
+    and nothing in the run's folder holds it; only the identity read from it, in the cache
+    and `connectors.list`'s reply. A deny, a failure or an answer that says nothing
+    changes nothing; an identity stays as read until the account is signed in as someone
+    else, and a new mark forgets it at once, before any read. Never from a tick, and
+    never in rlxd's log. A release
+    build's table is empty until the owner's probe (M4) names each connector's tool; a
+    test build's holds the fixture's `claude.ai Fixture` `whoami`.
   - **In the background**, only with `connectors.no_turn` (no turn is ever spent unasked):
     every 10 minutes rlxd asks the brain for the accounts again and reads at once each
     new one and each signed in again (another mark); any other account is read again
@@ -627,7 +652,8 @@ listing, 5.5 and 7.7): `crate::connectors`, and the gate in `crate::runner::conn
   the login's exit 0 is `connector.login.done {status: "connected"}`; anything else is
   `connector.login.error {code}` (`not_https`, `no_url`, `failed`, `timed_out`,
   `claude_not_found`, `claude_not_runnable`). Its `claude` and environment are a run's:
-  the app's (4.3), on top of rlxd's own. No URL's query, where a login's secrets are, is
+  the app's (4.3), on top of rlxd's own, and its sign-in is filed in the account of the
+  home it started on. No URL's query, where a login's secrets are, is
   ever in rlxd's log. The PTY is killed when the login ends.
 - **`connectors.call {run_id, connector, tool, input}`** (5.3 phase 2; spike #5, route a)
   makes exactly one call of the connector's tool through Claude Code's own MCP client,

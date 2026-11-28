@@ -4,8 +4,8 @@
 #
 # It reads the real accounts' connectors with no model turn: it makes no turn and calls no
 # connector's tool. It prints slots, connector names, kinds and statuses only: never an
-# email, an account id, a login mark or a home's path. $OUT keeps only that (summary.tsv
-# and map.txt); what it reads to get there (the brain's reply, rlxd's temp home, `claude
+# email, an account id, a login mark or a home's path. $OUT keeps only that (summary.tsv,
+# map.txt and identity-tools.txt); what it reads to get there (the brain's reply, rlxd's temp home, `claude
 # mcp list`'s output) is in a private temp folder it deletes when it ends.
 #
 #   rlxd/tests/probes/connector_map.sh
@@ -17,6 +17,9 @@
 #     connectors (the table to hold against the brief's)
 # M3  whether user-scope local MCP servers (kind `mcp`) show up under rlxd's
 #     `--setting-sources project`, against `claude mcp list` in each account's home
+# M4  per account, the read-only tool names of Slack, Gmail and Calendar (names and
+#     read_only_hint only, from M2's listing: no content, no call), so the owner can name
+#     each connector's identity tool (task #14, step 2's table)
 #
 # CLAUDE  Claude Code (default: `command -v claude`)
 # RLXD    rlxd built with its test methods (default: rlxd/target/debug/rlxd, after
@@ -92,4 +95,10 @@ for slot in $(jq -r '.[].slot' "$RAW/accounts.json"); do
   read_local=$(jq --argjson s "$slot" '[.data.accounts[]? | select(.account == $s) | .connectors[] | select(.source == "mcp")] | length' "$RAW/map.json")
   verdict M3 "slot $slot: claude mcp list shows $listed servers, $local_listed local; rlxd's read shows $read_local local (kind mcp)"
 done
+# --- M4: the identity tools' candidates, names only -----------------------------------------
+jq -r '.data.accounts[]? | "slot \(.account):",
+  (.connectors[] | select(.id | test("slack|gmail|calendar"; "i")) | "  \(.id):",
+    (.tools[] | select(.read_only_hint == true) | "    \(.name)\tread_only_hint true"))' \
+  "$RAW/map.json" | tee "$OUT/identity-tools.txt"
+verdict M4 "the read-only tools of Slack, Gmail and Calendar are in $OUT/identity-tools.txt: name each one's identity tool"
 echo "probe: done; the summary is $OUT/summary.tsv"

@@ -17,6 +17,10 @@
 //!   default account): a run's `system/init` updates that account's connectors as it
 //!   comes, so a connector a run finds failing needs no refresh. Each change to the app's
 //!   values settles that account again, asking the brain when it must.
+//! - **Identity** (task #14, step 2, [`crate::identity`]): after an explicit refresh's
+//!   reads, with the capability `connectors.call` on and an app connected, each account is
+//!   asked who it is on each connector the identity table names, with one gated read call
+//!   each ([`Runner::identity_call`]): the app decides every one. Never from a tick.
 //! - **In the background**, only on the no-turn route, so no turn is ever spent unasked:
 //!   every [`TICK`], the brain is asked again, and each account that is new or signed in
 //!   again (another [`Account::login`] mark) is read at once; so is each one whose last
@@ -28,7 +32,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
-use rlxd_proto::{DEFAULT_ACCOUNT, Data, ErrorBody, codes};
+use rlxd_proto::{ConnectorsCallParams, DEFAULT_ACCOUNT, Data, ErrorBody, codes};
 use tokio::sync::watch;
 
 use crate::brain::{Brain, CallError};
@@ -180,27 +184,96 @@ impl ConnectorMap {
     /// `connectors.list {refresh: true}` on the no-turn route: reads `only`'s connectors,
     /// or every account's (asking the brain for them first). Fails only when no read
     /// succeeded: with the first read's error.
-    pub async fn refresh(&self, only: Option<u32>) -> Result<(), ErrorBody> {
+    pub async fn refresh(&self, only: Option<u32>, identify: bool) -> Result<(), ErrorBody> {
         self.learn_accounts().await;
         let accounts: Vec<Account> = match only {
             Some(slot) => self.connectors.account(slot).into_iter().collect(),
             None => self.connectors.accounts(),
         };
         let mut first_error = None;
-        let mut read = 0_usize;
+        let mut fresh = Vec::new();
         for account in &accounts {
             match self.read(account).await {
-                Ok(()) => read += 1,
+                Ok(()) => fresh.push(account),
                 Err(error) => {
                     first_error.get_or_insert(error);
                 }
             }
         }
-        // Identity (task #14's second step) is read here, after the reads, on an explicit
-        // refresh only: until then each connector's `identity` stays null.
+        // Who each account is on its connectors: on an explicit refresh only (never a
+        // tick's) by a client that may make a connectors.call (`identify`: app, cli and
+        // tui, not remote), with the call route on and an app connected to decide each.
+        if identify && self.connectors.call_route() && self.runner.app_present() {
+            for account in &fresh {
+                self.identify(account).await;
+            }
+        }
+        let read = fresh.len();
         match first_error {
             Some(error) if read == 0 => Err(error),
             _ => Ok(()),
+        }
+    }
+
+    /// Reads who `account` is on each connector the identity table names, that its own
+    /// listing holds `connected` with the table's tool read-only: one call each, at most,
+    /// through `connectors.call`'s gate path, so the app decides each one. A deny, a
+    /// failure or a result that says no identity changes nothing. rlxd's log holds counts
+    /// and codes, never what was read.
+    async fn identify(&self, account: &Account) {
+        let sources = off_worker(|| self.connectors.identity_sources(account.slot));
+        let (mut read, mut unread) = (0_usize, 0_usize);
+        for source in sources {
+            let Ok(params) = ConnectorsCallParams::new(
+                crate::scheduler::fresh_run_id(),
+                source.connector,
+                source.tool,
+                (source.input)(),
+            ) else {
+                continue;
+            };
+            let identity = match self.runner.identity_call(params, account).await {
+                Ok(data) if data.is_error != Some(true) => {
+                    data.content.as_ref().and_then(source.read)
+                }
+                Ok(_) => None,
+                Err(error) => {
+                    info!(
+                        "connectors: account {}'s identity on {} was not read: {}",
+                        account.slot, source.connector, error.code
+                    );
+                    None
+                }
+            };
+            match identity {
+                Some(identity) => {
+                    // Under the sign-in it was asked under, or not at all.
+                    let stored = off_worker(|| {
+                        self.connectors.set_identity(
+                            account.slot,
+                            account.login.as_deref(),
+                            source.connector,
+                            identity,
+                        )
+                    });
+                    if stored {
+                        read += 1;
+                    } else {
+                        info!(
+                            "connectors: account {}'s identity on {} is dropped: signed_in_again",
+                            account.slot, source.connector
+                        );
+                        unread += 1;
+                    }
+                }
+                None => unread += 1,
+            }
+        }
+        if read + unread > 0 {
+            info!(
+                "connectors: account {}: {read} identities read, {unread} not",
+                account.slot
+            );
         }
     }
 

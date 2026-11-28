@@ -1164,3 +1164,244 @@ fn an_init_held_for_the_brain_is_filed_by_its_own_home_and_a_later_runs_by_their
         list(&home, &json!({}))
     );
 }
+
+/// `connectors.login {id: Slack}`, started: its `login_id`.
+fn login(home: &TestHome) -> String {
+    let run = home.rlxd(&[
+        "call",
+        "connectors.login",
+        &json!({"id": SLACK}).to_string(),
+    ]);
+    assert_eq!(run.code(), Some(0), "{run:?}");
+    run.data()["login_id"].as_str().unwrap().to_owned()
+}
+
+/// The `connector` events after `since`, until the first login's end.
+fn login_events(home: &TestHome, since: u64) -> Vec<Value> {
+    let run = home.rlxd(&[
+        "events",
+        "--topics",
+        "connector",
+        "--since",
+        &since.to_string(),
+        "--follow",
+        "--until",
+        "connector.login.done,connector.login.error",
+        "--timeout",
+        "30",
+    ]);
+    assert_eq!(run.code(), Some(0), "{run:?}");
+    run.lines()
+}
+
+/// The `needs_you` events after `since` of `type`.
+fn needs_you_events(home: &TestHome, since: u64, r#type: &str) -> Vec<Value> {
+    home.rlxd(&[
+        "events",
+        "--as-app",
+        "--topics",
+        "needs_you",
+        "--since",
+        &since.to_string(),
+    ])
+    .lines()
+    .into_iter()
+    .filter(|e| e["type"] == r#type)
+    .collect()
+}
+
+/// A home whose two accounts have read Slack `slot_1` and `slot_2`, with no turn, and
+/// `envs` set too.
+fn read_home(slot_1: &str, slot_2: &str, envs: &[(&str, &str)]) -> (TestHome, Accounts) {
+    let (home, accounts) = map_home_with(true, envs, &slack(slot_2));
+    accounts.set(1, &slack(slot_1));
+    list(&home, &json!({"refresh": true}));
+    assert_eq!(slack_status(&home, 1), slot_1);
+    assert_eq!(slack_status(&home, 2), slot_2);
+    (home, accounts)
+}
+
+/// Waits until fake-claude's log holds `count` starts: the latest's.
+fn started(home: &TestHome, count: usize) -> Value {
+    eventually("the start is logged", || starts(home).len() >= count);
+    starts(home)[count - 1].clone()
+}
+
+#[test]
+fn a_logins_sign_in_is_filed_under_the_account_whose_home_it_ran_on() {
+    // #4182 L: the login starts on slot 2's home, and the app's home is the plain one's
+    // by the time it signs in. The sign-in is slot 2's; slot 1's Slack stays signed out.
+    let (home, accounts) = read_home("needs-auth", "needs-auth", &[]);
+    let reads = starts(&home).len();
+    app_sets(
+        &home,
+        &json!({"CLAUDE_CONFIG_DIR": accounts.managed.to_str().unwrap()}),
+    );
+    std::fs::write(home.root().join("scenario"), "mcp-login-slow").unwrap();
+    let since = seq(&home);
+    login(&home);
+    let start = started(&home, reads + 1);
+    assert_eq!(start["argv"][1], "mcp", "{start:#}");
+    assert_eq!(
+        start["env"]["CLAUDE_CONFIG_DIR"],
+        accounts.managed.to_str().unwrap()
+    );
+    app_sets(&home, &json!({"CLAUDE_CONFIG_DIR": ""}));
+    let events = login_events(&home, since);
+    assert_eq!(
+        events.last().unwrap()["type"],
+        "connector.login.done",
+        "{events:#?}"
+    );
+    assert_eq!(slack_status(&home, 2), "connected");
+    assert_eq!(slack_status(&home, 1), "needs-auth");
+    // The change is published after the login's end: the replay holds it.
+    let changed = || -> Vec<Value> {
+        connector_events(&home, since)
+            .into_iter()
+            .filter(|e| e["type"] == "connector.changed")
+            .collect()
+    };
+    eventually("the change is published", || !changed().is_empty());
+    let changed = changed();
+    assert_eq!(changed.len(), 1, "{changed:#?}");
+    assert_eq!(changed[0]["data"]["account"], 2, "{changed:#?}");
+}
+
+#[test]
+fn a_calls_verdict_is_filed_under_the_account_whose_home_it_ran_on() {
+    // The call twin: the call starts on slot 2's home and finds Slack signed out 3 s in,
+    // after the app's home went back to the plain one's. Slot 2's Slack is signed out.
+    let (home, accounts) = read_home(
+        "connected",
+        "connected",
+        &[("RLXD_TEST_CONNECTORS_CALL", "1")],
+    );
+    let reads = starts(&home).len();
+    app_sets(
+        &home,
+        &json!({"CLAUDE_CONFIG_DIR": accounts.managed.to_str().unwrap()}),
+    );
+    std::fs::write(home.root().join("scenario"), "mcp-direct-needs-auth-slow").unwrap();
+    let params = json!({"run_id": run_id(), "connector": SLACK,
+        "tool": "mcp__claude_ai_Slack__slack_search_public", "input": {"query": "probe"}});
+    let call = home.spawn(&["call", "connectors.call", &params.to_string()]);
+    let start = started(&home, reads + 1);
+    assert_eq!(
+        start["env"]["CLAUDE_CONFIG_DIR"],
+        accounts.managed.to_str().unwrap()
+    );
+    app_sets(&home, &json!({"CLAUDE_CONFIG_DIR": ""}));
+    let run = common::finish(call);
+    assert_eq!(run.error_code(), "call_failed", "{run:?}");
+    assert_eq!(slack_status(&home, 2), "needs-auth");
+    assert_eq!(slack_status(&home, 1), "connected");
+}
+
+#[test]
+fn a_sign_in_clears_only_the_needs_you_of_runs_on_its_account() {
+    // A run on the plain home and one on slot 2's both wait for Slack's sign-in. A login
+    // on slot 2's home clears the second's needs-you alone.
+    let (home, accounts) = read_home("needs-auth", "needs-auth", &[]);
+    let needs = json!({"kind": "widget_refresh", "prompt": "digest",
+        "mount": {"kind": "connectors", "connectors": [SLACK]},
+        "needs_connectors": [SLACK], "space": "default"});
+    std::fs::write(home.root().join("scenario"), "connectors-needs-auth").unwrap();
+    let since = seq(&home);
+    let plain = run_id();
+    start(&home, &needs, &plain);
+    ended(&home, &plain);
+    app_sets(
+        &home,
+        &json!({"CLAUDE_CONFIG_DIR": accounts.managed.to_str().unwrap()}),
+    );
+    let managed = run_id();
+    start(&home, &needs, &managed);
+    ended(&home, &managed);
+    let raised = needs_you_events(&home, since, "needs_you.raised");
+    let id_of = |run: &str| {
+        raised
+            .iter()
+            .find(|e| e["data"]["run_id"] == run && e["data"]["reason"] == "auth")
+            .unwrap_or_else(|| panic!("{run}'s needs-you: {raised:#?}"))["data"]["id"]
+            .clone()
+    };
+    let (plain_needs, managed_needs) = (id_of(&plain), id_of(&managed));
+
+    std::fs::write(home.root().join("scenario"), "mcp-login").unwrap();
+    let signed = seq(&home);
+    login(&home);
+    let events = login_events(&home, signed);
+    assert_eq!(
+        events.last().unwrap()["type"],
+        "connector.login.done",
+        "{events:#?}"
+    );
+    eventually("slot 2's run's needs-you is cleared", || {
+        !needs_you_events(&home, signed, "needs_you.cleared").is_empty()
+    });
+    std::thread::sleep(Duration::from_millis(500));
+    let cleared = needs_you_events(&home, signed, "needs_you.cleared");
+    assert_eq!(cleared.len(), 1, "{cleared:#?}");
+    assert_eq!(cleared[0]["data"]["id"], managed_needs, "{cleared:#?}");
+    assert_ne!(cleared[0]["data"]["id"], plain_needs);
+    // The plain run's is still out, in its record too.
+    let record = home
+        .root()
+        .join("rlxd")
+        .join("runs")
+        .join(&plain)
+        .join("run.json");
+    let record: Value = serde_json::from_slice(&std::fs::read(record).unwrap()).unwrap();
+    assert_eq!(record["auth"], json!([SLACK]), "{record:#}");
+}
+
+#[test]
+fn a_retried_runs_init_is_filed_by_the_home_its_attempt_ran_on() {
+    // #4182 N3, the gated-retry path: three tries on slot 2's home, and the app's home is
+    // the plain one's from the first try on. The init is slot 2's.
+    let (home, accounts) = map_home(false, &[]);
+    app_sets(
+        &home,
+        &json!({"CLAUDE_CONFIG_DIR": accounts.managed.to_str().unwrap()}),
+    );
+    std::fs::write(home.root().join("scenario"), "connectors-never").unwrap();
+    let needs = json!({"kind": "widget_refresh", "prompt": "digest",
+        "mount": {"kind": "connectors", "connectors": [SLACK]},
+        "needs_connectors": [SLACK], "space": "default"});
+    let since = seq(&home);
+    let id = run_id();
+    start(&home, &needs, &id);
+    let first = started(&home, 1);
+    assert_eq!(
+        first["env"]["CLAUDE_CONFIG_DIR"],
+        accounts.managed.to_str().unwrap()
+    );
+    app_sets(&home, &json!({"CLAUDE_CONFIG_DIR": ""}));
+    // Three tries, 2 s and 5 s apart, then the end.
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    while slack_status(&home, 2).is_null() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "never: the init is filed"
+        );
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    ended(&home, &id);
+    let starts = starts(&home);
+    assert_eq!(starts.len(), 3, "{starts:#?}");
+    for start in &starts {
+        assert_eq!(
+            start["env"]["CLAUDE_CONFIG_DIR"],
+            accounts.managed.to_str().unwrap()
+        );
+    }
+    let data = list(&home, &json!({}));
+    assert_eq!(row(&data, 2)["from"], "init", "{data:#}");
+    assert_eq!(row(&data, 1)["connectors"], json!([]), "{data:#}");
+    let events = connector_events(&home, since);
+    assert!(
+        events.iter().all(|e| e["data"]["account"] == 2),
+        "{events:#?}"
+    );
+}

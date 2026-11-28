@@ -2731,9 +2731,10 @@ fn the_hooks_name_their_events_methods_and_codes() {
             event_types::HOOK_STOP,
             event_types::HOOK_STOP_FAILURE,
             event_types::HOOK_NOTIFICATION,
-            event_types::HOOK_PRE_TOOL_USE,
         ]
     );
+    // The gate's hook is answered, and published as no hook event (5.1).
+    assert_eq!(hook_event_type(PRE_TOOL_USE), None);
     for r#type in &types {
         let event = Event::new(1, TIME, topics::HOOK, r#type.clone(), data(json!({}))).unwrap();
         assert_valid("event.json", &serde_json::to_value(&event).unwrap());
