@@ -8,8 +8,9 @@ waited for unless it is listed as safe to cut off, so this guard checks what tha
 rests on: every ``run_worker(…)`` and ``@work(…)`` in ``aisquare.cli.ui``, read from the
 source, is a thread worker (a task worker is left to the quit) and has a name. It follows a
 name passed down through a helper's parameter (Welcome's ``_start_work`` → ``_run`` →
-``worker_name``), so the app's lists and the hand-over's tests name only workers the UI
-starts, and those tests take every worker the walk finds.
+``worker_name``), and one read through an import in the starting function itself, as the
+shell imports a view where it is first used (#45), so the app's lists and the hand-over's
+tests name only workers the UI starts, and those tests take every worker the walk finds.
 """
 
 from __future__ import annotations
@@ -66,6 +67,23 @@ def _calls_to(tree: ast.AST, function: str) -> Iterator[ast.Call]:
             yield node
 
 
+def _imported_in(where: ast.FunctionDef | None, name: str) -> Any:
+    """What ``name`` is bound to by an import in ``where`` itself, ``None`` without one: a
+    module, or a name of one, imported where it is first used (#45). The walk below has
+    imported every UI module already."""
+    if where is None:
+        return None
+    for node in ast.walk(where):
+        if isinstance(node, ast.ImportFrom) and node.module and not node.level:
+            for alias in node.names:
+                if (alias.asname or alias.name) == name:
+                    module = importlib.import_module(node.module)
+                    if hasattr(module, alias.name):
+                        return getattr(module, alias.name)
+                    return importlib.import_module(f"{node.module}.{alias.name}")
+    return None
+
+
 def _names(
     value: ast.expr,
     where: ast.FunctionDef | None,
@@ -77,7 +95,10 @@ def _names(
     if isinstance(value, ast.Constant) and isinstance(value.value, str):
         return {value.value}
     if isinstance(value, ast.Attribute) and isinstance(value.value, ast.Name):
-        found = getattr(namespace.get(value.value.id), value.attr, None)
+        holder = namespace.get(value.value.id)
+        if holder is None:
+            holder = _imported_in(where, value.value.id)
+        found = getattr(holder, value.attr, None)
         if isinstance(found, str):
             return {found}
     if isinstance(value, ast.Name):
@@ -96,6 +117,8 @@ def _names(
                 names |= _names(passed, _enclosing(call, parents), tree, parents, namespace)
             return names
         found = namespace.get(value.id)
+        if found is None:
+            found = _imported_in(where, value.id)
         if isinstance(found, str):
             return {found}
     if isinstance(value, ast.Call) and isinstance(value.func, ast.Name) and len(value.args) == 1:
@@ -279,6 +302,18 @@ SHAPES = {
         "def go(self):\n"
         "    self._start_work('read', job)\n"
     ),
+    "a first-use import of its module": (
+        "def go(self):\n"
+        "    from aisquare.cli.ui.views import usage_sharing\n"
+        "\n"
+        "    self.run_worker(job, name=usage_sharing.SHIP_WORKER, thread=True)\n"
+    ),
+    "a first-use import of the name": (
+        "def go(self):\n"
+        "    from aisquare.cli.ui.views.usage_sharing import SHIP_WORKER as SHIP\n"
+        "\n"
+        "    self.run_worker(job, name=SHIP, thread=True)\n"
+    ),
 }
 
 
@@ -291,7 +326,11 @@ def test_the_rule_reads_every_shape_and_accuses_a_start_that_is_not_a_thread(sha
     exec(compile(SHAPES[shape], shape, "exec"), dict(namespace))  # the shape is real Python
     as_task = SHAPES[shape].replace("thread=True", "thread=False")
 
+    from aisquare.cli.ui.views.usage_sharing import SHIP_WORKER
+
     expected = {"welcome-read"} if shape == "a helper's parameter" else {"new-read"}
+    if shape.startswith("a first-use import"):
+        expected = {SHIP_WORKER}
     assert started == expected
     with pytest.raises(AssertionError, match="not a thread worker"):
         started_workers(as_task, namespace)

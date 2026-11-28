@@ -30,7 +30,7 @@ from textual.widgets import Button, DirectoryTree, Input, RichLog, Static
 from textual.widgets.directory_tree import DirEntry
 from textual.widgets.tree import TreeNode
 
-from aisquare.cli.ui import app as ui_app
+from aisquare.cli.ui.views import onboard as onboard_module
 from aisquare.cli.ui.views.doctor import NO_MANAGER_WAY, DoctorRefreshed, DoctorView, FixApplied
 from aisquare.cli.ui.views.onboard import OnboardFailed, OnboardView, ProjectOnboarded, ProjectTree
 from aisquare.core.selfcli import CliResult
@@ -645,7 +645,8 @@ def _onboard_at(home: Path, monkeypatch: pytest.MonkeyPatch) -> type[OnboardView
         def __init__(self, **options: object) -> None:
             super().__init__(home, **options)  # type: ignore[arg-type]
 
-    monkeypatch.setattr(ui_app, "OnboardView", AtHome)
+    # Where the shell takes it from, at the first ``+`` (#45: imported on first use).
+    monkeypatch.setattr(onboard_module, "OnboardView", AtHome)
     return AtHome
 
 
