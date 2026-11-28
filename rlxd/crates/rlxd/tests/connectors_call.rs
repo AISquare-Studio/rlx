@@ -28,6 +28,23 @@ const WRITE: &str = "mcp__claude_ai_GitHub__create_issue";
 /// `{"ref":"main"}`'s RFC 8785 SHA-256.
 const MAIN_SHA256: &str = "a934b65d9e929e7a924f901e05035152e791f1d2575f4b2adcb3721ec55d5e93";
 
+/// The handoff's 5.3 Accept lines' call: this connector, this tool, this input.
+const SLACK: &str = "claude.ai Slack";
+const SLACK_READ: &str = "mcp__claude_ai_Slack__slack_search_public";
+
+/// The Accept lines' `h`: `{"query":"probe"}`'s RFC 8785 SHA-256.
+const H: &str = "ecd24fed4577faae6517c6d884030c22d05f35f86e47538d13cfbce7679d0e95";
+
+/// The Accept lines' input.
+fn probe() -> Value {
+    json!({"query": "probe"})
+}
+
+/// The Accept lines' params, exactly, as the run `r`.
+fn accept_params(r: &str) -> Value {
+    json!({"run_id": r, "connector": SLACK, "tool": SLACK_READ, "input": probe()})
+}
+
 /// The capability's switch, as a test build reads it.
 const ON: (&str, &str) = ("RLXD_TEST_CONNECTORS_CALL", "1");
 
@@ -208,7 +225,7 @@ fn without_the_capability_a_call_is_no_route_and_starts_nothing() {
         "{capabilities}"
     );
     let r = run_id();
-    let run = call(&home, &params(&r, READ, &json!({"ref": "main"})));
+    let run = call(&home, &accept_params(&r));
     let (code, _) = refusal(&run);
     assert_eq!(code, "no_route", "{run:?}");
     // No run, and no Claude Code.
@@ -254,7 +271,7 @@ fn with_no_app_the_call_is_denied_unreachable_with_a_ledger_entry() {
     let home = home("mcp-direct", &[]);
     let since = seq(&home);
     let r = run_id();
-    let run = call(&home, &params(&r, READ, &json!({"ref": "main"})));
+    let run = call(&home, &accept_params(&r));
     let (code, detail) = refusal(&run);
     assert_eq!(code, "denied", "{run:?}");
     assert_eq!(detail["by"], "unreachable", "{run:?}");
@@ -263,8 +280,8 @@ fn with_no_app_the_call_is_denied_unreachable_with_a_ledger_entry() {
     assert_eq!(calls.len(), 1, "{calls:#?}");
     assert_eq!(calls[0]["decision"], "deny");
     assert_eq!(calls[0]["by"], "unreachable");
-    assert_eq!(calls[0]["tool"], READ);
-    assert_eq!(calls[0]["input_sha256"], MAIN_SHA256);
+    assert_eq!(calls[0]["tool"], SLACK_READ);
+    assert_eq!(calls[0]["input_sha256"], H);
     let events = wait_until(&home, since, "the run ends", |e| {
         !of(e, &r, Some("run.failed")).is_empty()
     });
@@ -284,17 +301,17 @@ fn through_the_gate_an_allow_gives_the_content_with_no_model_turn() {
     let _app = App::open(&home);
     let since = seq(&home);
     let r = run_id();
-    let input = json!({"ref": "main"});
-    let reply = call_in_background(&home, &params(&r, READ, &input));
+    let input = probe();
+    let reply = call_in_background(&home, &accept_params(&r));
     let events = wait_until(&home, since, "the call reaches the app", |e| {
         !of(e, &r, Some("run.tool_call")).is_empty()
     });
     let asked = one(&events, &r, "run.tool_call");
     assert_valid("run-event.json", asked);
     assert_eq!(asked["data"]["kind"], "watch");
-    assert_eq!(asked["data"]["tool"], READ);
+    assert_eq!(asked["data"]["tool"], SLACK_READ);
     assert_eq!(asked["data"]["input"], input);
-    assert_eq!(asked["data"]["input_sha256"], MAIN_SHA256);
+    assert_eq!(asked["data"]["input_sha256"], H);
     let call_id = asked["data"]["call_id"].clone();
     assert!(
         call_id.as_str().unwrap().starts_with("toolu_mcp_call_"),
@@ -351,7 +368,7 @@ fn through_the_gate_an_allow_gives_the_content_with_no_model_turn() {
             .as_array()
             .unwrap()
             .iter()
-            .any(|t| t == READ),
+            .any(|t| t == SLACK_READ),
         "{started}"
     );
     // What Claude Code was told: initialize, mcp_status, one mcp_call with
@@ -373,7 +390,7 @@ fn through_the_gate_an_allow_gives_the_content_with_no_model_turn() {
     assert!(!requests(&start, "mcp_status").is_empty(), "{start:#}");
     let mcp_calls = requests(&start, "mcp_call");
     assert_eq!(mcp_calls.len(), 1, "{start:#}");
-    assert_eq!(mcp_calls[0]["tool"], READ);
+    assert_eq!(mcp_calls[0]["tool"], SLACK_READ);
     assert_eq!(mcp_calls[0]["arguments"], input);
     assert_eq!(mcp_calls[0]["check_permissions"], true);
     assert_eq!(mcp_calls[0]["result_not_for_model"], true);
@@ -618,6 +635,75 @@ fn a_deny_by_timeout_ends_the_run_failed_denied() {
     let start = the_start(&home);
     assert_eq!(start["tool_runs"], 0, "{start:#}");
     assert_eq!(start["control_answers"][0]["response"]["behavior"], "deny");
+}
+
+/// A call to `scenario`, which asks `can_use_tool` again once allowed: the second ask is
+/// denied by rlxd, never the app's, and the run is ended `call_failed`, the tree killed.
+fn asked_twice(scenario: &str, second_tool: &str) {
+    let home = home(scenario, &[]);
+    let _app = App::open(&home);
+    let since = seq(&home);
+    let r = run_id();
+    let reply = call_in_background(&home, &params(&r, READ, &json!({"ref": "main"})));
+    let events = wait_until(&home, since, "the call reaches the app", |e| {
+        !of(e, &r, Some("run.tool_call")).is_empty()
+    });
+    let call_id = one(&events, &r, "run.tool_call")["data"]["call_id"].clone();
+    assert_eq!(decide(&home, &r, &call_id, "allow").code(), Some(0));
+    let run = finish(reply);
+    let (code, detail) = refusal(&run);
+    assert_eq!(code, "call_failed", "{run:?}");
+    assert_eq!(detail["reason"], "error", "{run:?}");
+    // Nothing of content.json's (its head_sha) is in the reply.
+    assert!(!run.stdout.contains("3d9a1b7"), "{run:?}");
+    let events = wait_until(&home, since, "the run ends", |e| {
+        !of(e, &r, Some("run.failed")).is_empty()
+    });
+    let failed = one(&events, &r, "run.failed");
+    assert!(
+        failed["data"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("for a second call"),
+        "{failed}"
+    );
+    // The second ask never reached the app: one run.tool_call, two decisions.
+    assert_eq!(
+        of(&events, &r, Some("run.tool_call")).len(),
+        1,
+        "{events:#?}"
+    );
+    assert!(
+        of(&events, &r, Some("run.tool_result")).is_empty(),
+        "{events:#?}"
+    );
+    let decided = of(&events, &r, Some("run.tool_decided"));
+    assert_eq!(decided.len(), 2, "{events:#?}");
+    assert_eq!(decided[1]["data"]["decision"], "deny");
+    assert_eq!(decided[1]["data"]["by"], "rlxd");
+    let calls = ledger(&home, &r);
+    assert_eq!(calls.len(), 2, "{calls:#?}");
+    // The allowed call may have run: unknown, as the run ended with it executing.
+    assert_eq!(calls[0]["call_id"], call_id);
+    assert_eq!(calls[0]["input_sha256"], MAIN_SHA256);
+    assert_eq!(calls[0]["state"], "unknown");
+    assert_eq!(calls[1]["tool"], second_tool);
+    assert_eq!(calls[1]["by"], "rlxd");
+    assert_eq!(calls[1]["decision"], "deny");
+    // Killed: it never got to exit by itself.
+    let start = the_start(&home);
+    assert_eq!(start["exit"], Value::Null, "{start:#}");
+    assert_eq!(start["tool_runs"], 1, "{start:#}");
+}
+
+#[test]
+fn a_second_can_use_tool_for_the_same_call_ends_the_run() {
+    asked_twice("mcp-direct-twice", READ);
+}
+
+#[test]
+fn a_second_can_use_tool_for_another_tool_ends_the_run() {
+    asked_twice("mcp-direct-twice-other", WRITE);
 }
 
 // --- No route, and what rlxd does not trust -----------------------------------------------

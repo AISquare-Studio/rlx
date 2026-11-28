@@ -28,7 +28,10 @@
 //!   the request carried; a deny with its reason. A call that comes back with no
 //!   `can_use_tool` first (or after a deny) is a failure: its content is dropped, the
 //!   ledger keeps it (`by: "rlxd"`, `unknown`, or `error` when Claude Code said it
-//!   failed), and rlxd's log names what can skip the ask.
+//!   failed), and rlxd's log names what can skip the ask. A second `can_use_tool` (any
+//!   tool, any id) is a second call, which a `connectors.call` never makes: it is denied
+//!   `by: "rlxd"` at once, never the app's to decide, and then the tree is killed and the
+//!   call is `call_failed`, the first call's content dropped.
 //! - **Its result** goes to the ledger (`ok` or `error`), to `run.tool_result`, and for a
 //!   watch job to the scheduler; the run ends `run.done {num_turns: 0}`, or `run.failed
 //!   {reason: "denied"}` on a deny.
@@ -103,6 +106,9 @@ const CALL_ID: &str = "rlxd-mcp-call";
 /// rules before it was sent, or made with no `can_use_tool`.
 pub const RLXD_CALL_ID: &str = "rlxd_mcp_call";
 
+/// The reason of a second `can_use_tool`'s deny.
+const SECOND_ASK: &str = "a connectors.call makes one call: Claude Code asked for a second";
+
 /// The ledger's reason for a call Claude Code made with no `can_use_tool`.
 const RAN_UNASKED: &str = "ran_without_can_use_tool: Claude Code made the call without asking \
                            rlxd's gate";
@@ -176,6 +182,10 @@ impl CallRun {
 
     fn set(&self, outcome: Outcome) {
         *self.outcome.lock().unwrap_or_else(|p| p.into_inner()) = Some(outcome);
+    }
+
+    fn clear(&self) {
+        *self.outcome.lock().unwrap_or_else(|p| p.into_inner()) = None;
     }
 
     fn outcome(&self) -> Option<Outcome> {
@@ -642,6 +652,28 @@ impl Runner {
                 Message::Asked {
                     request_id,
                     request,
+                } if request["subtype"] == "can_use_tool" && (allowed.is_some() || denied) => {
+                    // A second call: denied by rlxd at once, then the run ends (the
+                    // module's doc).
+                    let tool = self.deny_second(run, &request);
+                    let response = json!({"type": "control_response", "response": {
+                        "subtype": "success", "request_id": request_id,
+                        "response": {"behavior": "deny", "message": SECOND_ASK}}});
+                    let _ = channel.write(&response, until, "take the answer").await;
+                    call.clear();
+                    warning!(
+                        "run {}: Claude Code asked can_use_tool again ({tool}), for a second \
+                         call: it is denied, and the run is ended",
+                        run.params.run_id
+                    );
+                    return Driven::Broken(format!(
+                        "Claude Code asked can_use_tool again ({tool}), for a second call, which \
+                         a connectors.call never makes: the call's content is dropped"
+                    ));
+                }
+                Message::Asked {
+                    request_id,
+                    request,
                 } if request["subtype"] == "can_use_tool" => {
                     let taken = match self.ask_gate(run, channel, &request).await {
                         Ok(taken) => taken,
@@ -873,6 +905,31 @@ impl Runner {
             by: taken.by,
             reason: taken.reason,
         });
+    }
+
+    /// Denies a second `can_use_tool` `by: "rlxd"` into the ledger and the stream, unless
+    /// it reuses a call id the run has (then it changes nothing of that call): its tool.
+    fn deny_second(&self, run: &Run, request: &Value) -> String {
+        let tool = request["tool_name"].as_str().unwrap_or("?").to_owned();
+        let Some(id) = request["tool_use_id"].as_str().filter(|id| !id.is_empty()) else {
+            return tool;
+        };
+        let mut inner = run.inner();
+        let known = inner.gate.contains_key(id) || inner.calls.iter().any(|c| c.call_id == id);
+        if !known {
+            let input = request.get("input").cloned().unwrap_or_else(|| json!({}));
+            let second = Call::new(id.to_owned(), tool.clone(), input);
+            self.decide_now(
+                run,
+                &mut inner,
+                &second,
+                Decision::Deny,
+                DecidedBy::Rlxd,
+                SECOND_ASK,
+                None,
+            );
+        }
+        tool
     }
 
     /// Keeps a call Claude Code made with no `can_use_tool` in the ledger: `by: "rlxd"`

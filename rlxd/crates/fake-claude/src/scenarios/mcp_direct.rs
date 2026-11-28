@@ -5,8 +5,10 @@
 //! - `initialize`: its `capabilities` list `mcp_call_check_permissions_v1` and the two
 //!   other `mcp_call_*` features.
 //! - `mcp_status`: `mcpServers: []` for the first [`EARLY_MS`] (the claude.ai list not
-//!   fetched yet), then [`CONNECTOR`] `connected` (`source: "claudeai"`) with two tools:
-//!   [`READ`] (`readOnly: true`) and [`WRITE`] (`openWorld: true` only).
+//!   fetched yet), then two connectors `connected` (`source: "claudeai"`): [`CONNECTOR`]
+//!   with [`READ`] (`readOnly: true`) and [`WRITE`] (`openWorld: true` only), and
+//!   [`SLACK`], the handoff's Accept lines' connector, with [`SLACK_READ`]
+//!   (`readOnly: true`). Each read gives [`CONTENT`].
 //! - `mcp_call` with `check_permissions: true`, and with `--permission-prompt-tool stdio`
 //!   on its command line: one `can_use_tool` to rlxd with the call's `arguments` as its
 //!   `input` and a `toolu_mcp_call_…` id. On an allow, the tool runs with the answer's
@@ -27,8 +29,10 @@
 //! [`HUGE_BYTES`] after `initialize`, `-turn` writes an `assistant` line after it,
 //! `-respelled` asks `can_use_tool` with the input's whole numbers written as `1.0` (the
 //! same canonical input, other bytes), `-needs-auth` lists the connector `needs-auth`,
-//! `-hang` never answers the allowed call, and `-plant` writes an allow rule for the read
-//! tool into its cwd's `.claude/settings.json` once it has answered `initialize`.
+//! `-hang` never answers the allowed call, `-plant` writes an allow rule for the read
+//! tool into its cwd's `.claude/settings.json` once it has answered `initialize`, and
+//! `-twice` (`-twice-other`) runs the allowed call, then asks `can_use_tool` again under a
+//! new id for the same call (for [`WRITE`]) before it gives the first one's result.
 //!
 //! Started as one of rlxd's conversations (with `--settings`, as a watch job's fallback
 //! run is), each plays [`super::watch_call`]: so a fire that falls back has a model to make
@@ -52,6 +56,12 @@ pub const READ: &str = "mcp__claude_ai_GitHub__get_check_runs";
 
 /// Its write tool, as Claude Code names it.
 pub const WRITE: &str = "mcp__claude_ai_GitHub__create_issue";
+
+/// The handoff's Accept lines' connector.
+pub const SLACK: &str = "claude.ai Slack";
+
+/// Its read tool, as Claude Code names it.
+pub const SLACK_READ: &str = "mcp__claude_ai_Slack__slack_search_public";
 
 /// The read tool's content, exactly as Claude Code gives it.
 pub const CONTENT: &str =
@@ -89,6 +99,10 @@ pub enum Variant {
     Hang,
     /// It plants an allow rule in its cwd's project settings after `initialize`.
     Plant,
+    /// Allowed, it asks `can_use_tool` again for the same call under a new id.
+    Twice,
+    /// Allowed, it asks `can_use_tool` again for [`WRITE`].
+    TwiceOther,
 }
 
 /// The longest it waits for rlxd's next message.
@@ -187,7 +201,8 @@ fn servers(variant: Variant) -> Value {
     } else {
         "connected"
     };
-    let tools = if status == "connected" {
+    let connected = status == "connected";
+    let github = if connected {
         json!([
             {"name": "get_check_runs", "annotations": {"readOnly": true}},
             {"name": "create_issue", "annotations": {"openWorld": true}},
@@ -195,17 +210,63 @@ fn servers(variant: Variant) -> Value {
     } else {
         json!([])
     };
-    json!([{"name": CONNECTOR, "status": status, "scope": "claudeai", "source": "claudeai",
-        "transport": "claudeai-proxy", "config": {"type": "claudeai-proxy"},
-        "serverInfo": {"name": "github", "version": "1.0.0"}, "sessionProxied": true,
-        "tools": tools}])
+    let slack = if connected {
+        json!([{"name": "slack_search_public", "annotations": {"readOnly": true}}])
+    } else {
+        json!([])
+    };
+    let row = |name: &str, server: &str, tools: Value| {
+        json!({"name": name, "status": status, "scope": "claudeai", "source": "claudeai",
+            "transport": "claudeai-proxy", "config": {"type": "claudeai-proxy"},
+            "serverInfo": {"name": server, "version": "1.0.0"}, "sessionProxied": true,
+            "tools": tools})
+    };
+    json!([row(CONNECTOR, "github", github), row(SLACK, "slack", slack)])
+}
+
+/// The connector whose tool `tool` is.
+fn server_of(tool: &str) -> &'static str {
+    if tool.starts_with("mcp__claude_ai_Slack__") {
+        SLACK
+    } else {
+        CONNECTOR
+    }
+}
+
+/// Asks rlxd `can_use_tool` for `tool` with `input` as the request `ask_id`, the call
+/// `tool_use_id`: rlxd's answer, logged in `control_answers`, or `None` once stdin closed.
+fn ask(
+    fake: &mut Fake,
+    ask_id: &str,
+    tool: &str,
+    input: &Value,
+    tool_use_id: &str,
+) -> Option<Value> {
+    let display = tool.rsplit("__").next().unwrap_or_default().to_owned();
+    fake.emit(&json!({"type": "control_request", "request_id": ask_id,
+        "request": {"subtype": "can_use_tool", "tool_name": tool, "input": input,
+            "mcp_server": {"name": server_of(tool), "source": "claudeai"},
+            "display_name": display, "tool_use_id": tool_use_id,
+            "server_policy_ask_only": false, "suppress_always_allow_rule": true}}));
+    // The answer to it: rlxd's other messages meanwhile are logged, and skipped.
+    let answer = loop {
+        let message = fake.next_control_within(WAIT).ok().flatten()?;
+        if message["type"] == "control_response" && message["response"]["request_id"] == ask_id {
+            break message["response"].clone();
+        }
+        if message["type"] == "control_request" {
+            fake.log_push("control_requests", message["request"].clone());
+        }
+    };
+    fake.log_push("control_answers", answer.clone());
+    Some(answer)
 }
 
 /// Plays one `mcp_call`: whether stdin stayed open throughout.
 fn call(fake: &mut Fake, id: &Value, request: &Value, variant: Variant, n: u32) -> bool {
     let tool = request["tool"].as_str().unwrap_or_default().to_owned();
     let arguments = request["arguments"].clone();
-    if variant == Variant::NeedsAuth || !(tool == READ || tool == WRITE) {
+    if variant == Variant::NeedsAuth || ![READ, WRITE, SLACK_READ].contains(&tool.as_str()) {
         fake.emit(
             &json!({"type": "control_response", "response": {"subtype": "error",
             "request_id": id, "error": "MCP server not connected: claude_ai_GitHub"}}),
@@ -224,32 +285,20 @@ fn call(fake: &mut Fake, id: &Value, request: &Value, variant: Variant, n: u32) 
         run_tool(fake, id, &arguments);
         return true;
     }
-    let ask_id = format!("fake-ask-{n}");
     let asked = if variant == Variant::Respelled {
         respelled(&arguments)
     } else {
         arguments.clone()
     };
-    let display = tool.rsplit("__").next().unwrap_or_default().to_owned();
-    fake.emit(&json!({"type": "control_request", "request_id": ask_id,
-        "request": {"subtype": "can_use_tool", "tool_name": tool, "input": asked,
-            "mcp_server": {"name": CONNECTOR, "source": "claudeai"},
-            "display_name": display, "tool_use_id": format!("toolu_mcp_call_{n:024x}"),
-            "server_policy_ask_only": false, "suppress_always_allow_rule": true}}));
-    // The answer to it: rlxd's other messages meanwhile are logged, and skipped.
-    let answer = loop {
-        let message = match fake.next_control_within(WAIT) {
-            Ok(Some(message)) => message,
-            Ok(None) | Err(_) => return false,
-        };
-        if message["type"] == "control_response" && message["response"]["request_id"] == ask_id {
-            break message["response"].clone();
-        }
-        if message["type"] == "control_request" {
-            fake.log_push("control_requests", message["request"].clone());
-        }
+    let Some(answer) = ask(
+        fake,
+        &format!("fake-ask-{n}"),
+        &tool,
+        &asked,
+        &format!("toolu_mcp_call_{n:024x}"),
+    ) else {
+        return false;
     };
-    fake.log_push("control_answers", answer.clone());
     let decided = &answer["response"];
     if answer["subtype"] == "success" && decided["behavior"] == "allow" {
         if variant == Variant::Hang {
@@ -260,6 +309,30 @@ fn call(fake: &mut Fake, id: &Value, request: &Value, variant: Variant, n: u32) 
             .get("updatedInput")
             .cloned()
             .unwrap_or_else(|| arguments.clone());
+        if matches!(variant, Variant::Twice | Variant::TwiceOther) {
+            // The tool runs, then a second ask comes before its result.
+            fake.ran_tool();
+            fake.log_push("tool_inputs", input.clone());
+            let (again, again_input) = if variant == Variant::Twice {
+                (tool.clone(), input.clone())
+            } else {
+                (WRITE.to_owned(), json!({"title": "again"}))
+            };
+            let again_id = format!("toolu_mcp_call_{:024x}", n + 1000);
+            if ask(
+                fake,
+                &format!("fake-ask-{n}-again"),
+                &again,
+                &again_input,
+                &again_id,
+            )
+            .is_none()
+            {
+                return false;
+            }
+            success(fake, id, result_of(&input));
+            return true;
+        }
         run_tool(fake, id, &input);
     } else {
         let why = decided["message"].as_str().unwrap_or("denied");
@@ -275,13 +348,17 @@ fn call(fake: &mut Fake, id: &Value, request: &Value, variant: Variant, n: u32) 
 fn run_tool(fake: &mut Fake, id: &Value, input: &Value) {
     fake.ran_tool();
     fake.log_push("tool_inputs", input.clone());
-    let result = if input["ref"] == "missing" {
+    success(fake, id, result_of(input));
+}
+
+/// What a read gives for `input`: [`CONTENT`], or an error result for `{"ref": "missing"}`.
+fn result_of(input: &Value) -> Value {
+    if input["ref"] == "missing" {
         json!({"content": [{"type": "text", "text": MISSING}], "isError": true})
     } else {
         let content: Value = serde_json::from_str(CONTENT).expect("content.json is JSON");
         json!({"content": content, "_meta": {"fake": true}})
-    };
-    success(fake, id, result);
+    }
 }
 
 /// Writes a successful `control_response` to the request `id`.

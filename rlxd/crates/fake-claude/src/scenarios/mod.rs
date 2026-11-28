@@ -85,6 +85,12 @@ pub const ALL: &[(&str, Scenario)] = &[
     ("mcp-direct-silent", |fake| {
         mcp_direct::play(fake, Variant::Silent)
     }),
+    ("mcp-direct-twice", |fake| {
+        mcp_direct::play(fake, Variant::Twice)
+    }),
+    ("mcp-direct-twice-other", |fake| {
+        mcp_direct::play(fake, Variant::TwiceOther)
+    }),
     ("mcp-direct-turn", |fake| {
         mcp_direct::play(fake, Variant::Turn)
     }),

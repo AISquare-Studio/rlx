@@ -470,7 +470,10 @@ listing, 5.5 and 7.7): `crate::connectors`, and the gate in `crate::runner::conn
   cache knows is not read-only is denied so before Claude Code starts. Then one
   `mcp_call`, always with `check_permissions: true`. Claude Code's `can_use_tool` takes
   the gate's own path (rlxd's rules again, then the app, then the ledger), and an allow
-  answers with the pinned input as `updatedInput`, never the request's. **No settings but rlxd's:** Claude Code
+  answers with the pinned input as `updatedInput`, never the request's. A second
+  `can_use_tool` is a second call, which a `connectors.call` never makes: it is denied
+  `by: "rlxd"` at once (never the app's), the tree is killed, and the call is
+  `call_failed`, the first call's content dropped. **No settings but rlxd's:** Claude Code
   decides a `check_permissions` call by its settings' rules and hooks before it asks
   `can_use_tool`, and a rule that allowed the call would skip every rule of rlxd's. So it
   loads no user or local settings (`--setting-sources project`) and runs not in the space

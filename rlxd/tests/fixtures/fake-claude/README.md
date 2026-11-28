@@ -107,8 +107,10 @@ text, as a tool would. Then it tries the identical call again, which rlxd denies
 **`mcp-direct`** plays Claude Code on a `connectors.call` run's control channel (5.3), as
 spike #5 found 2.1.332: no user message, no `system/init`, only answers to rlxd's
 control requests. `initialize` lists `mcp_call_check_permissions_v1`; `mcp_status` lists
-no server for its first 300 ms, then `claude.ai GitHub` connected (`source: "claudeai"`)
-with `get_check_runs` (`readOnly: true`) and `create_issue` (`openWorld: true` only); an
+no server for its first 300 ms, then two connectors connected (`source: "claudeai"`):
+`claude.ai GitHub` with `get_check_runs` (`readOnly: true`) and `create_issue`
+(`openWorld: true` only), and `claude.ai Slack`, the 5.3 Accept lines' connector, with
+`slack_search_public` (`readOnly: true`); each read gives `mcp-direct/content.json`; an
 `mcp_call` with `check_permissions: true` asks rlxd one `can_use_tool` (a
 `toolu_mcp_call_…` id), and runs the tool with the answer's `updatedInput` only on an
 allow, giving `mcp-direct/content.json` (an error result for `{"ref": "missing"}`). The
@@ -132,6 +134,8 @@ a watch job's fallback run is), each plays `watch-call`.
 | `mcp-direct-turn` | Writes an `assistant` line after `initialize` |
 | `mcp-direct-hang` | Never answers the allowed call |
 | `mcp-direct-plant` | Writes an allow rule for the read tool into its cwd's `.claude/settings.json` once it has answered `initialize` |
+| `mcp-direct-twice` | Allowed, runs the tool, then asks `can_use_tool` again for the same call under a new id before it gives the result |
+| `mcp-direct-twice-other` | The same, its second ask for `create_issue` |
 
 Each writes `$AISQUARE_HOME/fake-claude.log.json` in the handoff's shape: see the crate's
 documentation for each field. Like Claude Code, every scenario exits 1 for
