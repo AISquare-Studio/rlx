@@ -706,6 +706,107 @@ fn a_second_can_use_tool_for_another_tool_ends_the_run() {
     asked_twice("mcp-direct-twice-other", WRITE);
 }
 
+#[test]
+fn a_call_claude_code_runs_after_the_apps_deny_is_call_failed_not_denied() {
+    // mcp-direct-defiant runs the call though the app denied it: the call ran, so the
+    // reply is call_failed, as the run and the ledger say, and its content is dropped.
+    let home = home("mcp-direct-defiant", &[]);
+    let _app = App::open(&home);
+    let since = seq(&home);
+    let r = run_id();
+    let reply = call_in_background(&home, &params(&r, READ, &json!({"ref": "main"})));
+    let events = wait_until(&home, since, "the call reaches the app", |e| {
+        !of(e, &r, Some("run.tool_call")).is_empty()
+    });
+    let call_id = one(&events, &r, "run.tool_call")["data"]["call_id"].clone();
+    assert_eq!(decide(&home, &r, &call_id, "deny").code(), Some(0));
+    let run = finish(reply);
+    let (code, detail) = refusal(&run);
+    assert_eq!(code, "call_failed", "{run:?}");
+    assert_eq!(detail["reason"], "error", "{run:?}");
+    assert!(!run.stdout.contains("3d9a1b7"), "{run:?}");
+    let events = wait_until(&home, since, "the run ends", |e| {
+        !of(e, &r, Some("run.failed")).is_empty()
+    });
+    let failed = one(&events, &r, "run.failed");
+    assert_eq!(failed["data"]["reason"], "error");
+    assert!(
+        failed["data"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("that rlxd's gate denied"),
+        "{failed}"
+    );
+    assert!(of(&events, &r, Some("run.tool_result")).is_empty());
+    let calls = ledger(&home, &r);
+    assert_eq!(calls.len(), 1, "{calls:#?}");
+    assert_eq!(calls[0]["decision"], "deny");
+    assert_eq!(calls[0]["by"], "app");
+    assert_eq!(calls[0]["state"], "unknown");
+}
+
+#[test]
+fn an_unreadable_can_use_tool_is_the_one_ask() {
+    // mcp-direct-garbled asks first with no tool_use_id, then well formed: the first is
+    // denied by rlxd and counts as the one ask, so the second ends the run, never at the app.
+    let home = home("mcp-direct-garbled", &[]);
+    let _app = App::open(&home);
+    let since = seq(&home);
+    let r = run_id();
+    let run = call(&home, &params(&r, READ, &json!({"ref": "main"})));
+    let (code, detail) = refusal(&run);
+    assert_eq!(code, "call_failed", "{run:?}");
+    assert_eq!(detail["reason"], "error", "{run:?}");
+    let events = wait_until(&home, since, "the run ends", |e| {
+        !of(e, &r, Some("run.failed")).is_empty()
+    });
+    assert!(
+        one(&events, &r, "run.failed")["data"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("for a second call"),
+        "{events:#?}"
+    );
+    assert!(
+        of(&events, &r, Some("run.tool_call")).is_empty(),
+        "{events:#?}"
+    );
+    let calls = ledger(&home, &r);
+    assert_eq!(calls.len(), 2, "{calls:#?}");
+    assert_eq!(calls[0]["call_id"], "rlxd_mcp_call");
+    for entry in &calls {
+        assert_eq!(entry["decision"], "deny", "{calls:#?}");
+        assert_eq!(entry["by"], "rlxd", "{calls:#?}");
+    }
+    let start = the_start(&home);
+    assert_eq!(start["tool_runs"], 0, "{start:#}");
+    assert_eq!(start["exit"], Value::Null, "{start:#}");
+}
+
+#[test]
+fn a_process_left_holding_stderr_doesnt_hold_the_reply() {
+    // mcp-direct-orphan leaves a process (in a process group of its own) that holds its
+    // stderr for a minute, then writes a model turn's line: the tree is killed, and the
+    // reply comes once rlxd stops reading stderr, not when that process exits.
+    let home = home("mcp-direct-orphan", &[]);
+    let r = run_id();
+    let began = Instant::now();
+    let run = call(&home, &params(&r, READ, &json!({"ref": "main"})));
+    let took = began.elapsed();
+    let start = the_start(&home);
+    if let Some(pid) = start["lingering_pid"].as_u64()
+        && common::alive(pid)
+    {
+        common::kill_hard(pid);
+    }
+    let (code, detail) = refusal(&run);
+    assert_eq!(code, "call_failed", "{run:?}");
+    assert_eq!(detail["reason"], "error", "{run:?}");
+    assert!(took < Duration::from_secs(20), "{took:?}");
+    assert!(start["lingering_pid"].is_u64(), "{start:#}");
+    assert_eq!(home.status()["runs"]["live"], 0, "{:#}", home.status());
+}
+
 // --- No route, and what rlxd does not trust -----------------------------------------------
 
 #[test]

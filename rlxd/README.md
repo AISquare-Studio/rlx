@@ -471,9 +471,9 @@ listing, 5.5 and 7.7): `crate::connectors`, and the gate in `crate::runner::conn
   `mcp_call`, always with `check_permissions: true`. Claude Code's `can_use_tool` takes
   the gate's own path (rlxd's rules again, then the app, then the ledger), and an allow
   answers with the pinned input as `updatedInput`, never the request's. A second
-  `can_use_tool` is a second call, which a `connectors.call` never makes: it is denied
-  `by: "rlxd"` at once (never the app's), the tree is killed, and the call is
-  `call_failed`, the first call's content dropped. **No settings but rlxd's:** Claude Code
+  `can_use_tool` (one rlxd can't read counts as the first) is a second call, which a
+  `connectors.call` never makes: it is denied `by: "rlxd"` at once (never the app's), the
+  tree is killed, and the call is `call_failed`, the first call's content dropped. **No settings but rlxd's:** Claude Code
   decides a `check_permissions` call by its settings' rules and hooks before it asks
   `can_use_tool`, and a rule that allowed the call would skip every rule of rlxd's. So it
   loads no user or local settings (`--setting-sources project`) and runs not in the space
@@ -489,12 +489,14 @@ listing, 5.5 and 7.7): `crate::connectors`, and the gate in `crate::runner::conn
   decision, content?, is_error?, model_turns: 0}`; a deny is `denied` (`detail.by`,
   `detail.reason`, `detail.call_id`); any other end is `call_failed` (`detail.reason`,
   the run's). A call that comes back with no `can_use_tool` first (or after a deny) fails
-  all the same: its content is dropped, the ledger keeps it (`by: "rlxd"`, `unknown`, or
+  all the same, `call_failed` (never `denied`: it ran): its content is dropped, the ledger keeps it (`by: "rlxd"`, `unknown`, or
   `error`), and rlxd's log names what can skip the ask. Every read is bounded: a 4 MiB
   line, a wait for `initialize`'s reply (15 s), the connector (30 s), the `can_use_tool`
   (30 s, and at least the app's `deadline_ms` and 5 s), and the result (60 s from the
   moment any answer, allow or deny, is given), and the run's `timeout_s` (their sum and
-  `deadline_ms`); any of them, or a model turn's line, kills the tree. A deny, however
+  `deadline_ms`); any of them, or a model turn's line, kills the tree, and after a kill
+  Claude Code's stderr is read for 5 s at most (a process that left the tree may hold
+  it). A deny, however
   long the app took or by `timeout`, ends `run.failed {reason: "denied"}`.
 - **The probe.** `rlxd/tests/probes/connectors_route.sh` is the owner-run check of what
   only the real Claude Code can say: the route, whether `system/init` carries

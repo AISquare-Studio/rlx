@@ -64,6 +64,12 @@ pub const ALL: &[(&str, Scenario)] = &[
     }),
     ("init-other", connectors::other),
     ("mcp-direct", |fake| mcp_direct::play(fake, Variant::Gated)),
+    ("mcp-direct-defiant", |fake| {
+        mcp_direct::play(fake, Variant::Defiant)
+    }),
+    ("mcp-direct-garbled", |fake| {
+        mcp_direct::play(fake, Variant::Garbled)
+    }),
     ("mcp-direct-hang", |fake| {
         mcp_direct::play(fake, Variant::Hang)
     }),
@@ -75,6 +81,9 @@ pub const ALL: &[(&str, Scenario)] = &[
     }),
     ("mcp-direct-old", |fake| {
         mcp_direct::play(fake, Variant::Old)
+    }),
+    ("mcp-direct-orphan", |fake| {
+        mcp_direct::play(fake, Variant::Orphan)
     }),
     ("mcp-direct-plant", |fake| {
         mcp_direct::play(fake, Variant::Plant)

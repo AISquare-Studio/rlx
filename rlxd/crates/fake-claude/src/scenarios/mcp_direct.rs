@@ -32,7 +32,11 @@
 //! `-hang` never answers the allowed call, `-plant` writes an allow rule for the read
 //! tool into its cwd's `.claude/settings.json` once it has answered `initialize`, and
 //! `-twice` (`-twice-other`) runs the allowed call, then asks `can_use_tool` again under a
-//! new id for the same call (for [`WRITE`]) before it gives the first one's result.
+//! new id for the same call (for [`WRITE`]) before it gives the first one's result,
+//! `-defiant` runs the call even when rlxd denies it, `-garbled` first asks a
+//! `can_use_tool` with no `tool_use_id`, then a well-formed one, and `-orphan` starts a
+//! process of its own in a process group of its own that holds its stderr (logged as
+//! `lingering_pid`; it lingers a minute), then writes an `assistant` line.
 //!
 //! Started as one of rlxd's conversations (with `--settings`, as a watch job's fallback
 //! run is), each plays [`super::watch_call`]: so a fire that falls back has a model to make
@@ -103,6 +107,12 @@ pub enum Variant {
     Twice,
     /// Allowed, it asks `can_use_tool` again for [`WRITE`].
     TwiceOther,
+    /// Denied, it runs the call all the same.
+    Defiant,
+    /// Its first `can_use_tool` has no `tool_use_id`; a well-formed one follows.
+    Garbled,
+    /// It leaves a process holding its stderr, then writes an `assistant` line.
+    Orphan,
 }
 
 /// The longest it waits for rlxd's next message.
@@ -162,6 +172,11 @@ pub fn play(fake: &mut Fake, variant: Variant) -> i32 {
                     }
                     Variant::Turn => fake.emit(&json!({"type": "assistant", "message": {
                         "role": "assistant", "content": [{"type": "text", "text": "Hi"}]}})),
+                    Variant::Orphan => {
+                        linger(fake);
+                        fake.emit(&json!({"type": "assistant", "message": {
+                            "role": "assistant", "content": [{"type": "text", "text": "Hi"}]}}));
+                    }
                     Variant::Plant => {
                         let dir = std::path::Path::new(".claude");
                         let rule = json!({"permissions": {"allow": [READ]}});
@@ -290,6 +305,27 @@ fn call(fake: &mut Fake, id: &Value, request: &Value, variant: Variant, n: u32) 
     } else {
         arguments.clone()
     };
+    if variant == Variant::Garbled {
+        // No tool_use_id: rlxd can't read it as a call.
+        let display = tool.rsplit("__").next().unwrap_or_default().to_owned();
+        fake.emit(
+            &json!({"type": "control_request", "request_id": "fake-ask-garbled",
+            "request": {"subtype": "can_use_tool", "tool_name": tool, "input": asked,
+                "mcp_server": {"name": server_of(&tool), "source": "claudeai"},
+                "display_name": display}}),
+        );
+        loop {
+            let Some(message) = fake.next_control_within(WAIT).ok().flatten() else {
+                return false;
+            };
+            if message["type"] == "control_response"
+                && message["response"]["request_id"] == "fake-ask-garbled"
+            {
+                fake.log_push("control_answers", message["response"].clone());
+                break;
+            }
+        }
+    }
     let Some(answer) = ask(
         fake,
         &format!("fake-ask-{n}"),
@@ -334,6 +370,9 @@ fn call(fake: &mut Fake, id: &Value, request: &Value, variant: Variant, n: u32) 
             return true;
         }
         run_tool(fake, id, &input);
+    } else if variant == Variant::Defiant {
+        // Denied, and run all the same.
+        run_tool(fake, id, &arguments);
     } else {
         let why = decided["message"].as_str().unwrap_or("denied");
         fake.emit(
@@ -342,6 +381,31 @@ fn call(fake: &mut Fake, id: &Value, request: &Value, variant: Variant, n: u32) 
         );
     }
     true
+}
+
+/// Starts this binary again as a process that lingers a minute, in a process group of its
+/// own (on macOS and Linux), holding this start's stderr: logged as `lingering_pid`.
+fn linger(fake: &Fake) {
+    let me = std::env::args_os().next().unwrap_or_default();
+    let mut command = std::process::Command::new(me);
+    command
+        .arg(super::LINGER)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::inherit());
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        command.process_group(0);
+    }
+    match command.spawn() {
+        Ok(child) => {
+            if let Some(log) = fake.log() {
+                log.update(|start| start["lingering_pid"] = json!(child.id()));
+            }
+        }
+        Err(e) => eprintln!("fake-claude/mcp-direct-orphan: it did not start: {e}"),
+    }
 }
 
 /// Runs the tool with `input`, and answers the `mcp_call` `id` with its result.

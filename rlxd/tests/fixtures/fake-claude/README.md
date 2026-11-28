@@ -136,6 +136,9 @@ a watch job's fallback run is), each plays `watch-call`.
 | `mcp-direct-plant` | Writes an allow rule for the read tool into its cwd's `.claude/settings.json` once it has answered `initialize` |
 | `mcp-direct-twice` | Allowed, runs the tool, then asks `can_use_tool` again for the same call under a new id before it gives the result |
 | `mcp-direct-twice-other` | The same, its second ask for `create_issue` |
+| `mcp-direct-defiant` | Runs the call even when rlxd denies it |
+| `mcp-direct-garbled` | Asks `can_use_tool` first with no `tool_use_id`, then well formed |
+| `mcp-direct-orphan` | Leaves a process in a process group of its own holding its stderr for a minute (`lingering_pid` in the log), then writes an `assistant` line |
 
 Each writes `$AISQUARE_HOME/fake-claude.log.json` in the handoff's shape: see the crate's
 documentation for each field. Like Claude Code, every scenario exits 1 for

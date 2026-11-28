@@ -232,7 +232,11 @@ pub mod methods {
     /// One read call of a connector's tool with no model turn, as a gated `watch` run
     /// (5.3): [`ConnectorsCallParams`](crate::ConnectorsCallParams) in,
     /// [`ConnectorsCallData`](crate::ConnectorsCallData) out. Needs the capability
-    /// `connectors.call` (else `no_route`); not for a `remote` connection.
+    /// `connectors.call` (else `no_route`); not for a `remote` connection. It answers once
+    /// the call's run has ended, which may wait on the app's decision; a connection answers
+    /// one request at a time, so the app decides it (`run.decide`) on a connection of its
+    /// own: one sent on the same connection waits behind it, until the call's deadline
+    /// denies it.
     pub const CONNECTORS_CALL: &str = "connectors.call";
     /// Test builds only: `run.start` with a scheduler `job_id`, which no other client can
     /// set: [`RunStartParams`](crate::RunStartParams) plus `job_id` in,

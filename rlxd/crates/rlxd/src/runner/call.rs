@@ -106,6 +106,10 @@ const CALL_ID: &str = "rlxd-mcp-call";
 /// rules before it was sent, or made with no `can_use_tool`.
 pub const RLXD_CALL_ID: &str = "rlxd_mcp_call";
 
+/// The reason of a `can_use_tool` with no tool name or no call id: rlxd denies the call.
+const UNREADABLE: &str = "rlxd could not read Claude Code's can_use_tool request (it named no \
+                          tool or no call id)";
+
 /// The reason of a second `can_use_tool`'s deny.
 const SECOND_ASK: &str = "a connectors.call makes one call: Claude Code asked for a second";
 
@@ -449,8 +453,23 @@ impl Runner {
                 tree.reap(&mut child, None).await;
             }
         }
+        // What Claude Code said, for a failure: bounded too, as a process that left the
+        // tree may hold its stderr open for as long as it lives.
         let said = if matches!(driven, Driven::Broken(_)) {
-            stderr.await.unwrap_or_default()
+            let mut stderr = stderr;
+            match tokio::time::timeout(EXIT_GRACE, &mut stderr).await {
+                Ok(said) => said.unwrap_or_default(),
+                Err(_) => {
+                    stderr.abort();
+                    warning!(
+                        "run {}: Claude Code's stderr stayed open {}s after its tree was \
+                         killed (a process that left the tree holds it): it is not read on",
+                        params.run_id,
+                        EXIT_GRACE.as_secs()
+                    );
+                    String::new()
+                }
+            }
         } else {
             stderr.abort();
             String::new()
@@ -696,8 +715,13 @@ impl Runner {
                             }
                             json!({"behavior": "deny", "message": taken.reason})
                         }
-                        None => json!({"behavior": "deny",
-                            "message": "rlxd could not read the request"}),
+                        None => {
+                            // Unread, it is the one ask all the same, denied by rlxd: any
+                            // after it is a second.
+                            denied = true;
+                            self.deny_unsent(run, call, UNREADABLE);
+                            json!({"behavior": "deny", "message": UNREADABLE})
+                        }
                     };
                     let response = json!({"type": "control_response", "response": {
                         "subtype": "success", "request_id": request_id, "response": answer}});
@@ -786,11 +810,13 @@ impl Runner {
             return match result {
                 Err(_) if denied => Driven::Denied,
                 Ok(_) if denied => {
-                    // It ran all the same: the ledger's deny says it may have.
+                    // It ran all the same: the ledger's deny says it may have, and the call
+                    // is call_failed, not denied: it ran.
                     if let Some(Outcome::Denied { call_id, .. }) = call.outcome() {
                         let mut inner = run.inner();
                         self.ran_anyway(run, &mut inner, &call_id, CallState::Unknown);
                     }
+                    call.clear();
                     warning!(
                         "run {}: Claude Code made the call of {tool} that rlxd's gate denied: \
                          its content is dropped. A rule or hook rlxd does not control (an \
@@ -896,10 +922,7 @@ impl Runner {
             None,
         );
         drop(inner);
-        info!(
-            "run {}: rlxd's rules deny the call, which is not sent: {reason}",
-            run.params.run_id
-        );
+        info!("run {}: rlxd denies the call: {reason}", run.params.run_id);
         call.set(Outcome::Denied {
             call_id: RLXD_CALL_ID.to_owned(),
             by: taken.by,
@@ -1099,11 +1122,12 @@ fn listed_of(rows: &[Value]) -> gate::Listed {
     listed
 }
 
-/// Whether `capabilities` (a list of names, or an object keyed by them) names `name`.
+/// Whether `capabilities` (a list of names, or an object keyed by them, `true`) names
+/// `name`.
 fn lists(capabilities: &Value, name: &str) -> bool {
     match capabilities {
         Value::Array(names) => names.iter().any(|each| each == name),
-        Value::Object(names) => names.get(name).is_some_and(|v| v != &Value::Bool(false)),
+        Value::Object(names) => names.get(name) == Some(&Value::Bool(true)),
         _ => false,
     }
 }
@@ -1321,6 +1345,11 @@ mod tests {
         assert!(lists(&json!({CHECK_PERMISSIONS: true}), CHECK_PERMISSIONS));
         assert!(!lists(
             &json!({CHECK_PERMISSIONS: false}),
+            CHECK_PERMISSIONS
+        ));
+        assert!(!lists(&json!({CHECK_PERMISSIONS: null}), CHECK_PERMISSIONS));
+        assert!(!lists(
+            &json!({CHECK_PERMISSIONS: "yes"}),
             CHECK_PERMISSIONS
         ));
         assert!(!lists(
