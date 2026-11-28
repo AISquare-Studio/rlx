@@ -418,12 +418,21 @@ pub mod codes {
     /// `env.set` or `hello`'s `env` named a key that is not `PATH`, `CLAUDE_CONFIG_DIR` or
     /// `CLAUDE_SECURESTORAGE_CONFIG_DIR` (4.3). Nothing changed.
     pub const BAD_ENV_KEY: &str = "bad_env_key";
-    /// A run could not start: no `claude` on the app's `PATH` (4.3), or rlxd's own when
-    /// the app set none, and `RLXD_CLAUDE_BIN` names none. Agreed with the runner (7.5).
+    /// `connectors.list {refresh: true}`: rlxd has no route to Claude Code's connectors
+    /// that makes no model turn yet. `allow_turn: true` lets it take one.
+    pub const NO_ROUTE: &str = "no_route";
+    /// Claude Code could not start: no `claude` on the app's `PATH` (4.3), or rlxd's own
+    /// when the app set none, and `RLXD_CLAUDE_BIN` names none. Refuses `run.start`,
+    /// `run.resume` and `connectors.list {refresh: true, allow_turn: true}`. Agreed with
+    /// the runner (7.5).
     pub const CLAUDE_NOT_FOUND: &str = "claude_not_found";
-    /// A run could not start: the `claude` found first is a batch file, such as npm's
-    /// `claude.cmd` shim on Windows, which rlxd does not run through `cmd` (4.3).
+    /// Claude Code could not start: the `claude` found first is a batch file, such as
+    /// npm's `claude.cmd` shim on Windows, which rlxd does not run through `cmd` (4.3).
+    /// Refuses what `claude_not_found` does.
     pub const CLAUDE_NOT_RUNNABLE: &str = "claude_not_runnable";
+    /// `connectors.list {refresh: true, allow_turn: true}`: the one-turn probe ended
+    /// without a `system/init`. The message says why.
+    pub const PROBE_FAILED: &str = "probe_failed";
 }
 
 impl Envelope {

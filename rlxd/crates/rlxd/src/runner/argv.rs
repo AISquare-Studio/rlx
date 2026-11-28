@@ -101,6 +101,76 @@ pub fn settings_via(
     ]}]}})
 }
 
+/// The command line after the program of the connectors' one-turn probe (5.3), with its
+/// settings file at `settings`: a run's, with no session, its MCP servers loaded
+/// (`--tools ""` and no `--strict-mcp-config`), and one turn at most.
+///
+/// ```text
+/// -p --output-format stream-json --verbose --input-format stream-json
+///   --no-session-persistence --tools "" --max-turns 1
+///   --settings <settings> --setting-sources project --permission-mode dontAsk
+/// ```
+pub fn probe_args(settings: &Path) -> Vec<OsString> {
+    let mut args: Vec<OsString> = [
+        "-p",
+        "--output-format",
+        "stream-json",
+        "--verbose",
+        "--input-format",
+        "stream-json",
+        "--no-session-persistence",
+        "--tools",
+        "",
+        "--max-turns",
+        "1",
+        "--settings",
+    ]
+    .map(OsString::from)
+    .to_vec();
+    args.push(settings.as_os_str().to_owned());
+    args.extend(
+        [
+            "--setting-sources",
+            "project",
+            "--permission-mode",
+            "dontAsk",
+        ]
+        .map(OsString::from),
+    );
+    args
+}
+
+/// The probe's own settings: one PreToolUse hook, matching every tool, that runs
+/// `rlxd __probe-deny` by rlxd's absolute path `rlxd`. rlxd itself denies each call the
+/// probe makes: the hook opens no connection, and no call reaches the app. Refused, saying
+/// why, for a path a hook's shell would misread.
+pub fn probe_settings(rlxd: &Path) -> Result<Value, String> {
+    if !rlxd.is_absolute() {
+        return Err(format!(
+            "rlxd's own path, {}, is not absolute",
+            rlxd.display()
+        ));
+    }
+    if cfg!(windows) && rlxd.to_string_lossy().contains(WINDOWS_SHELL_CHARACTERS) {
+        return Err(format!(
+            "rlxd's own path, {}, holds a character a hook's shell would read",
+            rlxd.display()
+        ));
+    }
+    let command = format!("{} __probe-deny", quoted(rlxd));
+    Ok(json!({"hooks": {"PreToolUse": [{"matcher": "*", "hooks": [
+        {"type": "command", "command": command, "timeout": 10}
+    ]}]}}))
+}
+
+/// What `rlxd __probe-deny` prints: Claude Code's PreToolUse deny, by rlxd.
+pub fn probe_deny_output() -> String {
+    json!({"hookSpecificOutput": {"hookEventName": "PreToolUse",
+        "permissionDecision": "deny",
+        "permissionDecisionReason": "Denied by rlxd: a connectors probe runs no tool."}})
+    .to_string()
+}
+
 /// `path` as a shell word, for the shell Claude Code runs a hook's command through: as it
 /// is when it holds only characters no shell treats specially, else in double quotes,
 /// with `"`, `\`, `$` and `` ` `` escaped.
@@ -196,6 +266,46 @@ mod tests {
     fn after<'a>(args: &'a [String], flag: &str) -> Option<&'a str> {
         let at = args.iter().position(|a| a == flag)?;
         args.get(at + 1).map(String::as_str)
+    }
+
+    #[test]
+    fn the_probe_loads_mcp_servers_for_one_turn_and_rlxd_denies_its_calls() {
+        let argv = text(&probe_args(Path::new("/h/p.json")));
+        assert_eq!(after(&argv, "--tools"), Some(""));
+        assert_eq!(after(&argv, "--max-turns"), Some("1"));
+        assert_eq!(after(&argv, "--settings"), Some("/h/p.json"));
+        assert_eq!(after(&argv, "--setting-sources"), Some("project"));
+        for present in ["-p", "--verbose", "--no-session-persistence"] {
+            assert!(argv.iter().any(|a| a == present), "{present}: {argv:?}");
+        }
+        for absent in [
+            "--strict-mcp-config",
+            "--allowedTools",
+            "--bare",
+            "--session-id",
+        ] {
+            assert!(!argv.iter().any(|a| a == absent), "{absent}: {argv:?}");
+        }
+        let rlxd = if cfg!(windows) {
+            r"C:\rlx\rlxd.exe"
+        } else {
+            "/opt/rlx/rlxd"
+        };
+        let settings = probe_settings(Path::new(rlxd)).unwrap();
+        let hook = &settings["hooks"]["PreToolUse"][0];
+        assert_eq!(hook["matcher"], "*");
+        let command = hook["hooks"][0]["command"].as_str().unwrap();
+        assert!(command.ends_with(" __probe-deny"), "{command}");
+        assert!(!command.contains("rlxd-hook"), "{command}");
+        assert!(probe_settings(Path::new("rlxd")).is_err());
+        let deny: Value = serde_json::from_str(&probe_deny_output()).unwrap();
+        assert_eq!(deny["hookSpecificOutput"]["permissionDecision"], "deny");
+        assert!(
+            deny["hookSpecificOutput"]["permissionDecisionReason"]
+                .as_str()
+                .unwrap()
+                .contains("rlxd")
+        );
     }
 
     #[test]

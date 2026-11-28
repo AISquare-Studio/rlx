@@ -63,7 +63,7 @@ bound both validators agree on.
 | `pty-list-reply.json` | `pty.list`'s reply: `{ptys: [{pty_id, label?, argv, cwd, pid, cols, rows, started_at, exited, status?, signal?, error?}]}`, in the order they started |
 | `pty-output.json` | `pty.output`'s data, on the `pty` topic: `{pty_id, bytes_b64}`, the process's bytes in standard base64 |
 | `pty-exited.json` | `pty.exited`'s data, on the `pty` topic: `{pty_id, status, signal?, error?}` |
-| `run-start.json` | `run.start`'s params (7.5): `{run_id, kind, prompt?, mount, needs_connectors?, output_schema?, persist_session?, space?, append_system_prompt?, partial?, timeout_s?, deadline_ms?, pinned_call?, needs_you_when?, job_id?}`. `run_id` is a lower-case UUID, Claude Code's session id; `space` follows the space name rule |
+| `run-start.json` | `run.start`'s params (7.5): `{run_id, kind, prompt?, mount, needs_connectors?, output_schema?, persist_session?, space?, append_system_prompt?, partial?, timeout_s?, deadline_ms?, pinned_call?, needs_you_when?, job_id?}`. `run_id` is a lower-case UUID, Claude Code's session id; `space` follows the space name rule; each of `needs_connectors` is a connector's id (1 to 256 bytes, no control character) |
 | `run-ref.json` | One run by id, `{run_id}`: `run.start`'s reply, and `run.cancel`'s and `run.get`'s params |
 | `run-resume.json` | `run.resume`'s params: `{run_id, reply?}`. Refused: `run_alive`, `not_resumable` (a `send_executor`), `no_session` |
 | `run-resume-reply.json` | `run.resume`'s reply: `{run_id, attempt}`, the new attempt, from 2 |
@@ -75,7 +75,7 @@ bound both validators agree on.
 | `run-cancel-reply.json` | `run.cancel`'s reply: `{run_id, cancelled, state}`. A run that had ended stays as it was, `cancelled: false` |
 | `run-event.json` | One event of a run's stream: `event.json`, plus each 7.5 run event type's `data` (`run.queued`, `run.started`, `run.text`, `run.tool_result`, `run.rate_limited`, `run.needs_you`, `run.done`, `run.failed`) and 7.3's `needs_you.raised {id, source, run_id?, agent_id?, reason, text}` and `needs_you.cleared {id}`. Other types need only `event.json` |
 | `run-event-list.json` | A JSON array of them, as `jq -s .` makes of a capture of the `run` and `needs_you` topics |
-| `job-put.json` | `job.put`'s params (7.6): `{job_id, type, schedule, run?, connector?, tool?, input?, catch_up, enabled?, loud?}`. `schedule` is `{every_minutes}` or `{cron, tz}`; `run` is a `run.start` template without `run_id`, checked as `run.start` checks its params. Unknown fields are refused. Refused: `kind_mount_mismatch`, `pinned_call_required`, `not_implemented` (a `needs_connectors`, or a `watch` job until it is served), `invalid_params` |
+| `job-put.json` | `job.put`'s params (7.6): `{job_id, type, schedule, run?, connector?, tool?, input?, catch_up, enabled?, loud?}`. `schedule` is `{every_minutes}` or `{cron, tz}`; `run` is a `run.start` template without `run_id`, checked as `run.start` checks its params. Unknown fields are refused. Refused: `kind_mount_mismatch`, `pinned_call_required`, `not_implemented` (a `watch` job until it is served), `invalid_params` |
 | `job-ref.json` | `{job_id}`: `job.delete`'s, `job.pause`'s, `job.resume`'s and `job.run_now`'s params, and `job.put`'s, `job.delete`'s, `job.pause`'s and `job.resume`'s reply. `unknown_job` for a job rlxd doesn't hold |
 | `job-list.json` | `job.list`'s params: `{}` |
 | `job-list-reply.json` | `job.list`'s reply: `{jobs: [{job_id, type, schedule, catch_up, enabled, paused, loud, next_fire_at, last_fire_at, last_run_id, last_state, skipped_count}]}` |
@@ -84,6 +84,16 @@ bound both validators agree on.
 | `space.json` | `space.ensure`'s and `space.erase`'s params: `{name}`, 1 to 64 lower-case letters, digits, `-`, `_` and `.`, starting with a letter or digit, no `..`, no `.` at the end, not a Windows device name |
 | `space-ensure-reply.json` | `space.ensure`'s reply: `{name, path}`, the space's folder, absolute and resolved |
 | `space-erase-reply.json` | `space.erase`'s reply: `{removed: [path], links?: [path]}`, `links` being links inside the space removed as links. Every link is listed, under the space's resolved path. Refused whole: `runs_live` (`detail.run_ids`), `erase_in_progress`, `link_refused` (`detail.paths`), and `erase_incomplete` (`detail {removed, failed}`) when some paths stayed |
+| `connectors.json` | `connectors.list`'s reply (5.3, 7.7): `{connectors: [{id, source, status, tools: [{name, read_only_hint}]}], as_of, from, model_turns}`. `status` is `connected`, `needs-auth`, `pending` or `failed`; `read_only_hint` is always there, `true`, `false` or `null`; `as_of` is `null` before any `system/init`; `from` is `init` (or `listing`, with `connectors.no_turn`); `model_turns` is 0, or 1 for a one-turn refresh |
+| `connectors-list.json` | `connectors.list`'s params: `{refresh?, allow_turn?}`. `refresh` without a route that makes no turn is `no_route`, unless `allow_turn`, which `remote` may not pass (`role_not_allowed`) |
+| `connectors-login.json` | `connectors.login`'s params: `{id}`, 1 to 256 bytes with no control character, not beginning with `-`. Refused for `remote` (`role_not_allowed`) |
+| `connectors-login-reply.json` | `connectors.login`'s reply: `{login_id}`, which its `connector.login.*` events carry |
+| `connector-id.json` | `connector.added`'s and `connector.removed`'s data, on the `connector` topic: `{id}` |
+| `connector-changed.json` | `connector.changed`'s data: `{id, status, previous_status}`, once a real change |
+| `connector-login-open-url.json` | `connector.login.open_url`'s data: `{login_id, id, url}`, `url` always `https://` |
+| `connector-login-waiting.json` | `connector.login.waiting`'s data: `{login_id}` |
+| `connector-login-done.json` | `connector.login.done`'s data: `{login_id, id, status}` |
+| `connector-login-error.json` | `connector.login.error`'s data: `{login_id, code, message}`, `code` one of `claude_not_found`, `claude_not_runnable`, `no_url`, `not_https`, `failed` and `timed_out` |
 
 Validate a document with `uvx check-jsonschema --schemafile rlxd/schemas/v1/<schema> <file>`.
 

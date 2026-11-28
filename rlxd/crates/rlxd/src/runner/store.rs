@@ -76,6 +76,10 @@ pub struct Record {
     /// Whether the run's pinned call was allowed once (5.1): every later call is denied.
     #[serde(default)]
     pub pinned_call_used: bool,
+    /// The connectors a failed run's `needs_you {reason: "auth"}` waits on (5.5), while
+    /// it is out.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub auth: Vec<String>,
 }
 
 /// A run's process, as the sweep finds it again.

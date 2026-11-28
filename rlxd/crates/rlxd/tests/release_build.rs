@@ -84,6 +84,13 @@ fn check_7_a_release_build_has_no_debug_methods() {
             .count();
         assert_eq!(found, 0, "{needle} is in the release build");
     }
+    // Nor a test build's smaller PTY limit (#2853): a release build holds 64.
+    let needle = "RLXD_TEST_MAX_PTYS";
+    let found = bytes
+        .windows(needle.len())
+        .filter(|w| *w == needle.as_bytes())
+        .count();
+    assert_eq!(found, 0, "{needle} is in the release build");
 
     let test_build = TestHome::new();
     test_build.start();

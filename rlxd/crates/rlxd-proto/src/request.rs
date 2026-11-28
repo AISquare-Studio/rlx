@@ -220,6 +220,15 @@ pub mod methods {
     /// [`SpaceParams`](crate::SpaceParams) in, [`SpaceEraseData`](crate::SpaceEraseData)
     /// out.
     pub const SPACE_ERASE: &str = "space.erase";
+    /// The user's connectors, from the latest `system/init`, or refreshed:
+    /// [`ConnectorsListParams`](crate::ConnectorsListParams) in,
+    /// [`ConnectorsList`](crate::ConnectorsList) out (7.7).
+    pub const CONNECTORS_LIST: &str = "connectors.list";
+    /// Signs a connector in again, through `claude mcp login` in an rlxd PTY:
+    /// [`ConnectorsLoginParams`](crate::ConnectorsLoginParams) in,
+    /// [`ConnectorsLoginData`](crate::ConnectorsLoginData) out, then `connector.login.*`
+    /// events (7.7). Not for a `remote` connection.
+    pub const CONNECTORS_LOGIN: &str = "connectors.login";
     /// Test builds only: `run.start` with a scheduler `job_id`, which no other client can
     /// set: [`RunStartParams`](crate::RunStartParams) plus `job_id` in,
     /// [`RunRef`](crate::RunRef) out. A release build answers `unknown_method`.
