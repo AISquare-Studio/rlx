@@ -318,13 +318,19 @@ async def clickable(pilot: Pilot[Any], selector: str, seconds: float = 10.0) -> 
     scrolls itself into view, and a scroll can outlast a settle. Aimed mid-scroll, the click
     pressed down on the button and let go where it no longer was: aimed at row 21, the
     button at row 18 by the click, so it was never pressed (the same test at -n 3, #65).
-    This is a bounded poll on the condition (``settle_until``).
+    Its region must also be the one it had a poll ago: a scroll asked for after a refresh
+    waits in the screen's callbacks, where no settle looks (reviewer #3992). This is a
+    bounded poll on the condition (``settle_until``).
     """
     app = pilot.app
+    seen: list[Region] = []
 
     def ready() -> bool:
         widget = app.screen.query_one(selector)
-        if not (widget.display and widget.region.area):
+        region = widget.region
+        still = seen[-1:] == [region]
+        seen.append(region)
+        if not (widget.display and region.area and still):
             return False
         scrolls = [(node, at) for node in widget.ancestors_with_self for at in SCROLLS]
         return not any(app.animator.is_being_animated(node, at) for node, at in scrolls)
@@ -1584,12 +1590,15 @@ def test_a_bind_made_with_account_reads_that_account_for_every_agent(
 
 
 async def double_click_row(pilot: Pilot[Any], option: str) -> None:
-    """A double click on ``option``'s row of the target picker on screen."""
+    """A double click on ``option``'s row of the target picker on screen, once the list is
+    :func:`clickable`; it must land on the list (reviewer #3992)."""
+    await clickable(pilot, "#picker-list")
     listing = pilot.app.screen.query_one("#picker-list", OptionList)
     index = listing.get_option_index(option)
     inside = listing.content_region
     at = (inside.x - listing.region.x + 4, inside.y - listing.region.y + index)
-    await pilot.double_click(listing, offset=at)
+    landed = await pilot.double_click(listing, offset=at)
+    assert landed, f"the double click on {option} missed #picker-list; it was at {listing.region}"
 
 
 def test_choosing_an_agent_asks_in_place_then_attaches_and_says_how_it_was_delivered(
@@ -2123,11 +2132,17 @@ LATE_LAYOUT_S = 0.5
 #: How long it then takes to scroll itself into view: longer than a settle's bounded rounds.
 SLOW_SCROLL_S = 2.0
 
+#: The refreshes the slowed scroll waits, at most, for the opened section to be laid out.
+LAYOUT_REFRESHES = 100
+
 
 def lay_out_late(monkeypatch: pytest.MonkeyPatch, collapsible_id: str) -> None:
     """The collapsible ``collapsible_id`` opens (or folds) ``LATE_LAYOUT_S`` late, its
-    contents not laid out until then, and then scrolls itself into view over
-    ``SLOW_SCROLL_S``, moving them as it goes. In process; no load."""
+    contents not laid out until then. Once they are, it scrolls itself into view over
+    ``SLOW_SCROLL_S``, moving them as it goes. Textual's own scroll, asked for after a
+    refresh, sometimes ran before the opened section was laid out and scrolled nothing
+    (reviewer #3992). This one waits for the layout, so the slowed runs always scroll.
+    In process; no load."""
     on_time = Collapsible._watch_collapsed
     scroll = Collapsible.scroll_visible
 
@@ -2138,9 +2153,19 @@ def lay_out_late(monkeypatch: pytest.MonkeyPatch, collapsible_id: str) -> None:
             on_time(self, collapsed)
 
     def slowly(self: Collapsible, *args: Any, **kwargs: Any) -> None:
-        if self.id == collapsible_id:
-            kwargs["duration"] = SLOW_SCROLL_S
-        scroll(self, *args, **kwargs)
+        if self.id != collapsible_id:
+            scroll(self, *args, **kwargs)
+            return
+        kwargs["duration"] = SLOW_SCROLL_S
+
+        def once_laid_out(refreshes: int = 0) -> None:
+            unlaid = not self.query_one(Collapsible.Contents).region.area
+            if not self.collapsed and unlaid and refreshes < LAYOUT_REFRESHES:
+                self.call_after_refresh(once_laid_out, refreshes + 1)
+            else:
+                scroll(self, *args, **kwargs)
+
+        once_laid_out()
 
     monkeypatch.setattr(Collapsible, "_watch_collapsed", late)
     monkeypatch.setattr(Collapsible, "scroll_visible", slowly)
@@ -2156,17 +2181,20 @@ def test_a_button_in_a_section_laid_out_late_is_clickable_once_it_is_at_rest(
 
     lay_out_late(monkeypatch, "spawn-advanced")
 
-    async def scenario(pilot: Pilot[None], host: Host) -> list[Region]:
+    async def scenario(pilot: Pilot[None], host: Host) -> list[Any]:
         host.push_screen(SpawnDialog(project, accounts=None, defaults=None))
-        await wait_for(pilot, SpawnDialog)
+        dialog = await wait_for(pilot, SpawnDialog)
+        fields = dialog.query_one("#spawn-fields")
+        before = fields.scroll_y
         await press(pilot, "#spawn-advanced CollapsibleTitle")
         button = await clickable(pilot, "#spawn-import")
         ready = button.region
         await pilot.wait_for_scheduled_animations()
         await settle(pilot)
-        return [ready, button.region]
+        return [ready, button.region, before, fields.scroll_y]
 
-    ready, at_rest = drive(scenario, project=project)
+    ready, at_rest, before, after = drive(scenario, project=project)
+    assert after > before, f"the premise: the opened section scrolled ({before} to {after})"
     assert ready.area, "clickable returned before Import… was laid out"
     assert ready == at_rest, f"clickable returned mid-scroll: at {ready}, at rest {at_rest}"
 
