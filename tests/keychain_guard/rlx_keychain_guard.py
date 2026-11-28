@@ -396,8 +396,8 @@ def argv_commands(argv: Sequence[str], *, windows: bool = False, depth: int = 0)
         return []
     found = [words]
     script = _shell_script(_program_name(words[0]), words[1:])
-    if script is not None:
-        inner_windows = windows or _program_name(words[0]) in ("cmd", "powershell", "pwsh")
+    if script is not None:  # a POSIX shell's script is a POSIX line wherever it was started
+        inner_windows = _program_name(words[0]) in ("cmd", "powershell", "pwsh")
         found += commands(script, windows=inner_windows, depth=depth + 1)
     return found
 

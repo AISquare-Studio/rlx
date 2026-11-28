@@ -303,6 +303,7 @@ def test_the_word_outside_command_position_is_not_the_tool(line: str, own_log: P
     assert refusals(own_log) == []
 
 
+@pytest.mark.skipif(os.name == "nt", reason="POSIX shells: Windows' cmd /c is in the table")
 @pytest.mark.parametrize(
     "line",
     [
@@ -349,6 +350,10 @@ def test_a_windows_command_line_is_read_without_backslash_escapes() -> None:
     assert guard.refusal_kind(found[1]) == "credential-tool"
 
 
+#: How a stand-in agent is named where it must be found on PATH (PATHEXT on Windows).
+AGENT_SUFFIX = ".cmd" if os.name == "nt" else ""
+
+
 @pytest.fixture
 def agents_elsewhere(tmp_path: Path) -> Iterator[Path]:
     """A ``claude`` and a ``codex`` (scripts that exit 0) in a directory the guard is told is
@@ -356,7 +361,7 @@ def agents_elsewhere(tmp_path: Path) -> Iterator[Path]:
     where = tmp_path / "elsewhere"
     where.mkdir()
     for name in ("claude", "codex"):
-        tool = where / name
+        tool = where / f"{name}{AGENT_SUFFIX}"
         tool.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
         tool.chmod(0o755)
     before = guard.snapshot()
@@ -369,14 +374,14 @@ def agents_elsewhere(tmp_path: Path) -> Iterator[Path]:
 def test_a_real_agent_binary_is_refused_by_path_and_on_path(
     name: str, agents_elsewhere: Path, own_log: Path
 ) -> None:
-    tool = str(agents_elsewhere / name)
+    tool = str(agents_elsewhere / f"{name}{AGENT_SUFFIX}")
     with pytest.raises(guard.AgentBinaryRefused, match="real claude or codex"):
         guard._hook("subprocess.Popen", (tool, [tool, "--version"], None, None))
     env = {"PATH": str(agents_elsewhere)}
     with pytest.raises(guard.AgentBinaryRefused):
         guard._hook("subprocess.Popen", (name, [name, "-p", "hi"], None, env))
     with pytest.raises(guard.AgentBinaryRefused):
-        guard._hook("subprocess.Popen", _sh(f"nohup {tool} -p hi"))
+        guard._hook("subprocess.Popen", _sh(f"nohup {Path(tool).as_posix()} -p hi"))
     entries, _ = guard.read_log(own_log)
     assert [entry["kind"] for entry in entries] == ["agent"] * 3
 
@@ -395,7 +400,7 @@ def test_a_stand_in_agent_or_one_not_installed_is_not_refused(
 ) -> None:
     """The tests' own ``claude`` lives in a run root (``tmp_path``, ``tests/``); a ``claude``
     on no ``PATH`` starts nothing for the guard to refuse."""
-    stand_in = tmp_path / "bin" / "claude"
+    stand_in = tmp_path / "bin" / f"claude{AGENT_SUFFIX}"
     stand_in.parent.mkdir()
     stand_in.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
     assert guard.refusal_kind(str(stand_in)) is None
@@ -409,7 +414,7 @@ def test_real_agent_binaries_lifts_the_refusal_here_and_in_children(
     agents_elsewhere: Path, own_log: Path
 ) -> None:
     assert os.environ[guard.AGENTS_VAR] == "1"
-    assert guard.refusal_kind(str(agents_elsewhere / "claude")) is None
+    assert guard.refusal_kind(str(agents_elsewhere / f"claude{AGENT_SUFFIX}")) is None
     assert refusals(own_log) == []
 
 
