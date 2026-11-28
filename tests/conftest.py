@@ -27,7 +27,7 @@ from typer.testing import CliRunner
 
 import aisquare
 from aisquare.core import agents as agent_core
-from aisquare.core import experimental, insights, instance_scan, login_session, program
+from aisquare.core import code_index, experimental, insights, instance_scan, login_session, program
 from aisquare.core.paths import HOME_ENV_VAR
 from aisquare.core.state import reset_state
 from aisquare.models import ProjectInfo
@@ -1129,6 +1129,66 @@ def no_index_of_this_checkout(
         return REAL_ENSURE_CODE_INDEX(project, refresh=refresh)
 
     monkeypatch.setattr(project_service, "_ensure_code_index", ensure)
+
+
+#: The file list of a build, as written, for the tests of it: ``no_files_of_this_checkout``
+#: replaces it for every test.
+REAL_LISTED_FILES = code_index.listed_files
+
+
+@pytest.fixture(autouse=True)
+def no_files_of_this_checkout(
+    monkeypatch: pytest.MonkeyPatch, tmp_path_factory: pytest.TempPathFactory
+) -> None:
+    """A code index build lists no files outside pytest's temp dirs (#61).
+
+    ``no_index_of_this_checkout`` keeps ``init`` and ``onboard`` from indexing this
+    repository, but ``code index``, and the first ``code`` query of a project with no
+    index, build one wherever the test stands: the sweeps that run every command did, a
+    fresh 102 MB ``code/index.db`` of this checkout per test, 112 MB of temp each (41 GB
+    across a Mac's kept basetemps). The build still runs end to end here (its schema, its
+    lock, its report) over no files; a repo under the temp dirs is indexed as written.
+    """
+    base = tmp_path_factory.getbasetemp().resolve()
+
+    def listed(root: Path, ignore: Sequence[str] = ()) -> list[str]:
+        if not Path(root).resolve().is_relative_to(base):
+            return []
+        return REAL_LISTED_FILES(root, ignore)
+
+    monkeypatch.setattr(code_index, "listed_files", listed)
+
+
+#: How big a code index a test may build (#61): a test's fixture repo makes kilobytes.
+CODE_INDEX_BOUND_MB = 20.0
+REAL_BUILD_CODE_INDEX = code_index.build
+
+
+def index_megabytes(project_id: str) -> float:
+    """``project_id``'s code index on disk, with SQLite's WAL and shared-memory files."""
+    database = code_index.index_path(project_id)
+    files = database.parent.glob(f"{database.name}*")
+    return sum(path.stat().st_size for path in files if path.is_file()) / 1e6
+
+
+@pytest.fixture(autouse=True)
+def small_code_index(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Every code index a test builds stays under :data:`CODE_INDEX_BOUND_MB`, or the test
+    fails naming the root it indexed (#61): the guard on what ``no_files_of_this_checkout``
+    keeps out, and on anything else that would fill a basetemp the same way."""
+
+    def build(project_id: str, root: Path, *args: Any, **kwargs: Any) -> Any:
+        report = REAL_BUILD_CODE_INDEX(project_id, root, *args, **kwargs)
+        size = index_megabytes(project_id)
+        if size > CODE_INDEX_BOUND_MB:
+            pytest.fail(
+                f"this test built a {size:.0f} MB code index of {root} (the bound is "
+                f"{CODE_INDEX_BOUND_MB:.0f} MB): index a small fixture repo under tmp_path "
+                "(tests/conftest.py::no_files_of_this_checkout, #61)"
+            )
+        return report
+
+    monkeypatch.setattr(code_index, "build", build)
 
 
 @pytest.fixture(autouse=True)

@@ -413,6 +413,12 @@ class Watcher:
                 }
             )
         _release_woken_holds(item for item in items if item.id not in undelivered)
+        # A scheduled manager's routine news, held until due (#41): sent from here too, so a
+        # fleet run with neither the rlx service nor asq still hears it. Theirs alone: every
+        # other held nudge is the rlx service's and asq's to send, as before.
+        from aisquare.services import fleet as fleet_service
+
+        fleet_service.retry_deferred_nudges(scheduled_only=True)
         if self.settings.auto_stop:
             with contextlib.suppress(Exception):  # a stop never costs the tick its news
                 from aisquare.services import autostop
@@ -648,7 +654,9 @@ def _deliver(project_id: str, items: Sequence[WatchItem], path: Path) -> bool:
             project_id, fleet_service.MANAGER_LABEL, live_only=True
         )
     board = fleet_service.board_of_row(manager) if manager is not None else project_id
-    team_service.watch_event(board, event_text(items, path), urgent=any(map(_urgent, items)))
+    team_service.watch_event(
+        board, event_text(items, path), urgent=any(map(_urgent, items)), project_id=project_id
+    )
     if manager is None:
         return False
     return fleet_service.nudge_manager(project_id, reason="watch", board=board)
