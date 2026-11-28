@@ -814,3 +814,67 @@ fn a_managed_account_whose_tmp_dir_is_not_known_is_not_read() {
         "{data:#}"
     );
 }
+
+#[test]
+fn once_the_brain_has_listed_slot_1_alone_an_unknown_homes_init_never_flips_it() {
+    let root = TestHome::new();
+    let accounts = Accounts::of(root.root());
+    accounts.set(1, &slack("connected"));
+    // The brain lists the plain account alone, signed in.
+    let listed = root.root().join("accounts.json");
+    std::fs::write(&listed, json!([{"slot": 1, "login": MARK_1}]).to_string()).unwrap();
+    let listed = listed.to_str().unwrap().to_owned();
+    // rlxd under home_in's CLAUDE_CONFIG_DIR: a home that is no account's.
+    let mut home = home_with_scenario_file_in(
+        root,
+        "mcp-accounts",
+        &[
+            ("RLXD_TEST_ACCOUNTS", listed.as_str()),
+            ("RLXD_TEST_CONNECTOR_MAP_MS", "off"),
+            ("RLXD_TEST_CONNECTORS_NO_TURN", "1"),
+        ],
+    );
+    let read = list(&home, &json!({"refresh": true}));
+    assert_eq!(
+        row(&read, 1)["connectors"][0]["status"],
+        "connected",
+        "{read:#}"
+    );
+    let run_signed_out = |home: &TestHome| {
+        std::fs::write(home.root().join("scenario"), "connectors-needs-auth").unwrap();
+        let id = run_id();
+        start(
+            home,
+            &json!({"kind": "widget_refresh", "prompt": "digest",
+                "mount": {"kind": "connectors", "connectors": [SLACK]}, "space": "default"}),
+            &id,
+        );
+        ended(home, &id);
+        std::thread::sleep(Duration::from_millis(500));
+        std::fs::write(home.root().join("scenario"), "mcp-accounts").unwrap();
+    };
+    let since = seq(&home);
+    run_signed_out(&home);
+    let data = list(&home, &json!({}));
+    assert_eq!(
+        row(&data, 1)["connectors"][0]["status"],
+        "connected",
+        "{data:#}"
+    );
+    assert!(connector_events(&home, since).is_empty());
+    // And after a restart with the brain gone: its answer was kept, so still nowhere.
+    home.stop();
+    let gone = home.root().join("no-accounts.json");
+    home.set_env("RLXD_TEST_ACCOUNTS", gone.to_str().unwrap());
+    home.start_dev();
+    let since = seq(&home);
+    run_signed_out(&home);
+    let data = list(&home, &json!({}));
+    assert_eq!(
+        row(&data, 1)["connectors"][0]["status"],
+        "connected",
+        "{data:#}"
+    );
+    assert!(connector_events(&home, since).is_empty());
+    assert_eq!(saved(&home)["1"]["login"], MARK_1);
+}

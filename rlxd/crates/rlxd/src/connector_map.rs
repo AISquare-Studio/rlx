@@ -39,6 +39,9 @@ pub const TICK: Duration = Duration::from_secs(10 * 60);
 /// How old an account's connectors may be before the background reads them again.
 pub const STALE: Duration = Duration::from_secs(24 * 60 * 60);
 
+/// How long rlxd waits, before it asks the brain, for the brain to be up or found missing.
+const BRAIN_SETTLE: Duration = Duration::from_secs(5);
+
 /// How long the brain has to take `accounts`, and to answer it.
 const ACCOUNTS_ACCEPT: Duration = Duration::from_secs(5);
 const ACCOUNTS_RUN: Duration = Duration::from_secs(15);
@@ -139,6 +142,18 @@ impl ConnectorMap {
     async fn listed(&self) -> Result<Vec<Account>, String> {
         if let Some(listed) = test_accounts() {
             return listed;
+        }
+        // At rlxd's start the brain may not be up yet, nor found missing: wait for one or
+        // the other, so a missing brain says so at once rather than at the accept wait's
+        // end (and a run's init held meanwhile is filed soon).
+        let until = tokio::time::Instant::now() + BRAIN_SETTLE;
+        loop {
+            let state = self.brain.status();
+            if state.pid.is_some() || state.error.is_some() || tokio::time::Instant::now() >= until
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
         }
         let data = match self
             .brain

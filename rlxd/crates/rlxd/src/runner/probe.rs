@@ -176,18 +176,31 @@ impl Runner {
     }
 }
 
+/// A process tree that can be ended at once: a run's [`Tree`].
+pub(super) trait Kill {
+    fn kill(&self);
+}
+
+impl Kill for Tree {
+    fn kill(&self) {
+        Tree::kill(self);
+    }
+}
+
 /// rlxd's own Claude Code of a probe or a no-turn read, its tree held in the runner's
-/// `probe_tree` (which rlxd's stop ends) while it runs. If what waits on it goes first (a
-/// client gone mid-request), the tree is ended with it: none outlives its request.
-pub(super) struct Tended<'a> {
-    tree: Arc<Tree>,
-    held: &'a std::sync::Mutex<Option<Arc<Tree>>>,
+/// `probe_tree` (which rlxd's stop ends) while it runs. If the future that drives it is
+/// dropped before it is reaped (rlxd's runtime ending it), the tree is ended with it. A
+/// client that goes mid-request doesn't drop it: the read runs on to its own bound, and a
+/// later refresh of that account joins it.
+pub(super) struct Tended<'a, T: Kill = Tree> {
+    tree: Arc<T>,
+    held: &'a std::sync::Mutex<Option<Arc<T>>>,
     reaped: bool,
 }
 
-impl<'a> Tended<'a> {
+impl<'a, T: Kill> Tended<'a, T> {
     /// `tree`, held in `held` until it is reaped or dropped.
-    pub(super) fn new(tree: Arc<Tree>, held: &'a std::sync::Mutex<Option<Arc<Tree>>>) -> Self {
+    pub(super) fn new(tree: Arc<T>, held: &'a std::sync::Mutex<Option<Arc<T>>>) -> Self {
         *held.lock().unwrap_or_else(|p| p.into_inner()) = Some(Arc::clone(&tree));
         Self {
             tree,
@@ -196,17 +209,24 @@ impl<'a> Tended<'a> {
         }
     }
 
-    /// Waits up to `grace` for `child` to exit, then ends the tree.
-    pub(super) async fn reap(mut self, child: &mut tokio::process::Child, grace: Duration) {
-        if self.tree.reap(child, Some(grace)).await.is_none() {
-            self.tree.kill();
-            self.tree.reap(child, None).await;
-        }
+    /// Marks the tree reaped: dropped from now on, it is let go and not ended.
+    fn reaped(mut self) {
         self.reaped = true;
     }
 }
 
-impl Drop for Tended<'_> {
+impl Tended<'_, Tree> {
+    /// Waits up to `grace` for `child` to exit, then ends the tree.
+    pub(super) async fn reap(self, child: &mut tokio::process::Child, grace: Duration) {
+        if self.tree.reap(child, Some(grace)).await.is_none() {
+            self.tree.kill();
+            self.tree.reap(child, None).await;
+        }
+        self.reaped();
+    }
+}
+
+impl<T: Kill> Drop for Tended<'_, T> {
     fn drop(&mut self) {
         if !self.reaped {
             self.tree.kill();
@@ -226,4 +246,42 @@ pub fn probe_deny() -> std::process::ExitCode {
     let mut out = std::io::stdout().lock();
     let _ = writeln!(out, "{}", argv::probe_deny_output()).and_then(|()| out.flush());
     std::process::ExitCode::SUCCESS
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    use super::*;
+
+    /// A tree that counts its kills.
+    #[derive(Default)]
+    struct Counted(AtomicU32);
+
+    impl Kill for Counted {
+        fn kill(&self) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    #[test]
+    fn a_tree_dropped_before_its_reap_is_ended_and_let_go() {
+        let held = Mutex::new(None);
+        let tree = Arc::new(Counted::default());
+        let tended = Tended::new(Arc::clone(&tree), &held);
+        assert!(held.lock().unwrap().is_some(), "held while it runs");
+        drop(tended);
+        assert_eq!(tree.0.load(Ordering::SeqCst), 1, "ended once");
+        assert!(held.lock().unwrap().is_none(), "and let go");
+    }
+
+    #[test]
+    fn a_reaped_tree_is_let_go_and_not_ended() {
+        let held = Mutex::new(None);
+        let tree = Arc::new(Counted::default());
+        Tended::new(Arc::clone(&tree), &held).reaped();
+        assert_eq!(tree.0.load(Ordering::SeqCst), 0);
+        assert!(held.lock().unwrap().is_none());
+    }
 }

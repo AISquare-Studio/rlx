@@ -183,11 +183,17 @@ impl Runs {
 
 /// Which account rlxd's own runs use: the plain one when rlxd's environment names no
 /// `CLAUDE_CONFIG_DIR` (`own`, resolved); else, once rlx has said which accounts there
-/// are (`told`), the one whose resolved `CLAUDE_CONFIG_DIR` it is. When rlx knows no
-/// account but the plain one (no brain has listed any), that is the only account there
-/// is, so it is the plain one's, as before accounts. Resolves each home: never under the
-/// cache's lock.
-fn runs_of(own: Option<&std::path::Path>, accounts: &BTreeMap<u32, Account>, told: bool) -> Runs {
+/// are or couldn't (`told`), the one whose resolved `CLAUDE_CONFIG_DIR` it is. While no
+/// brain has ever listed the accounts (`listed`, kept in the file across restarts), rlx
+/// knows the plain account alone, so it is the plain one's, as before accounts; once one
+/// has, a home that is none of them is filed nowhere. Resolves each home: never under
+/// the cache's lock.
+fn runs_of(
+    own: Option<&std::path::Path>,
+    accounts: &BTreeMap<u32, Account>,
+    told: bool,
+    listed: bool,
+) -> Runs {
     let Some(own) = own else {
         return Runs::Slot(DEFAULT_ACCOUNT);
     };
@@ -203,7 +209,7 @@ fn runs_of(own: Option<&std::path::Path>, accounts: &BTreeMap<u32, Account>, tol
     });
     match managed {
         Some(account) => Runs::Slot(account.slot),
-        None if accounts.keys().all(|slot| *slot == DEFAULT_ACCOUNT) => Runs::Slot(DEFAULT_ACCOUNT),
+        None if !listed => Runs::Slot(DEFAULT_ACCOUNT),
         None => Runs::Nowhere,
     }
 }
@@ -241,6 +247,9 @@ impl Seen {
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 struct Saved {
     accounts: BTreeMap<u32, Entry>,
+    /// Whether a brain has ever listed the accounts ([`runs_of`]).
+    #[serde(default)]
+    listed: bool,
 }
 
 /// One account's connectors, as rlxd last read them.
@@ -316,6 +325,7 @@ impl Saved {
         };
         Ok(Self {
             accounts: BTreeMap::from([(DEFAULT_ACCOUNT, entry)]),
+            listed: false,
         })
     }
 
@@ -422,7 +432,7 @@ impl Connectors {
             );
         }
         let own_dir = own_dir.map(canonical);
-        let runs = runs_of(own_dir.as_deref(), &accounts, false);
+        let runs = runs_of(own_dir.as_deref(), &accounts, false, saved.listed);
         Arc::new(Self {
             home,
             bus,
@@ -552,7 +562,8 @@ impl Connectors {
     /// were, and rlxd's runs are filed by them from now on.
     pub fn unanswered(&self) {
         let known = self.known().clone();
-        self.settle_runs(runs_of(self.own_dir.as_deref(), &known, true));
+        let listed = self.cache().listed;
+        self.settle_runs(runs_of(self.own_dir.as_deref(), &known, true, listed));
     }
 
     /// Takes `runs` as the runs' account, and files the `system/init` held until it was
@@ -598,9 +609,10 @@ impl Connectors {
             now.insert(account.slot, account);
         }
         // Each home resolved before the cache's lock is taken.
-        let runs = runs_of(self.own_dir.as_deref(), &now, true);
+        let runs = runs_of(self.own_dir.as_deref(), &now, true, true);
         let mut cache = self.cache();
-        let mut changed = false;
+        let mut changed = !cache.listed;
+        cache.listed = true;
         let gone: Vec<u32> = cache
             .accounts
             .keys()

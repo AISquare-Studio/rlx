@@ -487,7 +487,8 @@ listing, 5.5 and 7.7): `crate::connectors`, and the gate in `crate::runner::conn
     every 10 minutes rlxd asks the brain for the accounts again and reads at once each
     new one and each signed in again (another mark); any other account is read again
     once its last read was tried over 24 h ago, whether that read succeeded or failed, so
-    at most daily. A read whose client goes mid-request ends its Claude Code with it.
+    at most daily. A client that goes mid-read doesn't end the read: it runs on to its
+    bound, and a later refresh of that account joins it.
 - **`read_only_hint`** is each tool's MCP `readOnlyHint` when `system/init` lists the
   tool with annotations, else `null`: Claude Code 2.1 lists names only.
 - **`connectors.login {id}`**, for `app`, `cli` and `tui` (`remote` gets
