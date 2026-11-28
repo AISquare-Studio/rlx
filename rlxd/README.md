@@ -600,7 +600,8 @@ listing, 5.5 and 7.7): `crate::connectors`, and the gate in `crate::runner::conn
     reader's alone: the run's `run.tool_result` carries no content (`null`), so no event
     and nothing in the run's folder holds it; only the identity read from it, in the cache
     and `connectors.list`'s reply. A deny, a failure or an answer that says nothing
-    changes nothing; an identity stays as read until the account is signed in as someone
+    changes nothing, and an identity read raises no needs-you: a connector it finds
+    signed out is filed so under its account, and `connector.changed` tells the app; an identity stays as read until the account is signed in as someone
     else, and a new mark forgets it at once, before any read. Never from a tick, and
     never in rlxd's log. A release
     build's table is empty until the owner's probe (M4) names each connector's tool; a

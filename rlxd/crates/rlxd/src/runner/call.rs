@@ -206,6 +206,12 @@ impl CallRun {
         *self.outcome.lock().unwrap_or_else(|p| p.into_inner()) = None;
     }
 
+    /// Whether the call is an identity read, made on an account's environment for that
+    /// account ([`Runner::identity_call`]).
+    pub(super) fn is_identity(&self) -> bool {
+        self.account.is_some()
+    }
+
     fn outcome(&self) -> Option<Outcome> {
         self.outcome
             .lock()
