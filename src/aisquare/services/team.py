@@ -813,8 +813,8 @@ class DeliveryUnconfirmedError(RuntimeError):
 
     def __init__(self, ref: str, board_name: str) -> None:
         super().__init__(
-            f"write {ref} was not confirmed on board {board_name} — "
-            "not reporting success; check `aisquare log` before retrying"
+            f"write {ref} was not confirmed on board {board_name} — not reporting success"
+            + prog.shell_advice("; check `aisquare log` before retrying")  # asq attaches (R13)
         )
         self.ref = ref
         self.board_name = board_name
