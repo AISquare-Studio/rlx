@@ -551,8 +551,17 @@ fn stdin_held_open(route1: bool) {
     let home = home_with("stdin-eof-empty", &route(route1));
     let (id, events) = gated_start(&home, &widget(), 60).wait();
     assert_one_started_with_slack(&events, &id);
+    // The start that delivered: under a loaded machine an earlier try may have missed its
+    // wait and been ended, which is the gate working, not stdin closing early.
     let log = fixture_log(&home);
-    assert_eq!(log["starts"][0]["stdin_eof_at"], Value::Null, "{log:#}");
+    let delivered: Vec<&Value> = log["starts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|start| start["delivered"] == true)
+        .collect();
+    assert_eq!(delivered.len(), 1, "{log:#}");
+    assert_eq!(delivered[0]["stdin_eof_at"], Value::Null, "{log:#}");
 }
 
 #[test]
@@ -778,7 +787,11 @@ fn a_connector_an_init_no_longer_lists_is_removed_and_one_it_lists_new_is_added(
     let added = connector_events(&home, 0);
     assert_eq!(added.len(), 1, "{added:#?}");
     assert_eq!(added[0]["type"], "connector.added", "{added:#?}");
-    assert_eq!(added[0]["data"], json!({"id": SLACK}), "{added:#?}");
+    assert_eq!(
+        added[0]["data"],
+        json!({"account": 1, "id": SLACK}),
+        "{added:#?}"
+    );
     assert_valid("connector-id.json", &added[0]["data"]);
     let since = seq(&home);
     std::fs::write(home.root().join("scenario"), "init-other").unwrap();

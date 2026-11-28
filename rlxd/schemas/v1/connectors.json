@@ -1,11 +1,19 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "title": "ConnectorsList",
-  "description": "`connectors.list`'s reply (`connectors.json`).\n\n```json\n{\"connectors\": [{\"id\": \"claude.ai Slack\", \"source\": \"claude.ai\", \"status\": \"connected\",\n  \"tools\": [{\"name\": \"mcp__claude_ai_Slack__slack_search_public\", \"read_only_hint\": true}]}],\n \"as_of\": \"2026-11-27T09:00:00.000Z\", \"from\": \"init\", \"model_turns\": 0}\n```",
+  "description": "`connectors.list`'s reply (`connectors.json`).\n\n```json\n{\"connectors\": [{\"id\": \"claude.ai Slack\", \"source\": \"claude.ai\", \"status\": \"connected\",\n  \"tools\": [{\"name\": \"mcp__claude_ai_Slack__slack_search_public\", \"read_only_hint\": true}],\n  \"checked_at\": \"2026-11-27T09:00:00.000Z\", \"identity\": null}],\n \"as_of\": \"2026-11-27T09:00:00.000Z\", \"from\": \"init\", \"model_turns\": 0,\n \"accounts\": [{\"account\": 1, \"label\": null, \"connectors\": […],\n   \"as_of\": \"2026-11-27T09:00:00.000Z\", \"from\": \"init\", \"error\": null}]}\n```",
   "type": "object",
   "properties": {
+    "accounts": {
+      "description": "Every account's connectors, by slot: each account rlx knows, the plain one first.\nWith `account`, that account's alone.",
+      "type": "array",
+      "default": [],
+      "items": {
+        "$ref": "#/$defs/AccountConnectors"
+      }
+    },
     "as_of": {
-      "description": "When the list's `system/init` came, or `null` before any did.",
+      "description": "When the plain account's connectors were last read, or `null` before they were.",
       "type": [
         "string",
         "null"
@@ -13,18 +21,18 @@
       "format": "date-time"
     },
     "connectors": {
-      "description": "The connectors, by `id`. Empty until a run or a refresh has shown any.",
+      "description": "The plain account's connectors (slot 1, the plain `claude`), by `id`. Empty until\na run or a refresh has shown any.",
       "type": "array",
       "items": {
         "$ref": "#/$defs/Connector"
       }
     },
     "from": {
-      "description": "Where the list came from.",
+      "description": "Where the plain account's connectors were last read from.",
       "$ref": "#/$defs/ListedFrom"
     },
     "model_turns": {
-      "description": "The model turns this call made: 0 for a plain list, 1 for a one-turn refresh.",
+      "description": "The model turns this call made: 0, or 1 for a one-turn refresh.",
       "type": "integer",
       "format": "uint32",
       "maximum": 1,
@@ -32,24 +40,100 @@
     }
   },
   "required": [
+    "accounts",
     "as_of",
     "connectors",
     "from",
     "model_turns"
   ],
   "$defs": {
+    "AccountConnectors": {
+      "description": "One account's connectors in `connectors.list`.",
+      "type": "object",
+      "properties": {
+        "account": {
+          "description": "The account's rlx slot: 1 for the default one, the plain `claude` on rlxd's own\nenvironment.",
+          "type": "integer",
+          "format": "uint32",
+          "maximum": 4294967295,
+          "minimum": 1
+        },
+        "as_of": {
+          "description": "When its connectors were last read, or `null` before they were.",
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "date-time"
+        },
+        "connectors": {
+          "description": "Its connectors, by `id`. Empty until a run or a refresh has shown any.",
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/Connector"
+          }
+        },
+        "error": {
+          "description": "Why its latest refresh failed, or `null`: its connectors are then the ones read\nbefore.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Error"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "from": {
+          "description": "Where they were last read from.",
+          "$ref": "#/$defs/ListedFrom"
+        },
+        "label": {
+          "description": "The account's alias in rlx, when it has one.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "account",
+        "as_of",
+        "connectors",
+        "error",
+        "from",
+        "label"
+      ]
+    },
     "Connector": {
       "description": "One connector in `connectors.list`.",
       "type": "object",
       "properties": {
+        "checked_at": {
+          "description": "When its status was last read: a run's `system/init`, a refresh, or a login's end.\nAbsent in a list saved before rlxd kept it.",
+          "type": "string",
+          "format": "date-time"
+        },
         "id": {
           "description": "Its name, as runs name it in `needs_connectors` and mounts: `claude.ai Slack`.",
           "type": "string",
           "maxLength": 256,
           "minLength": 1
         },
+        "identity": {
+          "description": "Who the account is on this connector (a Slack workspace and user, a Gmail\naddress), where rlxd has read it: `null` until then.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ConnectorIdentity"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
         "source": {
-          "description": "Where it comes from: `claude.ai` for a claude.ai connector, else `mcp`.",
+          "description": "Its kind, where it comes from: `claude.ai` for a claude.ai connector, else `mcp`\n(a local MCP server).",
           "type": "string",
           "minLength": 1
         },
@@ -58,7 +142,7 @@
           "$ref": "#/$defs/ConnectorState"
         },
         "tools": {
-          "description": "Its tools, as the `system/init` mounted them.",
+          "description": "Its tools, as Claude Code mounted them.",
           "type": "array",
           "items": {
             "$ref": "#/$defs/ConnectorTool"
@@ -71,6 +155,24 @@
         "status",
         "tools"
       ]
+    },
+    "ConnectorIdentity": {
+      "description": "Who an account is on one connector, as a read call of the connector's own said.",
+      "type": "object",
+      "properties": {
+        "email": {
+          "description": "The address, such as a Gmail account's or a calendar owner's.",
+          "type": "string"
+        },
+        "user": {
+          "description": "The user there, such as a Slack user's name.",
+          "type": "string"
+        },
+        "workspace": {
+          "description": "The workspace or organisation, such as a Slack workspace's name.",
+          "type": "string"
+        }
+      }
     },
     "ConnectorState": {
       "description": "A connector's status, as Claude Code's `system/init` reports it.",
@@ -117,6 +219,113 @@
       "required": [
         "name",
         "read_only_hint"
+      ]
+    },
+    "Error": {
+      "title": "Error",
+      "description": "Why a request was refused or failed.",
+      "type": "object",
+      "properties": {
+        "code": {
+          "description": "A stable, machine-readable code, such as `unauthorized`, `unknown_method`,\n`incompatible_protocol`, `not_gate` or `not_a_tty`. A client also accepts codes it\ndoes not know.",
+          "type": "string",
+          "minLength": 1
+        },
+        "detail": {
+          "description": "More about what went wrong: a string, such as an underlying error's text, or an\nobject whose fields the code defines, such as `incompatible_protocol`'s\n`{\"supported\": [1]}` or `denied`'s `{\"by\": …}`. Never `null`: absent instead.",
+          "type": [
+            "string",
+            "object"
+          ]
+        },
+        "hint": {
+          "description": "What to do about it, for a person.",
+          "type": "string"
+        },
+        "message": {
+          "description": "What went wrong, for a person.",
+          "type": "string",
+          "minLength": 1
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "code": {
+                "const": "incompatible_protocol"
+              }
+            },
+            "required": [
+              "code"
+            ]
+          },
+          "then": {
+            "properties": {
+              "detail": {
+                "type": "object",
+                "properties": {
+                  "supported": {
+                    "type": "array",
+                    "items": {
+                      "type": "integer",
+                      "maximum": 4294967295,
+                      "minimum": 1
+                    },
+                    "minItems": 1
+                  }
+                },
+                "required": [
+                  "supported"
+                ]
+              }
+            },
+            "required": [
+              "detail"
+            ]
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "code": {
+                "const": "since_ahead"
+              }
+            },
+            "required": [
+              "code"
+            ]
+          },
+          "then": {
+            "properties": {
+              "detail": {
+                "type": "object",
+                "properties": {
+                  "head": {
+                    "type": "integer",
+                    "maximum": 18446744073709551615,
+                    "minimum": 0
+                  },
+                  "since": {
+                    "type": "integer",
+                    "maximum": 18446744073709551615,
+                    "minimum": 0
+                  }
+                },
+                "required": [
+                  "head"
+                ]
+              }
+            },
+            "required": [
+              "detail"
+            ]
+          }
+        }
+      ],
+      "required": [
+        "code",
+        "message"
       ]
     },
     "ListedFrom": {
