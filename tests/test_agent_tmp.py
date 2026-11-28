@@ -48,7 +48,7 @@ from aisquare.core.agent_adapters.types import store_dir
 from aisquare.core.spawn import OUTER_TMPDIR_ENV, TMP_KEY_ENV, tmux_client_env
 from aisquare.core.store import store_session
 from aisquare.models import FleetAgent, LaunchSpec, ProjectInfo
-from aisquare.services import agent_tmp, store_broker, usage_stats
+from aisquare.services import agent_tmp, store_broker, tidy, usage_stats
 from aisquare.services import fleet as fleet_service
 from tests import test_fleet_service as fleet_suite
 from tests import test_launch as launch_suite
@@ -587,3 +587,156 @@ def test_the_socket_bind_itself_needs_no_room_beyond_sun_path(short_home: Path) 
         pytest.raises(OSError),
     ):
         sock.bind(str(deep / "s.sock"))
+
+
+# --- rlx tidy's rule: ended_dirs plans it, tidy's one delete removes it (#3494) ------------
+
+tidy_only_deletes_on_posix = pytest.mark.skipif(
+    sys.platform == "win32",
+    reason="rlx tidy deletes nothing on native Windows in 0.10.2 (manager #3647)",
+)
+
+
+def _tidy_plan(tmp_path: Path) -> tidy.Plan:
+    """``tidy.plan()``, once every root it may delete under is shown to be the sandbox's."""
+    made = tidy.plan()
+    sandbox = tmp_path.resolve()
+    for root in (*made.roots.trees, *made.roots.temp, *made.roots.locks):
+        assert root.is_relative_to(sandbox), f"{root} is outside the sandbox"
+    assert paths.agent_tmp_root().resolve() in made.roots.temp
+    return made
+
+
+def _agent_items(made: tidy.Plan) -> list[Path]:
+    return [item.path for item in made.items if item.rule == tidy.AGENT_TMPDIR]
+
+
+@tidy_only_deletes_on_posix
+def test_tidy_frees_exactly_the_dirs_ended_dirs_lists_with_their_owner_records(
+    project: ProjectInfo,
+    processes: dict[int, str],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Planned from ``agent_tmp.ended_dirs`` and removed through tidy's one guarded delete
+    (``tidy._remove``, ruling #3494), each path the dry run listed, with its size."""
+    now = datetime.now(UTC)
+    ended, live, recent, paused = (
+        _dir(k, pid=9999, at=now - timedelta(hours=1))
+        for k in ("aaaaaa", "bbbbbb", "cccccc", "dddddd")
+    )
+    running = _dir("eeeeee", pid=4242, at=now - timedelta(hours=1))
+    processes[4242] = "t0"  # its process still runs: the row's end is not the agent's
+    (ended / "pytest-of-someone" / "basetemp.bin").write_bytes(b"x" * 8192)
+    _row(project, "aaaaaa", ended=now - timedelta(hours=1), label="coder-1")
+    _row(project, "bbbbbb", ended=None, label="coder-2")
+    _row(project, "cccccc", ended=now - timedelta(minutes=2), label="coder-3")
+    _row(project, "dddddd", ended=now - timedelta(days=3), paused=now, label="coder-4")
+    _row(project, "eeeeee", ended=now - timedelta(days=1), label="coder-5")
+    owner = agent_tmp.owner_path("aaaaaa")
+
+    made = _tidy_plan(tmp_path)
+
+    assert _agent_items(made) == [ended, owner]
+    assert {item.rule for item in made.items if item.path in (ended, owner)} == {"agent tmpdir"}
+    assert next(i for i in made.items if i.path == ended).bytes >= 8192, "its size is said"
+    assert all(d.exists() for d in (ended, live, recent, paused, running)), "a plan reads only"
+    shown = json.loads(CliRunner().invoke(app, ["--json", "tidy", "--dry-run"]).stdout)
+    assert shown["counts"].get(tidy.AGENT_TMPDIR) == 2
+    assert [p["path"] for p in shown["paths"] if p["rule"] == tidy.AGENT_TMPDIR] == [
+        str(ended),
+        str(owner),
+    ]
+
+    through: list[Path] = []
+    remove = tidy._remove
+
+    def guarded(path: Path, roots: tidy.Roots) -> None:
+        through.append(path)
+        remove(path, roots)
+
+    monkeypatch.setattr(tidy, "_remove", guarded)
+    report = tidy.apply(made)
+
+    assert through == [ended, owner], "every delete is tidy's guarded one"
+    assert [i.path for i in report.freed if i.rule == tidy.AGENT_TMPDIR] == [ended, owner]
+    assert not ended.exists() and not owner.exists()
+    assert all(d.exists() for d in (live, recent, paused, running))
+    assert all(agent_tmp.owner_path(d.name).exists() for d in (live, recent, paused, running))
+
+
+@tidy_only_deletes_on_posix
+def test_tidy_keeps_an_ended_agents_dir_holding_a_repository_and_names_it(
+    project: ProjectInfo, processes: dict[int, str], tmp_path: Path
+) -> None:
+    """rlx tidy never deletes a git repository (manager #3585): a clone an agent made in its
+    TMPDIR keeps the whole directory, the clone named with its size; so does a folder tidy
+    cannot look through, where one could be."""
+    now = datetime.now(UTC)
+    cloned, unread = _dir("aaaaaa", pid=9999), _dir("bbbbbb", pid=9999)
+    _row(project, "aaaaaa", ended=now - timedelta(hours=1), label="coder-1")
+    _row(project, "bbbbbb", ended=now - timedelta(hours=1), label="coder-2")
+    clone = cloned / "scratch" / "repo"
+    (clone / ".git").mkdir(parents=True)
+    (clone / "README").write_text("work no ref may hold")
+    locked = unread / "locked"
+    locked.mkdir()
+    locked.chmod(0o000)
+    try:
+        made = _tidy_plan(tmp_path)
+        report = tidy.apply(made)
+    finally:
+        locked.chmod(0o700)
+
+    assert _agent_items(made) == []
+    kept = {k.path: k for k in made.kept if k.rule == tidy.AGENT_TMPDIR}
+    assert set(kept) == {clone, unread}
+    assert kept[clone].why == tidy.NEVER_A_REPOSITORY and (kept[clone].bytes or 0) > 0
+    assert kept[unread].why == tidy.UNSEEN_THROUGH
+    assert report.freed == [] and (clone / "README").exists() and locked.exists()
+    assert agent_tmp.owner_path("aaaaaa").exists() and agent_tmp.owner_path("bbbbbb").exists()
+
+
+@tidy_only_deletes_on_posix
+def test_tidy_asks_again_before_it_frees_and_skips_what_no_longer_holds(
+    project: ProjectInfo, processes: dict[int, str], tmp_path: Path
+) -> None:
+    """Each item is re-checked just before it goes (review of #58, M-d): an agent whose process
+    is back, or a dir a repository appeared in, is skipped and said so, never freed."""
+    now = datetime.now(UTC)
+    back, cloned = _dir("aaaaaa", pid=11), _dir("bbbbbb", pid=12)
+    _row(project, "aaaaaa", ended=now - timedelta(hours=1), label="coder-1")
+    _row(project, "bbbbbb", ended=now - timedelta(hours=1), label="coder-2")
+    made = _tidy_plan(tmp_path)
+    assert sorted(_agent_items(made)) == sorted(
+        [back, agent_tmp.owner_path("aaaaaa"), cloned, agent_tmp.owner_path("bbbbbb")]
+    )
+
+    processes[11] = "t0"  # its agent's process runs again (a restart replays its key)
+    (cloned / "repo" / ".git").mkdir(parents=True)
+    report = tidy.apply(made)
+
+    why = {item.path: reason for item, reason in report.not_freed}
+    assert why[back] == "skipped: the agent is no longer ended"
+    assert why[cloned] == "skipped: a repository is there now"
+    assert back.exists() and cloned.exists() and report.freed == []
+    assert agent_tmp.owner_path("aaaaaa").exists() and agent_tmp.owner_path("bbbbbb").exists()
+
+
+def test_tidys_one_delete_takes_an_agents_dir_never_the_root_nor_through_a_link(
+    tmp_path: Path,
+) -> None:
+    root = paths.agent_tmp_root()
+    inside = _dir("aaaaaa")
+    roots = tidy._roots([], [])
+
+    assert roots.allows(inside) and roots.allows(agent_tmp.owner_path("aaaaaa"))
+    assert not roots.allows(root), "the root itself is never deleted"
+    assert not roots.allows(tmp_path / "elsewhere")
+    if sys.platform != "win32":
+        elsewhere = tmp_path / "elsewhere"
+        elsewhere.mkdir()
+        (root / "zzzzzz").symlink_to(elsewhere)
+        with pytest.raises(tidy.Refused):
+            tidy._remove(root / "zzzzzz", roots)
+        assert elsewhere.exists()

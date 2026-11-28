@@ -31,7 +31,7 @@ explicit confirmation per path.
    folders strictly inside it, holding no repository at any depth, in no tag-at-a-root, and
    tracking nothing in a checkout around them. Every repository in it is KEPT and listed with
    its size. The whole directory goes only once it ended :data:`EVIDENCE_TTL` ago and holds no
-   repository at all. The per-agent ``TMPDIR`` is #57's, which adds its rule here (#3494).
+   repository at all. The per-agent ``TMPDIR`` is rule 5's.
 3. **Idle live coders' build output**: a live coder whose board session has waited
    ``[tidy] idle_build_hours`` with no task in doing loses the tagged directories in its
    worktree, never one that is a PEP 405 environment (``core.cachedir.is_environment``: the one
@@ -40,6 +40,13 @@ explicit confirmation per path.
    process's ``TMPDIR`` is (each agent has its own): ``rlx-home-migration-<16 hex>.lock``,
    this user's, untouched for :data:`LOCK_AGE`, and free (taken at once, then unlinked while
    held).
+5. **Ended agents' own temp directories** (#57, ruling #3494): ``<home>/tmp/<key>/``, each
+   agent's ``TMPDIR``, when ``agent_tmp.ended_dirs`` finds its agent ended (that module's own
+   liveness: the process it was made for gone, and a fleet agent's newest row ended, not
+   paused, past ``agent_tmp.GRACE``). One that holds a repository is kept, each repository
+   named with its size; any other goes whole, its owner record beside it. The end paths (reap,
+   the watcher, every listing: ``agent_tmp.sweep_ended``) remove them too; tidy frees what they
+   have not reached yet.
 
 **Never touched:** anything outside rlx-owned roots (each project's ``.aisquare-worktrees``,
 the accounts' temp root, the agents' temp root, and those lock names in the system temp
@@ -65,10 +72,11 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
-from aisquare.core import cachedir, claude_accounts, locking, process_table
+from aisquare.core import cachedir, claude_accounts, locking, paths, process_table
 from aisquare.core.config import TidySettings, load_config
 from aisquare.core.store import FLEET_HELD, ContextStore, store_session
 from aisquare.models import FleetAgent, ProjectInfo
+from aisquare.services import agent_tmp
 from aisquare.services import fleet as fleet_service
 
 ENDED_WORKTREE = "ended worktree"
@@ -78,6 +86,7 @@ SESSION_CACHE = "session cache"
 SESSION_DIR = "session dir"
 IDLE_BUILD_CACHE = "idle build cache"
 MIGRATION_LOCK = "migration lock"
+AGENT_TMPDIR = "agent tmpdir"
 RULES = (
     ENDED_WORKTREE,
     ENDED_WORKTREE_CACHE,
@@ -86,6 +95,7 @@ RULES = (
     SESSION_DIR,
     IDLE_BUILD_CACHE,
     MIGRATION_LOCK,
+    AGENT_TMPDIR,
 )
 """Every rule, in the order a plan lists them."""
 
@@ -93,7 +103,8 @@ EXPLICIT_ENDS = ("stopped", "died")
 """How a fleet row ends on rlx's own word (``FleetAgent.ended_by``): the only ends tidy takes for
 a session's end (review of #58, M2)."""
 ENDED_IDLE = timedelta(hours=2)
-"""How long nothing of a session or an agent's temp may have moved before it is ended."""
+"""How long nothing of a session may have moved before it is ended. An agent's own temp
+directory is ended by ``agent_tmp.ended_dirs`` (rule 5), which owns its liveness."""
 EVIDENCE_TTL = timedelta(days=7)
 """How long an ended session's small files (logs, notes) are kept before its directory goes."""
 LOCK_AGE = timedelta(hours=24)
@@ -126,6 +137,10 @@ ROOT_TAG = (
 NEVER_A_REPOSITORY = "rlx won't delete a repository: remove it by hand if you don't need it"
 """Why every repository in a session's temp is kept (manager #3585: ``rlx tidy`` never deletes
 a git repository in 0.10.2)."""
+UNSEEN_THROUGH = (
+    "part of it cannot be read, or is another disk: kept, as a repository could be there"
+)
+"""Why an ended agent's temp directory with no repository found is kept all the same."""
 DELETES = sys.platform != "win32"
 """Whether tidy deletes here. Not on native Windows in 0.10.2 (manager #3647): it reports and
 lists, and removes nothing; the fleet there runs in WSL, where tidy deletes."""
@@ -324,6 +339,7 @@ def plan(*, now: datetime | None = None) -> Plan:
                 _idle_build_output(store, project, rows, config, at, result)
         _session_trees(store, every, commands, at, result)
     _stale_locks(at, result)
+    _agent_tmpdirs(at, result)
     return result
 
 
@@ -369,7 +385,7 @@ def _roots(projects: Iterable[ProjectInfo], every: Iterable[ProjectInfo]) -> Roo
 
     return Roots(
         trees=real(project.root / WORKTREES_DIR for project in projects),
-        temp=real((claude_accounts.tmp_root(),)),
+        temp=real((claude_accounts.tmp_root(), paths.agent_tmp_root())),
         locks=real(_system_temp_dirs()),
         checkouts=real(project.root for project in every),
     )
@@ -1003,6 +1019,54 @@ def _free_lock(path: Path, roots: Roots) -> Callable[[], str | None]:
             return "skipped: a move holds it"
         finally:
             os.close(fd)
+        return None
+
+    return run
+
+
+# --- 5. ended agents' own temp directories (#57) -----------------------------------------
+
+
+def _agent_tmpdirs(at: datetime, result: Plan) -> None:
+    """Each directory ``agent_tmp.ended_dirs`` lists (its agent ended, by that module's rules):
+    freed whole, with its owner record, through :func:`_remove`; kept, each repository in it
+    named with its size, when it holds one (manager #3585), or when part of it cannot be looked
+    through (``cachedir.holds_repository``: an unreadable folder, a mount)."""
+    for directory in agent_tmp.ended_dirs(now=at):
+        repositories = _repositories(directory)
+        for repository in repositories:
+            result.kept.append(
+                Kept(
+                    AGENT_TMPDIR,
+                    repository,
+                    NEVER_A_REPOSITORY,
+                    cachedir.allocated_bytes(repository),
+                )
+            )
+        if repositories:
+            continue
+        if cachedir.holds_repository(directory):
+            result.kept.append(Kept(AGENT_TMPDIR, directory, UNSEEN_THROUGH))
+            continue
+        owner = agent_tmp.owner_path(directory.name)
+        items = [Item(AGENT_TMPDIR, directory, cachedir.allocated_bytes(directory))]
+        if _there(owner):
+            items.append(Item(AGENT_TMPDIR, owner, cachedir.allocated_bytes(owner)))
+        result.add(items, _free_agent_tmpdir(directory, owner, result.roots))
+
+
+def _free_agent_tmpdir(directory: Path, owner: Path, roots: Roots) -> Callable[[], str | None]:
+    """Asked again just before (review of #58, M-d): its agent still ended, and still no
+    repository in it. Then the directory, then its owner record, each through :func:`_remove`."""
+
+    def run() -> str | None:
+        if directory not in agent_tmp.ended_dirs():
+            return "skipped: the agent is no longer ended"
+        if cachedir.holds_repository(directory):
+            return "skipped: a repository is there now"
+        _remove(directory, roots)
+        if _there(owner):
+            _remove(owner, roots)
         return None
 
     return run

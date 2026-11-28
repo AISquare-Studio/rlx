@@ -103,7 +103,7 @@ def new_key(taken: Collection[str] = ()) -> str:
         key = "".join(secrets.choice(_ALPHABET) for _ in range(KEY_LENGTH))
         if key in taken:
             continue
-        if not (root / key).exists() and not _owner_path(key).exists():
+        if not (root / key).exists() and not owner_path(key).exists():
             return key
 
 
@@ -115,14 +115,15 @@ def key_for(spec: LaunchSpec | None, *, fork: bool) -> str:
     return new_key()
 
 
-def _owner_path(key: str) -> Path:
+def owner_path(key: str) -> Path:
+    """``key``'s owner record, beside its directory: what ``rlx tidy`` removes with it."""
     return paths.agent_tmp_root() / f"{key}{OWNER}"
 
 
 def read_owner(key: str) -> Owner | None:
     """``key``'s owner record, or ``None`` when it is missing or unreadable."""
     try:
-        raw = json.loads(_owner_path(key).read_text(encoding="utf-8"))
+        raw = json.loads(owner_path(key).read_text(encoding="utf-8"))
         kind = raw["kind"]
         if kind not in ("fleet", "launch"):
             return None
@@ -207,7 +208,7 @@ def _write_owner(key: str, kind: Literal["fleet", "launch"]) -> None:
         "started": found.started if found is not None else None,
         "at": datetime.now(UTC).isoformat(timespec="seconds"),
     }
-    atomic.write_replacing(_owner_path(key), json.dumps(record), durable=False)
+    atomic.write_replacing(owner_path(key), json.dumps(record), durable=False)
 
 
 def ended_dirs(store: ContextStore | None = None, *, now: datetime | None = None) -> list[Path]:
@@ -298,7 +299,7 @@ def remove_dir(directory: Path) -> bool:
     shutil.rmtree(directory, ignore_errors=True)
     if directory.exists():
         return False
-    _owner_path(directory.name).unlink(missing_ok=True)
+    owner_path(directory.name).unlink(missing_ok=True)
     return True
 
 

@@ -36,6 +36,11 @@ SHARED: dict[str, tuple[int, str]] = {
         "path; Windows reads the temp dir, but Python there has no AF_UNIX "
         "(captain/actions.py), so nothing binds or dials it",
     ),
+    "services/tidy.py": (
+        2,
+        "the system temp dir rlx tidy frees stale migration locks in, found without TMPDIR "
+        "(macOS's per-user one by confstr, else /tmp): the same for every agent",
+    ),
     # One process, or a path handed to the child explicitly.
     "core/editor.py": (1, "the file's path is the editor's argument"),
     "services/native_telemetry.py": (
